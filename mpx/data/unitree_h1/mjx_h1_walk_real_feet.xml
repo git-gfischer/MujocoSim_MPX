@@ -110,7 +110,7 @@
                 <geom name = "FL" pos=".115 0 -0.056" size="0.01"/>
                 <geom name = "RL" pos="-.035 0 -0.056" size="0.01"/>
                 <!-- <geom class="foot3"/> -->
-                  <!-- <geom class="foot_single_capsule"/> -->
+                  <geom class="foot_single_capsule"/>
                 <site name ="left_foot" class="h1foot"/>
               </body>
             </body>
@@ -154,7 +154,7 @@
                 <!-- <geom class="foot3"/> -->
                 <geom name = "FR" pos=".115 0 -0.056" size="0.01"/>
                 <geom name = "RR" pos="-.035 0 -0.056" size="0.01"/>
-                  <!-- <geom class="foot_single_capsule"/> -->
+                  <geom class="foot_single_capsule"/>
                 <site name ="right_foot" class="h1foot"/>
               </body>
             </body>

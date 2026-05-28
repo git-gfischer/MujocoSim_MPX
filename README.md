@@ -32,15 +32,9 @@ Fully differentiable solver easily integrates into learning pipelines and suppor
 
 The solver is wrapped by the `MPCControllerWrapper` class, and all the settings (such as the dynamics model and cost function to be used) can be changed in the config files. Examples for various legged robots are provided in the `examples` folder.
 > **Note:**  
-> If you want to solve multiple MPC in parallel, look at the examples/multi_env.py
-> `MPCWrapper` is designed to use the whole body model, if you want to use the srbd model, use `mpc_wrapper_srbd.py`; look at examples/srbd_quad.py
+> If you want to solve multiple MPC in parallel, use `BatchedMPCControllerWrapper` look at the examples/multi_env.py
+> `MPCControllerWrapper` and `BatchedMPCControllerWrapper` are designed to use the whole body model, if you want to use the srbd model, use `mpc_wrapper_srbd.py`; look at examples/srbd_quad.py
 
-## Task examples
-| Acrobot Swing-Up | Quadruped Trot | Humanoid Jump | Quadruped Barrel roll |
-|---|---|---|---|
-| <img src="https://github.com/user-attachments/assets/af15576c-8fab-4e53-ac06-8f9e648703f6" width="100%" /> | <img src="https://github.com/user-attachments/assets/51f7eb3e-b344-4a92-9b16-837ca5dc71c6" width="100%" /> | <img src="https://github.com/user-attachments/assets/7b39eef5-a7d5-4243-a590-a6dab0b12af2" width="100%" /> | <img src="https://github.com/user-attachments/assets/7a875ce6-ea40-467a-b732-f473e5f40a02" width="100%" /> |
-> **Note:**  
-You can switch between two solvers, Primal-dual LQR of GPU-FDDP. Just change the flang in the config `solver_mode = "fddp" or "primal_dual`. 
 ## Installation
 
 ### Clone the repo
@@ -76,14 +70,13 @@ The first time running the script it can take more than a minute to JIT the solv
 ## Citing this work
 
 ```bibtex
-@article{amatuccisousa26ral,
- author={Amatucci, Lorenzo and Sousa-Pinto, João and Turrisi, Giulio and Orban, Dominique and Barasuol, Victor and Semini, Claudio},
- title={Primal-Dual iLQR for GPU-Accelerated Learning and Control in Legged Robots},
- year={2026},
- volume={11},
- number={1},
- pages={1010-1017},
- journal={IEEE Robotics and Automation Letters},
- doi={10.1109/LRA.2025.3632610}
+@misc{2025primaldualilqrgpuacceleratedlearning,
+      title={Primal-Dual iLQR for GPU-Accelerated Learning and Control in Legged Robots}, 
+      author={Lorenzo Amatucci and João Sousa-Pinto and Giulio Turrisi and Dominique Orban and Victor Barasuol and Claudio Semini},
+      year={2025},
+      eprint={2506.07823},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2506.07823}, 
 }
 ```

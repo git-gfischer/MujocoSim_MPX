@@ -13,7 +13,15 @@ def timer_run(duty_factor,step_freq, leg_time, dt):
 
     return contact, leg_time
 def terrain_orientation(liftoff_pos,Ryaw):
+    """
+    Calculates the terrain orientation based on the liftoff positions.
+    Args:
+        liftoff_pos: The liftoff positions of the legs.
+        Ryaw: The yaw rotation matrix.
 
+    Returns:
+        The terrain orientation quaternion.
+    """
     # Calculate the vectors between the legs
     vec_front_back = (liftoff_pos[:3] + liftoff_pos[3:6] - liftoff_pos[6:9] - liftoff_pos[9:12])/2
     # vec_left_right = (liftoff_pos[:3] + liftoff_pos[6:9] - liftoff_pos[3:6] - liftoff_pos[9:12])/2
@@ -34,9 +42,142 @@ def terrain_orientation(liftoff_pos,Ryaw):
     quat = rotation_matrix.as_quat()
 
     return jnp.roll(quat,1)
+    
+# region reference_generator_balance
+@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5))
+def reference_generator_balance(
+    use_terrain_estimator,
+    N,
+    dt,
+    n_joints,
+    n_contact,
+    mass,
+    foot0,
+    q0,
+    t_timer,
+    x,
+    foot,
+    input,
+    duty_factor,
+    step_freq,
+    step_height,
+    liftoff,
+    contact,
+    clearence_speed,
+    fixed_contact_mask,
+    foot_ref_anchor,
+    use_foot_ref_anchor,
+    base_quat_ref,
+    use_base_quat_ref,
+):
+    """Static contact schedule + constant foot anchors (whole-body MPC balance)."""
+    _, _, _, _, _, _, _ = (
+        foot0,
+        t_timer,
+        duty_factor,
+        step_freq,
+        step_height,
+        contact,
+        clearence_speed,
+    )
 
-@partial(jax.jit, static_argnums=(0,1,2,3,4,5))
-def reference_generator(use_terrain_estimator,N,dt,n_joints,n_contact,mass,foot0,q0,t_timer, x, foot, input, duty_factor, step_freq,step_height,liftoff,contact,clearence_speed):
+    p = x[:3]
+    quat = x[3:7]
+    yaw = jnp.arctan2(
+        2 * (quat[0] * quat[3] + quat[1] * quat[2]),
+        1 - 2 * (quat[2] * quat[2] + quat[3] * quat[3]),
+    )
+    Ryaw = jnp.array(
+        [
+            [jnp.cos(yaw), -jnp.sin(yaw), 0],
+            [jnp.sin(yaw), jnp.cos(yaw), 0],
+            [0, 0, 1],
+        ]
+    )
+    proprio_height = input[6] + jnp.sum(liftoff[2::3]) / n_contact
+    p = jnp.array([p[0], p[1], proprio_height])
+    if use_terrain_estimator:
+        quat_ref = jnp.tile(terrain_orientation(liftoff, Ryaw), (N + 1, 1))
+    else:
+        # Match current base attitude (incl. spawn yaw). Identity here fought random map yaw and
+        # caused large quat_sub costs → in-place spin / falls while "balancing".
+        quat_n = quat / (jnp.linalg.norm(quat) + 1e-8)
+        quat_ref_n = base_quat_ref / (jnp.linalg.norm(base_quat_ref) + 1e-8)
+        quat_ref = jax.lax.cond(
+            use_base_quat_ref,
+            lambda _: jnp.tile(quat_ref_n, (N + 1, 1)),
+            lambda _: jnp.tile(quat_n, (N + 1, 1)),
+            operand=None,
+        )
+    q_ref = jnp.tile(q0, (N + 1, 1))
+    pitch = jnp.arcsin(
+        2 * (quat_ref[0, 0] * quat_ref[0, 2] - quat_ref[0, 3] * quat_ref[0, 1])
+    )
+    Rpitch = jnp.array(
+        [
+            [jnp.cos(pitch), 0, jnp.sin(pitch)],
+            [0, 1, 0],
+            [-jnp.sin(pitch), 0, jnp.cos(pitch)],
+        ]
+    )
+
+    ref_lin_vel = Ryaw @ Rpitch @ input[:3]
+    ref_ang_vel = input[3:6]
+    p_ref_x = jnp.arange(N + 1) * dt * ref_lin_vel[0] + p[0]
+    p_ref_y = jnp.arange(N + 1) * dt * ref_lin_vel[1] + p[1]
+    p_ref_z = jnp.ones(N + 1) * proprio_height
+    p_ref = jnp.stack([p_ref_x, p_ref_y, p_ref_z], axis=1)
+    dp_ref = jnp.tile(ref_lin_vel, (N + 1, 1))
+    omega_ref = jnp.tile(ref_ang_vel, (N + 1, 1))
+    foot_track = jnp.where(use_foot_ref_anchor, foot_ref_anchor, foot)
+    foot_ref = jnp.tile(foot_track, (N + 1, 1))
+    grf_ref = jnp.zeros((N + 1, 3 * n_contact))
+
+    mask = fixed_contact_mask.astype(jnp.float32).reshape((n_contact,))
+    contact_sequence = jnp.tile(mask, (N + 1, 1))
+    sum_m = jnp.sum(mask) + 1e-6
+    grf_z_per_leg = mask * (mass * 9.81 / sum_m)
+    grf_ref = grf_ref.at[:, 2::3].set(jnp.broadcast_to(grf_z_per_leg, (N + 1, n_contact)))
+    reference = jnp.concatenate(
+        [
+            p_ref,
+            quat_ref,
+            q_ref,
+            dp_ref,
+            omega_ref,
+            foot_ref,
+            contact_sequence,
+            grf_ref,
+        ],
+        axis=1,
+    )
+    parameter = jnp.concatenate([contact_sequence], axis=1)
+    return reference, parameter, liftoff
+#endregion
+
+# region reference_generator_locomotion
+@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5))
+def reference_generator_locomotion(
+    use_terrain_estimator,
+    N,
+    dt,
+    n_joints,
+    n_contact,
+    mass,
+    foot0,
+    q0,
+    t_timer,
+    x,
+    foot,
+    input,
+    duty_factor,
+    step_freq,
+    step_height,
+    liftoff,
+    contact,
+    clearence_speed,
+):
+    """Gait timer, swing feet, footholds (whole-body MPC locomotion)."""
     p = x[:3]
     quat = x[3:7]
     # q = x[7:7+n_joints]
@@ -50,7 +191,10 @@ def reference_generator(use_terrain_estimator,N,dt,n_joints,n_contact,mass,foot0
     if use_terrain_estimator:
         quat_ref = jnp.tile(terrain_orientation(liftoff,Ryaw), (N+1, 1))
     else:
-        quat_ref = jnp.tile(jnp.array([1, 0, 0, 0]), (N+1, 1))
+        #quat_ref = jnp.tile(jnp.array([1, 0, 0, 0]), (N+1, 1))
+        # Keep attitude ref aligned with the base (avoids yaw mismatch after random map spawn).
+        quat_n = quat / (jnp.linalg.norm(quat) + 1e-8)
+        quat_ref = jnp.tile(quat_n, (N+1, 1))
     q_ref = jnp.tile(q0, (N+1, 1))
     contact_sequence = jnp.zeros(((N+1), n_contact))
     pitch = jnp.arcsin(2 * (quat_ref[0,0] * quat_ref[0,2] - quat_ref[0,3] * quat_ref[0,1]))
@@ -142,6 +286,14 @@ def reference_generator(use_terrain_estimator,N,dt,n_joints,n_contact,mass,foot0
     liftoff = liftoff.at[2::3].set(liftoff_z)
 
     return jnp.concatenate([p_ref, quat_ref, q_ref, dp_ref, omega_ref, foot_ref, contact_sequence,grf_ref], axis=1),jnp.concatenate([contact_sequence], axis=1), liftoff
+
+#endregion
+
+
+# region reference_generator_srbd
+# Historical name — locomotion gait reference only (`reference_generator_balance` for static stance).
+reference_generator = reference_generator_locomotion
+
 
 @partial(jax.jit, static_argnums=(0,1,2,3))
 def reference_generator_srbd(use_terrain_estimator,N,dt,n_contact,mass,foot0,t_timer, x, foot, input, duty_factor, step_freq,step_height,liftoff,contact,clearence_speed):
@@ -268,6 +420,9 @@ def reference_generator_srbd(use_terrain_estimator,N,dt,n_contact,mass,foot0,t_t
     liftoff = liftoff.at[2::3].set(liftoff_z)
 
     return jnp.concatenate([p_ref, quat_ref, dp_ref, omega_ref,contact_sequence], axis=1),jnp.concatenate([ contact_sequence,foot_ref], axis=1), liftoff , foot_ref_dot
+#endregion
+
+# region whole_body_interface
 
 import mujoco
 from mujoco import mjx
@@ -308,10 +463,12 @@ def whole_body_interface(model, mjx_model, contact_id, body_id,sim_frequency,Kp,
     tau_mpc = -(J@grf)[6:]
     tau_PD = (J @ cartesian_space_action)[6:]
     contact_mask = jnp.array([contact[0],contact[0],contact[0],contact[1],contact[1],contact[1],contact[2],contact[2],contact[2],contact[3],contact[3],contact[3]])
-    tau = tau_mpc*contact_mask + (1-contact_mask)*(tau_PD + tau_fb_lin) 
+    tau = tau_mpc*contact_mask + (1-contact_mask)*(tau_fb_lin) 
 
     return tau , J
+#endregion
 
+# region reference_barell_roll
 @partial(jax.jit, static_argnums=(0,1,2,3))
 def reference_barell_roll(N,dt,n_joints,n_contact,foot0,q0):
     t1 = 0.2
@@ -397,152 +554,4 @@ def reference_barell_roll(N,dt,n_joints,n_contact,foot0,q0):
     grf_ref = jnp.zeros((N, 3*n_contact))
 
     return jnp.concatenate([p_ref, quat_ref, q_ref, dp_ref, omega_ref, foot_ref, contact_sequence, grf_ref], axis=1), jnp.concatenate([contact_sequence, foot_ref], axis=1)
-
-
-def reference_humanoid_jump_forward(
-    N,
-    dt,
-    n_joints,
-    n_contact,
-    foot0,
-    q0,
-    *,
-    base_height=0.9,
-    crouch_height=0.82,
-    apex_height=1.02,
-    jump_distance=0.35,
-    foot_shift=0.18,
-    foot_lift=0.12,
-):
-    n_crouch = max(2, int(0.20 / dt))
-    n_flight = max(2, int(0.28 / dt))
-    n_land = max(2, int(0.18 / dt))
-    n_settle = max(0, N - (n_crouch + n_flight + n_land))
-
-    x_crouch = jnp.linspace(0.0, 0.05, n_crouch)
-    x_flight = jnp.linspace(x_crouch[-1], jump_distance, n_flight)
-    x_land = jnp.linspace(jump_distance, jump_distance, n_land)
-    x_settle = jnp.linspace(jump_distance, jump_distance, n_settle)
-
-    z_crouch = jnp.linspace(base_height, crouch_height, n_crouch)
-    phase = jnp.linspace(0.0, 1.0, n_flight)
-    z_flight = crouch_height + (base_height - crouch_height) * phase + (apex_height - base_height) * 4.0 * phase * (1.0 - phase)
-    z_land = jnp.linspace(base_height, base_height, n_land)
-    z_settle = jnp.linspace(base_height, base_height, n_settle)
-
-    x_ref = jnp.concatenate([x_crouch, x_flight, x_land, x_settle], axis=0)
-    z_ref = jnp.concatenate([z_crouch, z_flight, z_land, z_settle], axis=0)
-    y_ref = jnp.zeros_like(x_ref)
-    p_ref = jnp.stack([x_ref, y_ref, z_ref], axis=1)
-
-    quat_ref = jnp.tile(jnp.array([1.0, 0.0, 0.0, 0.0]), (N, 1))
-    omega_ref = jnp.zeros((N, 3))
-
-    crouch_q = q0.at[2].set(-0.8).at[3].set(1.5).at[4].set(-0.8)
-    crouch_q = crouch_q.at[7].set(-0.8).at[8].set(1.5).at[9].set(-0.8)
-    q_crouch = jnp.stack([q0 + (crouch_q - q0) * alpha for alpha in jnp.linspace(0.0, 1.0, n_crouch)], axis=0)
-    q_flight = jnp.tile(crouch_q, (n_flight, 1))
-    q_land = jnp.stack([crouch_q + (q0 - crouch_q) * alpha for alpha in jnp.linspace(0.0, 1.0, n_land)], axis=0)
-    q_settle = jnp.tile(q0, (n_settle, 1))
-    q_ref = jnp.concatenate([q_crouch, q_flight, q_land, q_settle], axis=0)
-
-    dp_ref = jnp.zeros((N, 3))
-    dp_ref = dp_ref.at[:-1].set((p_ref[1:] - p_ref[:-1]) / dt)
-    dp_ref = dp_ref.at[-1].set(dp_ref[-2])
-
-    foot_ref = jnp.tile(foot0, (N, 1))
-    flight_shift = foot_shift * phase
-    flight_lift = foot_lift * 4.0 * phase * (1.0 - phase)
-    foot_flight = jnp.tile(foot0, (n_flight, 1))
-    foot_flight = foot_flight.at[:, ::3].set(foot_flight[:, ::3] + flight_shift[:, None])
-    foot_flight = foot_flight.at[:, 2::3].set(foot_flight[:, 2::3] + flight_lift[:, None])
-    foot_land = jnp.tile(
-        foot0.at[::3].set(foot0[::3] + foot_shift),
-        (n_land + n_settle, 1),
-    )
-    foot_ref = foot_ref.at[n_crouch : n_crouch + n_flight].set(foot_flight)
-    if n_land + n_settle > 0:
-        foot_ref = foot_ref.at[n_crouch + n_flight :].set(foot_land)
-
-    contact_crouch = jnp.tile(jnp.ones(n_contact), (n_crouch, 1))
-    contact_flight = jnp.tile(jnp.zeros(n_contact), (n_flight, 1))
-    contact_land = jnp.tile(jnp.ones(n_contact), (n_land + n_settle, 1))
-    contact_sequence = jnp.concatenate([contact_crouch, contact_flight, contact_land], axis=0)
-
-    grf_ref = jnp.zeros((N, 3 * n_contact))
-
-    reference = jnp.concatenate(
-        [p_ref, quat_ref, q_ref, dp_ref, omega_ref, foot_ref, contact_sequence, grf_ref],
-        axis=1,
-    )
-    parameter = jnp.concatenate([contact_sequence, foot_ref], axis=1)
-    return reference, parameter
-
-
-def reference_quadruped_trot_two_step(
-    N,
-    dt,
-    n_joints,
-    n_contact,
-    foot0,
-    q0,
-    *,
-    base_height=0.36,
-    total_forward=0.45,
-    step_length=0.16,
-    step_height=0.08,
-    settle_time=0.10,
-    phase_time=0.16,
-):
-    del n_joints
-    n_stance = max(2, int(settle_time / dt))
-    n_phase = max(2, int(phase_time / dt))
-    n_phases = 4
-    n_settle = max(0, N - (n_stance + n_phases * n_phase))
-
-    p_ref = jnp.zeros((N, 3))
-    p_ref = p_ref.at[:, 0].set(jnp.linspace(0.0, total_forward, N))
-    p_ref = p_ref.at[:, 2].set(base_height)
-    quat_ref = jnp.tile(jnp.array([1.0, 0.0, 0.0, 0.0]), (N, 1))
-    q_ref = jnp.tile(q0, (N, 1))
-    dp_ref = jnp.zeros((N, 3))
-    dp_ref = dp_ref.at[:, 0].set(total_forward / ((N - 1) * dt + 1e-6))
-    omega_ref = jnp.zeros((N, 3))
-
-    foot_ref = jnp.tile(foot0, (N, 1))
-    footholds = foot0.reshape(n_contact, 3)
-    contact_sequence = jnp.tile(jnp.ones(n_contact), (N, 1))
-
-    trot_a = jnp.array([1.0, 0.0, 0.0, 1.0])
-    trot_b = jnp.array([0.0, 1.0, 1.0, 0.0])
-    patterns = [trot_a, trot_b, trot_a, trot_b]
-
-    start_idx = n_stance
-    for pattern in patterns:
-        end_idx = min(start_idx + n_phase, N)
-        contact_sequence = contact_sequence.at[start_idx:end_idx].set(
-            jnp.tile(pattern, (end_idx - start_idx, 1))
-        )
-        swing_ids = jnp.where(pattern == 0.0)[0]
-        phase = jnp.linspace(0.0, 1.0, end_idx - start_idx)
-        start_feet = footholds
-        end_feet = footholds.at[swing_ids, 0].add(step_length)
-        swing_xyz = start_feet[None, :, :] + (end_feet - start_feet)[None, :, :] * phase[:, None, None]
-        swing_xyz = swing_xyz.at[:, swing_ids, 2].set(
-            start_feet[swing_ids, 2][None, :] + step_height * 4.0 * phase[:, None] * (1.0 - phase[:, None])
-        )
-        foot_ref = foot_ref.at[start_idx:end_idx].set(swing_xyz.reshape(end_idx - start_idx, -1))
-        footholds = end_feet
-        start_idx = end_idx
-
-    if start_idx < N:
-        foot_ref = foot_ref.at[start_idx:].set(jnp.tile(footholds.reshape(-1), (N - start_idx, 1)))
-        contact_sequence = contact_sequence.at[start_idx:].set(jnp.tile(jnp.ones(n_contact), (N - start_idx, 1)))
-
-    grf_ref = jnp.zeros((N, 3 * n_contact))
-    reference = jnp.concatenate(
-        [p_ref, quat_ref, q_ref, dp_ref, omega_ref, foot_ref, contact_sequence, grf_ref],
-        axis=1,
-    )
-    parameter = jnp.concatenate([contact_sequence, foot_ref], axis=1)
-    return reference, parameter
+#endregion

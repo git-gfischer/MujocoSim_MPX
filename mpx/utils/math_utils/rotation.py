@@ -124,12 +124,23 @@ def rotation_matrix_to_quaternion(R):
         )
     )
     
-def yaw_rotation_from_quat(quat) -> jnp.ndarray:
-    """Yaw-only rotation matrix from base quaternion ``[w, x, y, z]``."""
-    yaw = jnp.arctan2(
+def quat_yaw_wxyz(yaw_rad) -> jnp.ndarray:
+    """Level base quaternion (zero roll/pitch) with heading ``yaw_rad``."""
+    half = 0.5 * yaw_rad
+    return jnp.array([jnp.cos(half), 0.0, 0.0, jnp.sin(half)])
+
+
+def yaw_from_quat_wxyz(quat) -> jnp.ndarray:
+    """Extract yaw from quaternion ``[w, x, y, z]``."""
+    return jnp.arctan2(
         2 * (quat[0] * quat[3] + quat[1] * quat[2]),
         1 - 2 * (quat[2] ** 2 + quat[3] ** 2),
     )
+
+
+def yaw_rotation_from_quat(quat) -> jnp.ndarray:
+    """Yaw-only rotation matrix from base quaternion ``[w, x, y, z]``."""
+    yaw = yaw_from_quat_wxyz(quat)
     return jnp.array(
         [
             [jnp.cos(yaw), -jnp.sin(yaw), 0.0],

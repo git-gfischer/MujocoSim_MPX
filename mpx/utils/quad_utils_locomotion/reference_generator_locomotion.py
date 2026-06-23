@@ -2,158 +2,22 @@ import jax
 from jax import numpy as jnp
 from functools import partial
 from mujoco.mjx._src import math
-from jax.scipy.spatial.transform import Rotation
+from mpx.utils.math_utils.rotation import quat_yaw_wxyz, yaw_from_quat_wxyz
+from mpx.utils.sim_utils import timer_run
+from mpx.estimators.terrain_orientation import terrain_orientation
 
-def timer_run(duty_factor,step_freq, leg_time, dt):
-    # Extract relevant fields
-    # Update timer
-    leg_time = leg_time + dt * step_freq
-    leg_time = jnp.where(leg_time > 1, leg_time - 1, leg_time)
-    contact = jnp.where(leg_time < duty_factor, 1, 0)
 
-    return contact, leg_time
-def terrain_orientation(liftoff_pos,Ryaw):
-    """
-    Calculates the terrain orientation based on the liftoff positions.
-    Args:
-        liftoff_pos: The liftoff positions of the legs.
-        Ryaw: The yaw rotation matrix.
 
-    Returns:
-        The terrain orientation quaternion.
-    """
-    # Calculate the vectors between the legs
-    vec_front_back = (liftoff_pos[:3] + liftoff_pos[3:6] - liftoff_pos[6:9] - liftoff_pos[9:12])/2
-    # vec_left_right = (liftoff_pos[:3] + liftoff_pos[6:9] - liftoff_pos[3:6] - liftoff_pos[9:12])/2
-    #DO NOT ADJUST THE ROLL
-    vec_left_right = Ryaw@jnp.array([0,1,0])
-    # Compute the normal vector to the plane
-    normal_vector = jnp.cross(vec_front_back, vec_left_right)
+def _mean_stance_foot_z(foot, contact, liftoff, n_contact):
+    """Terrain elevation from measured stance feet; fallback to liftoff average."""
+    foot_z = foot[2::3]
+    liftoff_z = liftoff[2::3]
+    on_stance = contact > 0.5
+    stance_sum = jnp.sum(jnp.where(on_stance, foot_z, 0.0))
+    stance_count = jnp.sum(on_stance.astype(jnp.float32))
+    liftoff_mean = jnp.sum(liftoff_z) / n_contact
+    return jnp.where(stance_count > 0.5, stance_sum / stance_count, liftoff_mean)
 
-    # Normalize the vectors
-    vec_front_back = vec_front_back / math.norm(vec_front_back)
-    vec_left_right = vec_left_right / math.norm(vec_left_right)
-    normal_vector = normal_vector / math.norm(normal_vector)
-
-    # Create the rotation matrix
-    rotation_matrix = Rotation.from_matrix(jnp.stack([vec_front_back, vec_left_right, normal_vector], axis=1))
-
-    # Convert the rotation matrix to a quaternion
-    quat = rotation_matrix.as_quat()
-
-    return jnp.roll(quat,1)
-    
-# region reference_generator_balance
-@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5))
-def reference_generator_balance(
-    use_terrain_estimator,
-    N,
-    dt,
-    n_joints,
-    n_contact,
-    mass,
-    foot0,
-    q0,
-    t_timer,
-    x,
-    foot,
-    input,
-    duty_factor,
-    step_freq,
-    step_height,
-    liftoff,
-    contact,
-    clearence_speed,
-    fixed_contact_mask,
-    foot_ref_anchor,
-    use_foot_ref_anchor,
-    base_quat_ref,
-    use_base_quat_ref,
-):
-    """Static contact schedule + constant foot anchors (whole-body MPC balance)."""
-    _, _, _, _, _, _, _ = (
-        foot0,
-        t_timer,
-        duty_factor,
-        step_freq,
-        step_height,
-        contact,
-        clearence_speed,
-    )
-
-    p = x[:3]
-    quat = x[3:7]
-    yaw = jnp.arctan2(
-        2 * (quat[0] * quat[3] + quat[1] * quat[2]),
-        1 - 2 * (quat[2] * quat[2] + quat[3] * quat[3]),
-    )
-    Ryaw = jnp.array(
-        [
-            [jnp.cos(yaw), -jnp.sin(yaw), 0],
-            [jnp.sin(yaw), jnp.cos(yaw), 0],
-            [0, 0, 1],
-        ]
-    )
-    proprio_height = input[6] + jnp.sum(liftoff[2::3]) / n_contact
-    p = jnp.array([p[0], p[1], proprio_height])
-    if use_terrain_estimator:
-        quat_ref = jnp.tile(terrain_orientation(liftoff, Ryaw), (N + 1, 1))
-    else:
-        # Match current base attitude (incl. spawn yaw). Identity here fought random map yaw and
-        # caused large quat_sub costs → in-place spin / falls while "balancing".
-        quat_n = quat / (jnp.linalg.norm(quat) + 1e-8)
-        quat_ref_n = base_quat_ref / (jnp.linalg.norm(base_quat_ref) + 1e-8)
-        quat_ref = jax.lax.cond(
-            use_base_quat_ref,
-            lambda _: jnp.tile(quat_ref_n, (N + 1, 1)),
-            lambda _: jnp.tile(quat_n, (N + 1, 1)),
-            operand=None,
-        )
-    q_ref = jnp.tile(q0, (N + 1, 1))
-    pitch = jnp.arcsin(
-        2 * (quat_ref[0, 0] * quat_ref[0, 2] - quat_ref[0, 3] * quat_ref[0, 1])
-    )
-    Rpitch = jnp.array(
-        [
-            [jnp.cos(pitch), 0, jnp.sin(pitch)],
-            [0, 1, 0],
-            [-jnp.sin(pitch), 0, jnp.cos(pitch)],
-        ]
-    )
-
-    ref_lin_vel = Ryaw @ Rpitch @ input[:3]
-    ref_ang_vel = input[3:6]
-    p_ref_x = jnp.arange(N + 1) * dt * ref_lin_vel[0] + p[0]
-    p_ref_y = jnp.arange(N + 1) * dt * ref_lin_vel[1] + p[1]
-    p_ref_z = jnp.ones(N + 1) * proprio_height
-    p_ref = jnp.stack([p_ref_x, p_ref_y, p_ref_z], axis=1)
-    dp_ref = jnp.tile(ref_lin_vel, (N + 1, 1))
-    omega_ref = jnp.tile(ref_ang_vel, (N + 1, 1))
-    foot_track = jnp.where(use_foot_ref_anchor, foot_ref_anchor, foot)
-    foot_ref = jnp.tile(foot_track, (N + 1, 1))
-    grf_ref = jnp.zeros((N + 1, 3 * n_contact))
-
-    mask = fixed_contact_mask.astype(jnp.float32).reshape((n_contact,))
-    contact_sequence = jnp.tile(mask, (N + 1, 1))
-    sum_m = jnp.sum(mask) + 1e-6
-    grf_z_per_leg = mask * (mass * 9.81 / sum_m)
-    grf_ref = grf_ref.at[:, 2::3].set(jnp.broadcast_to(grf_z_per_leg, (N + 1, n_contact)))
-    reference = jnp.concatenate(
-        [
-            p_ref,
-            quat_ref,
-            q_ref,
-            dp_ref,
-            omega_ref,
-            foot_ref,
-            contact_sequence,
-            grf_ref,
-        ],
-        axis=1,
-    )
-    parameter = jnp.concatenate([contact_sequence], axis=1)
-    return reference, parameter, liftoff
-#endregion
 
 # region reference_generator_locomotion
 @partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5))
@@ -175,9 +39,8 @@ def reference_generator_locomotion(
     step_height,
     liftoff,
     contact,
-    clearence_speed,
+    clearence_speed
 ):
-    """Gait timer, swing feet, footholds (whole-body MPC locomotion)."""
     p = x[:3]
     quat = x[3:7]
     # q = x[7:7+n_joints]
@@ -191,10 +54,7 @@ def reference_generator_locomotion(
     if use_terrain_estimator:
         quat_ref = jnp.tile(terrain_orientation(liftoff,Ryaw), (N+1, 1))
     else:
-        #quat_ref = jnp.tile(jnp.array([1, 0, 0, 0]), (N+1, 1))
-        # Keep attitude ref aligned with the base (avoids yaw mismatch after random map spawn).
-        quat_n = quat / (jnp.linalg.norm(quat) + 1e-8)
-        quat_ref = jnp.tile(quat_n, (N+1, 1))
+        quat_ref = jnp.tile(jnp.array([1, 0, 0, 0]), (N+1, 1))
     q_ref = jnp.tile(q0, (N+1, 1))
     contact_sequence = jnp.zeros(((N+1), n_contact))
     pitch = jnp.arcsin(2 * (quat_ref[0,0] * quat_ref[0,2] - quat_ref[0,3] * quat_ref[0,1]))
@@ -286,15 +146,139 @@ def reference_generator_locomotion(
     liftoff = liftoff.at[2::3].set(liftoff_z)
 
     return jnp.concatenate([p_ref, quat_ref, q_ref, dp_ref, omega_ref, foot_ref, contact_sequence,grf_ref], axis=1),jnp.concatenate([contact_sequence], axis=1), liftoff
-
 #endregion
 
+# region reference_barell_roll
+@partial(jax.jit, static_argnums=(0,1,2,3))
+def reference_barell_roll(N,dt,n_joints,n_contact,foot0,q0):
+    t1 = 0.2
+    t2 = 0.2
+    t3 = 0.3
+    t4 = 0.1
+    z_start = 0.4
+    z_land = 0.28
+    v_lateral = -0.25/(t2+t3)
+    v0 = (z_land - z_start + 0.5*9.81*t3*t3)/t3 
+    total_roll_time = t2+t3+t4
+    roll_speed = 2*3.14/total_roll_time
+    def z_position(t):
+        return z_start - 0.5*9.81*t**2 + v0*t
+    def z_speed(t):
+        return -9.81*t + v0
+    acc = v0/t2
+    print("v0", v0)
+    print("acc", acc)
+    #first part full stance 0.1s
+    n1 = int(t1/dt)
+    p1 = jnp.tile(jnp.array([0,0,0.33]), (n1, 1))
+    p1 = p1.at[:,1].set(jnp.arange(n1)*dt*(v_lateral))
+    dp1 = jnp.tile(jnp.array([0,v_lateral,0]), (n1, 1))
+    contact1 = jnp.tile(jnp.array([1,1,1,1]), (n1, 1))
+    quat1 = jnp.tile(jnp.array([1, 0, 0, 0]), (n1, 1))
+    omega1 = jnp.tile(jnp.array([0, 0, 0]), (n1, 1))
+    #second part lateral support 0.2s
+    n2 = int(t2/dt)
+    p2 = jnp.tile(jnp.array([0,p1[-1,1],0.33]), (n2, 1))
+    p2 = p2.at[:,2].set(0.5*jnp.arange(n2)*dt*jnp.arange(n2)*dt*acc + 0.33)
+    p2 = p2.at[:,1].set(jnp.arange(n2)*dt*(v_lateral))
+    dp2 = jnp.tile(jnp.array([0,v_lateral,0]), (n2, 1))
+    dp2 = dp2.at[:,2].set(jnp.arange(n2)*dt*acc)
+    contact2 = jnp.tile(jnp.array([0,1,0,1]), (n2, 1))
+    # for i in range(n2):
+    #     p2 = p2.at[i,2].set(z_position(i*dt))
+    #     dp2 = dp2.at[i,2].set(z_speed(i*dt))
+    #third part flying phase 0.4s
+    n3 = int(t3/dt)
+    p3 = jnp.tile(jnp.array([0,p2[-1,1],p2[-1,2]]), (n3, 1))
+    p3 = p3.at[:,1].set(jnp.arange(n3)*dt*(v_lateral))
+    dp3 = jnp.tile(jnp.array([0,v_lateral,0]), (n3, 1))
+    for i in range(n3):
+        p3 = p3.at[i,2].set(z_position(i*dt))
+        dp3 = dp3.at[i,2].set(z_speed(i*dt))
+    def fn(t,carry):
+        quat_new = math.quat_integrate(carry[t-1,:], jnp.array([roll_speed,0,0]), dt)
+        carry_new = carry.at[t,:].set(quat_new)
+        return carry_new
+    
+    
+    contact3 = jnp.tile(jnp.array([0,0,0,0]), (n3, 1))
+    #fourth part full stance 0.2s
+    n4 = int(t4/dt)
+    p4 = jnp.tile(jnp.array([0,p3[-1,1],z_land]), (n4, 1))
+    dp4 = jnp.tile(jnp.array([0,0,0]), (n4, 1))
+    quat5 = jnp.tile(jnp.array([1, 0, 0, 0]), (n4, 1))
+    omega5 = jnp.tile(jnp.array([0, 0, 0]), (n4, 1))
+    contact4 = jnp.tile(jnp.array([1,1,1,1]), (n4, 1))
+
+    init_carry = jnp.tile(jnp.array([1.0, 0.0, 0, 0]), (n2+n3+n4, 1))
+    quat234 = jax.lax.fori_loop(1, n2+n3+n4, fn, init_carry)
+    omega234 = jnp.tile(jnp.array([roll_speed, 0, 0]), (n2+n3+n4, 1))
+
+    n5 = N - (n1+n2+n3+n4)
+
+    p5 = jnp.tile(jnp.array([0,p4[-1,1],z_land]), (n5, 1))
+    dp5 = jnp.tile(jnp.array([0,0,0]), (n5, 1))
+    quat5 = jnp.tile(jnp.array([1, 0, 0, 0]), (n5, 1))
+    omega5 = jnp.tile(jnp.array([0, 0, 0]), (n5, 1))
+    contact5 = jnp.tile(jnp.array([1,1,1,1]), (n5, 1))
+
+    p_ref = jnp.concatenate([p1, p2, p3, p4,p5], axis=0)
+    quat_ref = jnp.concatenate([quat1,quat234,quat5], axis=0)
+    q_ref = jnp.tile(q0, (n1+n2+n3+n4+n5, 1))
+    dp_ref = jnp.concatenate([dp1, dp2, dp3, dp4,dp5], axis=0)
+    omega_ref = jnp.concatenate([omega1,omega234,omega5], axis=0)
+    foot_ref = jnp.tile(foot0, (n1+n2+n3+n4+n5, 1)) + jnp.tile(p_ref, n_contact)
+    foot_ref = foot_ref.at[:,2::3].set(jnp.zeros((n1+n2+n3+n4+n5, n_contact)))
+    contact_sequence = jnp.concatenate([contact1, contact2, contact3, contact4,contact5], axis=0)
+
+    grf_ref = jnp.zeros((N, 3*n_contact))
+
+    return jnp.concatenate([p_ref, quat_ref, q_ref, dp_ref, omega_ref, foot_ref, contact_sequence, grf_ref], axis=1), jnp.concatenate([contact_sequence, foot_ref], axis=1)
+#endregion
+
+# region whole_body_interface
+@partial(jax.jit, static_argnums=(0))
+def whole_body_interface(model, mjx_model, contact_id, body_id,sim_frequency,Kp,Kd,qpos,qvel,grf,foot_ref,foot_ref_dot,contact):
+
+    mjx_data = mjx.make_data(model)
+    # Update the position and velocity in the data object
+    mjx_data = mjx_data.replace(qpos=qpos, qvel=qvel)
+    # Perform forward kinematics and dynamics computations
+    mjx_data = mjx.fwd_position(mjx_model, mjx_data)
+    mjx_data = mjx.fwd_velocity(mjx_model, mjx_data)
+
+    # Extract the mass matrix and bias forces
+    M = mjx_data.qM
+    D = mjx_data.qfrc_bias
+
+    # Get the positions of the contact points on the legs
+    FL_leg = mjx_data.geom_xpos[contact_id[0]]
+    FR_leg = mjx_data.geom_xpos[contact_id[1]]
+    RL_leg = mjx_data.geom_xpos[contact_id[2]]
+    RR_leg = mjx_data.geom_xpos[contact_id[3]]
+
+    # Compute the Jacobians for each leg
+    J_FL, _ = mjx.jac(mjx_model, mjx_data, FL_leg, body_id[0])
+    J_FR, _ = mjx.jac(mjx_model, mjx_data, FR_leg, body_id[1])
+    J_RL, _ = mjx.jac(mjx_model, mjx_data, RL_leg, body_id[2])
+    J_RR, _ = mjx.jac(mjx_model, mjx_data, RR_leg, body_id[3])
+
+    # Concatenate the Jacobians into a single matrix
+    J = jnp.concatenate([J_FL, J_FR, J_RL, J_RR], axis=1)
+    # Concatenate the positions of the legs into a single vector
+    current_leg = jnp.concatenate([FL_leg, FR_leg, RL_leg, RR_leg], axis=0)
+    current_leg_dot = J.T @ mjx_data.qvel
+    cartesian_space_action = Kp@(foot_ref-current_leg) + Kd@(foot_ref_dot-current_leg_dot)
+    tau_fb_lin = D[6:] + (M @ jnp.linalg.pinv(J.T) @ (cartesian_space_action))[6:]
+    tau_mpc = -(J@grf)[6:]
+    tau_PD = (J @ cartesian_space_action)[6:]
+    contact_mask = jnp.array([contact[0],contact[0],contact[0],contact[1],contact[1],contact[1],contact[2],contact[2],contact[2],contact[3],contact[3],contact[3]])
+    tau = tau_mpc*contact_mask + (1-contact_mask)*(tau_fb_lin) 
+
+    return tau , J
+#endregion
 
 # region reference_generator_srbd
-# Historical name — locomotion gait reference only (`reference_generator_balance` for static stance).
-reference_generator = reference_generator_locomotion
-
-
 @partial(jax.jit, static_argnums=(0,1,2,3))
 def reference_generator_srbd(use_terrain_estimator,N,dt,n_contact,mass,foot0,t_timer, x, foot, input, duty_factor, step_freq,step_height,liftoff,contact,clearence_speed):
     p = x[:3]
@@ -420,138 +404,4 @@ def reference_generator_srbd(use_terrain_estimator,N,dt,n_contact,mass,foot0,t_t
     liftoff = liftoff.at[2::3].set(liftoff_z)
 
     return jnp.concatenate([p_ref, quat_ref, dp_ref, omega_ref,contact_sequence], axis=1),jnp.concatenate([ contact_sequence,foot_ref], axis=1), liftoff , foot_ref_dot
-#endregion
-
-# region whole_body_interface
-
-import mujoco
-from mujoco import mjx
-
-@partial(jax.jit, static_argnums=(0))
-def whole_body_interface(model, mjx_model, contact_id, body_id,sim_frequency,Kp,Kd,qpos,qvel,grf,foot_ref,foot_ref_dot,contact):
-
-    mjx_data = mjx.make_data(model)
-    # Update the position and velocity in the data object
-    mjx_data = mjx_data.replace(qpos=qpos, qvel=qvel)
-    # Perform forward kinematics and dynamics computations
-    mjx_data = mjx.fwd_position(mjx_model, mjx_data)
-    mjx_data = mjx.fwd_velocity(mjx_model, mjx_data)
-
-    # Extract the mass matrix and bias forces
-    M = mjx_data.qM
-    D = mjx_data.qfrc_bias
-
-    # Get the positions of the contact points on the legs
-    FL_leg = mjx_data.geom_xpos[contact_id[0]]
-    FR_leg = mjx_data.geom_xpos[contact_id[1]]
-    RL_leg = mjx_data.geom_xpos[contact_id[2]]
-    RR_leg = mjx_data.geom_xpos[contact_id[3]]
-
-    # Compute the Jacobians for each leg
-    J_FL, _ = mjx.jac(mjx_model, mjx_data, FL_leg, body_id[0])
-    J_FR, _ = mjx.jac(mjx_model, mjx_data, FR_leg, body_id[1])
-    J_RL, _ = mjx.jac(mjx_model, mjx_data, RL_leg, body_id[2])
-    J_RR, _ = mjx.jac(mjx_model, mjx_data, RR_leg, body_id[3])
-
-    # Concatenate the Jacobians into a single matrix
-    J = jnp.concatenate([J_FL, J_FR, J_RL, J_RR], axis=1)
-    # Concatenate the positions of the legs into a single vector
-    current_leg = jnp.concatenate([FL_leg, FR_leg, RL_leg, RR_leg], axis=0)
-    current_leg_dot = J.T @ mjx_data.qvel
-    cartesian_space_action = Kp@(foot_ref-current_leg) + Kd@(foot_ref_dot-current_leg_dot)
-    tau_fb_lin = D[6:] + (M @ jnp.linalg.pinv(J.T) @ (cartesian_space_action))[6:]
-    tau_mpc = -(J@grf)[6:]
-    tau_PD = (J @ cartesian_space_action)[6:]
-    contact_mask = jnp.array([contact[0],contact[0],contact[0],contact[1],contact[1],contact[1],contact[2],contact[2],contact[2],contact[3],contact[3],contact[3]])
-    tau = tau_mpc*contact_mask + (1-contact_mask)*(tau_fb_lin) 
-
-    return tau , J
-#endregion
-
-# region reference_barell_roll
-@partial(jax.jit, static_argnums=(0,1,2,3))
-def reference_barell_roll(N,dt,n_joints,n_contact,foot0,q0):
-    t1 = 0.2
-    t2 = 0.2
-    t3 = 0.3
-    t4 = 0.1
-    z_start = 0.4
-    z_land = 0.28
-    v_lateral = -0.25/(t2+t3)
-    v0 = (z_land - z_start + 0.5*9.81*t3*t3)/t3 
-    total_roll_time = t2+t3+t4
-    roll_speed = 2*3.14/total_roll_time
-    def z_position(t):
-        return z_start - 0.5*9.81*t**2 + v0*t
-    def z_speed(t):
-        return -9.81*t + v0
-    acc = v0/t2
-    print("v0", v0)
-    print("acc", acc)
-    #first part full stance 0.1s
-    n1 = int(t1/dt)
-    p1 = jnp.tile(jnp.array([0,0,0.33]), (n1, 1))
-    p1 = p1.at[:,1].set(jnp.arange(n1)*dt*(v_lateral))
-    dp1 = jnp.tile(jnp.array([0,v_lateral,0]), (n1, 1))
-    contact1 = jnp.tile(jnp.array([1,1,1,1]), (n1, 1))
-    quat1 = jnp.tile(jnp.array([1, 0, 0, 0]), (n1, 1))
-    omega1 = jnp.tile(jnp.array([0, 0, 0]), (n1, 1))
-    #second part lateral support 0.2s
-    n2 = int(t2/dt)
-    p2 = jnp.tile(jnp.array([0,p1[-1,1],0.33]), (n2, 1))
-    p2 = p2.at[:,2].set(0.5*jnp.arange(n2)*dt*jnp.arange(n2)*dt*acc + 0.33)
-    p2 = p2.at[:,1].set(jnp.arange(n2)*dt*(v_lateral))
-    dp2 = jnp.tile(jnp.array([0,v_lateral,0]), (n2, 1))
-    dp2 = dp2.at[:,2].set(jnp.arange(n2)*dt*acc)
-    contact2 = jnp.tile(jnp.array([0,1,0,1]), (n2, 1))
-    # for i in range(n2):
-    #     p2 = p2.at[i,2].set(z_position(i*dt))
-    #     dp2 = dp2.at[i,2].set(z_speed(i*dt))
-    #third part flying phase 0.4s
-    n3 = int(t3/dt)
-    p3 = jnp.tile(jnp.array([0,p2[-1,1],p2[-1,2]]), (n3, 1))
-    p3 = p3.at[:,1].set(jnp.arange(n3)*dt*(v_lateral))
-    dp3 = jnp.tile(jnp.array([0,v_lateral,0]), (n3, 1))
-    for i in range(n3):
-        p3 = p3.at[i,2].set(z_position(i*dt))
-        dp3 = dp3.at[i,2].set(z_speed(i*dt))
-    def fn(t,carry):
-        quat_new = math.quat_integrate(carry[t-1,:], jnp.array([roll_speed,0,0]), dt)
-        carry_new = carry.at[t,:].set(quat_new)
-        return carry_new
-    
-    
-    contact3 = jnp.tile(jnp.array([0,0,0,0]), (n3, 1))
-    #fourth part full stance 0.2s
-    n4 = int(t4/dt)
-    p4 = jnp.tile(jnp.array([0,p3[-1,1],z_land]), (n4, 1))
-    dp4 = jnp.tile(jnp.array([0,0,0]), (n4, 1))
-    quat5 = jnp.tile(jnp.array([1, 0, 0, 0]), (n4, 1))
-    omega5 = jnp.tile(jnp.array([0, 0, 0]), (n4, 1))
-    contact4 = jnp.tile(jnp.array([1,1,1,1]), (n4, 1))
-
-    init_carry = jnp.tile(jnp.array([1.0, 0.0, 0, 0]), (n2+n3+n4, 1))
-    quat234 = jax.lax.fori_loop(1, n2+n3+n4, fn, init_carry)
-    omega234 = jnp.tile(jnp.array([roll_speed, 0, 0]), (n2+n3+n4, 1))
-
-    n5 = N - (n1+n2+n3+n4)
-
-    p5 = jnp.tile(jnp.array([0,p4[-1,1],z_land]), (n5, 1))
-    dp5 = jnp.tile(jnp.array([0,0,0]), (n5, 1))
-    quat5 = jnp.tile(jnp.array([1, 0, 0, 0]), (n5, 1))
-    omega5 = jnp.tile(jnp.array([0, 0, 0]), (n5, 1))
-    contact5 = jnp.tile(jnp.array([1,1,1,1]), (n5, 1))
-
-    p_ref = jnp.concatenate([p1, p2, p3, p4,p5], axis=0)
-    quat_ref = jnp.concatenate([quat1,quat234,quat5], axis=0)
-    q_ref = jnp.tile(q0, (n1+n2+n3+n4+n5, 1))
-    dp_ref = jnp.concatenate([dp1, dp2, dp3, dp4,dp5], axis=0)
-    omega_ref = jnp.concatenate([omega1,omega234,omega5], axis=0)
-    foot_ref = jnp.tile(foot0, (n1+n2+n3+n4+n5, 1)) + jnp.tile(p_ref, n_contact)
-    foot_ref = foot_ref.at[:,2::3].set(jnp.zeros((n1+n2+n3+n4+n5, n_contact)))
-    contact_sequence = jnp.concatenate([contact1, contact2, contact3, contact4,contact5], axis=0)
-
-    grf_ref = jnp.zeros((N, 3*n_contact))
-
-    return jnp.concatenate([p_ref, quat_ref, q_ref, dp_ref, omega_ref, foot_ref, contact_sequence, grf_ref], axis=1), jnp.concatenate([contact_sequence, foot_ref], axis=1)
 #endregion

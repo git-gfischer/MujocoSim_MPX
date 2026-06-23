@@ -2,9 +2,10 @@ import readline
 import readchar
 import time
 import numpy as np
+import glfw
 
 # Config imports
-import mpx.config.config_aliengo as config_aliengo
+import mpx.config.robot_config.config_aliengo as config_aliengo
 
 class Console():
     def __init__(self, controller_node):
@@ -188,3 +189,90 @@ class Console():
         print("setupGaitTimer: Setup the gait timer")
         print("setupLegsGains: Setup the leg gains")
         print("setupGeneral: Setup general parameters\n")
+
+#=============================================================================
+class KeyboardVelocityCommand:
+    """Arrow-key forward and yaw command for passive MuJoCo viewers.
+
+    Usage:
+    `command = KeyboardVelocityCommand(vx=0.3)`
+    `viewer = mujoco.viewer.launch_passive(..., key_callback=command.key_callback)`
+    `mpc_input = command.mpc_input(robot_height)`
+    """
+
+    def __init__(
+        self,
+        vx: float = 0.0,
+        vy: float = 0.0,
+        wz: float = 0.0,
+        forward_step: float = 0.1,
+        yaw_step: float = 0.2,
+        forward_limits: tuple[float, float] = (-1.0, 1.0),
+        yaw_limits: tuple[float, float] = (-1.5, 1.5),
+    ):
+        self.vx = float(vx)
+        self.vy = float(vy)
+        self.wz = float(wz)
+        self.forward_step = float(forward_step)
+        self.yaw_step = float(yaw_step)
+        self.forward_limits = tuple(float(value) for value in forward_limits)
+        self.yaw_limits = tuple(float(value) for value in yaw_limits)
+        self._overlay_dirty = True
+
+    def _clip(self):
+        self.vx = float(np.clip(self.vx, *self.forward_limits))
+        self.wz = float(np.clip(self.wz, *self.yaw_limits))
+
+    def reset(self):
+        self.vx = 0.0
+        self.vy = 0.0
+        self.wz = 0.0
+        self._overlay_dirty = True
+
+    def key_callback(self, key: int):
+        """Update the planar command from GLFW arrow keys."""
+
+        if glfw is None:
+            raise RuntimeError("glfw is required to use KeyboardVelocityCommand.")
+
+        # Left/right arrows steer the commanded yaw rate around the vertical axis.
+        if key == glfw.KEY_UP:      self.vx += self.forward_step
+        elif key == glfw.KEY_DOWN:  self.vx -= self.forward_step
+        elif key == glfw.KEY_LEFT:  self.wz += self.yaw_step
+        elif key == glfw.KEY_RIGHT: self.wz -= self.yaw_step
+        elif key in (glfw.KEY_SPACE, glfw.KEY_ENTER, glfw.KEY_BACKSPACE):
+            self.reset()
+        else:
+            return
+
+        self._clip()
+        self._overlay_dirty = True
+
+    def planar_command(self) -> np.ndarray:
+        """Return the current planar command `[vx, vy]`."""
+
+        return np.array([self.vx, self.vy], dtype=np.float64)
+
+    def mpc_input(self, robot_height: float) -> np.ndarray:
+        """Return the 7D locomotion command used by the MPC examples."""
+
+        return np.array(
+            [self.vx, self.vy, 0.0, 0.0, 0.0, self.wz, robot_height],
+            dtype=np.float64,
+        )
+
+    def overlay_text(self) -> tuple[str, str]:
+        """Return short viewer text showing controls and the current command."""
+
+        return (
+            "Up/Down: forward | Left/Right: yaw | Space: stop",
+            f"vx {self.vx:+.2f}  wz {self.wz:+.2f}",
+        )
+
+    def consume_overlay_text(self) -> tuple[str, str] | None:
+        """Return overlay text only when the command was updated."""
+
+        if not self._overlay_dirty:
+            return None
+        self._overlay_dirty = False
+        return self.overlay_text()

@@ -11,9 +11,6 @@ Quadruped body tree
     :func:`bodies_direct_parent_child` — True if two bodies are immediate parent/child.
     :func:`geom_belongs_to_robot_under_root` — True if a geom is on the robot subtree.
 
-Quaternion math (MuJoCo ``qpos`` order ``[w, x, y, z]``)
-    :func:`quat_normalize_wxyz`, :func:`quat_mul_wxyz`, :func:`quat_yaw_wxyz`.
-
 Viewer overlay
     :func:`alloc_decor_geom` — reserve a decoration geom in ``viewer.user_scn``.
 
@@ -113,74 +110,6 @@ def geom_belongs_to_robot_under_root(
             return False
         bid = parent
 
-
-# ---------------------------------------------------------------------------
-# Quaternion math (spawn orientation; scalar-first wxyz)
-# ---------------------------------------------------------------------------
-
-
-def quat_normalize_wxyz(q: np.ndarray) -> np.ndarray:
-    """Unit-length quaternion; returns input unchanged if norm is tiny."""
-    q = np.asarray(q, dtype=np.float64).reshape(4)
-    n = np.linalg.norm(q)
-    return q / (n if n > 1e-12 else 1.0)
-
-
-_quat_normalize_wxyz = quat_normalize_wxyz
-
-
-def quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Hamilton product (compose rotations), MuJoCo order ``[w, x, y, z]``."""
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array(
-        [
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        ],
-        dtype=np.float64,
-    )
-
-
-_quat_mul_wxyz = quat_mul_wxyz
-
-
-def quat_yaw_wxyz(yaw_rad: float) -> np.ndarray:
-    """Pure yaw about world +Z by ``yaw_rad`` radians (wxyz)."""
-    h = 0.5 * float(yaw_rad)
-    return np.array([np.cos(h), 0.0, 0.0, np.sin(h)], dtype=np.float64)
-
-
-def _quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array(
-        [
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        ],
-        dtype=np.float64,
-    )
-
-
-def _quat_from_rpy_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    cr, sr = np.cos(0.5 * roll), np.sin(0.5 * roll)
-    cp, sp = np.cos(0.5 * pitch), np.sin(0.5 * pitch)
-    cy, sy = np.cos(0.5 * yaw), np.sin(0.5 * yaw)
-    return np.array(
-        [
-            cr * cp * cy + sr * sp * sy,
-            sr * cp * cy - cr * sp * sy,
-            cr * sp * cy + sr * cp * sy,
-            cr * cp * sy - sr * sp * cy,
-        ],
-        dtype=np.float64,
-    )
-
 # ---------------------------------------------------------------------------
 # Viewer overlay (passive MuJoCo viewer decoration scene)
 # ---------------------------------------------------------------------------
@@ -194,6 +123,17 @@ def alloc_decor_geom(viewer: Any) -> int:
 
 _alloc_decor_geom = alloc_decor_geom
 
+
+#----------------------------------------------------------------------------
+def timer_run(duty_factor,step_freq, leg_time, dt):
+    import jax.numpy as jnp
+    # Extract relevant fields
+    # Update timer
+    leg_time = leg_time + dt * step_freq
+    leg_time = jnp.where(leg_time > 1, leg_time - 1, leg_time)
+    contact = jnp.where(leg_time < duty_factor, 1, 0)
+
+    return contact, leg_time
 
 # ---------------------------------------------------------------------------
 # Model lookup
@@ -212,3 +152,293 @@ def resolve_foot_geom_ids(model: mujoco.MjModel, foot_geom_names: Sequence[str])
             )
         gids.append(gid)
     return gids
+
+
+#----------------------------------------------------------------------------
+
+def geom_ids(model: mujoco.MjModel, names: Sequence[str]) -> np.ndarray:
+    """Return the MuJoCo geom ids for the provided geom names."""
+
+    return np.asarray(
+        [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in names],
+        dtype=np.int32,
+    )
+
+
+def geom_positions(data: mujoco.MjData, geom_ids: Sequence[int], flatten: bool = True) -> np.ndarray:
+    """Return the geom positions for the selected geoms."""
+
+    positions = np.asarray([data.geom_xpos[int(geom_id)] for geom_id in geom_ids], dtype=np.float64)
+    return positions.reshape(-1) if flatten else positions
+
+def _reserve_user_geom(viewer) -> int:
+    if viewer is None:
+        return -1
+    if viewer.user_scn.ngeom >= viewer.user_scn.maxgeom:
+        raise ValueError(
+            f"Viewer user scene is full ({viewer.user_scn.ngeom}/{viewer.user_scn.maxgeom})."
+        )
+    viewer.user_scn.ngeom += 1
+    return viewer.user_scn.ngeom - 1
+
+#---------------------------Render Helpers---------------------------
+def render_vector(
+    viewer,
+    vector: np.ndarray,
+    pos: np.ndarray,
+    scale: float,
+    color: np.ndarray = np.array([1.0, 0.0, 0.0, 1.0]),
+    geom_id: int = -1,
+) -> int:
+    """Render a decorative arrow aligned with the provided vector."""
+
+    if viewer is None:
+        return -1
+
+    if geom_id < 0:
+        geom_id = _reserve_user_geom(viewer)
+
+    geom = viewer.user_scn.geoms[geom_id]
+    direction = np.asarray(vector, dtype=np.float64).reshape(3)
+    start = np.asarray(pos, dtype=np.float64).reshape(3)
+    norm = np.linalg.norm(direction)
+    if norm < 1e-6:
+        direction = np.array([0.0, 0.0, 1.0])
+        norm = 1.0
+
+    end = start + (scale * direction / norm)
+    mujoco.mjv_initGeom(
+        geom,
+        type=mujoco.mjtGeom.mjGEOM_ARROW,
+        size=np.ones(3) * 1e-3,
+        pos=np.zeros(3),
+        mat=np.eye(3).reshape(9),
+        rgba=np.asarray(color, dtype=np.float32),
+    )
+    mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_ARROW, 0.01, start, end)
+    geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+    geom.segid = -1
+    geom.objid = -1
+    return geom_id
+
+
+def render_sphere(
+    viewer,
+    position: np.ndarray,
+    diameter: float,
+    color: np.ndarray = np.array([1.0, 0.0, 0.0, 1.0]),
+    geom_id: int = -1,
+) -> int:
+    """Render a decorative sphere at the provided position."""
+
+    if viewer is None:
+        return -1
+
+    if geom_id < 0:
+        geom_id = _reserve_user_geom(viewer)
+
+    geom = viewer.user_scn.geoms[geom_id]
+    mujoco.mjv_initGeom(
+        geom,
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        size=np.array([0.5 * diameter, 0.0, 0.0]),
+        pos=np.asarray(position, dtype=np.float64).reshape(3),
+        mat=np.eye(3).reshape(9),
+        rgba=np.asarray(color, dtype=np.float32),
+    )
+    geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+    geom.segid = -1
+    geom.objid = -1
+    return geom_id
+
+
+def render_sphere_trajectory(
+    viewer,
+    positions: np.ndarray,
+    alphas: np.ndarray,
+    diameter: float,
+    color: np.ndarray = np.array([1.0, 0.45, 0.0, 1.0]),
+    geom_ids: list[int] | None = None,
+) -> list[int]:
+    """Render or update a sequence of decorative spheres."""
+
+    if viewer is None:
+        return []
+
+    positions = np.asarray(positions, dtype=np.float64)
+    alphas = np.asarray(alphas, dtype=np.float64)
+    if positions.shape[0] == 0:
+        return []
+
+    if geom_ids is None or len(geom_ids) != positions.shape[0]:
+        geom_ids = [-1] * positions.shape[0]
+
+    base_color = np.asarray(color, dtype=np.float32)
+    for idx, (position, alpha) in enumerate(zip(positions, alphas, strict=False)):
+        rgba = np.array(base_color, copy=True)
+        rgba[3] = float(alpha)
+        geom_ids[idx] = render_sphere(
+            viewer,
+            position,
+            diameter,
+            color=rgba,
+            geom_id=geom_ids[idx],
+        )
+
+    return geom_ids
+
+#-------------------------Ghost Geom Helpers-------------------------
+def _build_ghost_geoms(
+    viewer,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+) -> dict[int, dict[str, Any]]:
+    """Cache the static visual spec for each rendered ghost geom."""
+
+    scene = mujoco.MjvScene(mj_model, maxgeom=max(2 * mj_model.ngeom, 200))
+    mujoco.mjv_updateScene(
+        mj_model,
+        mj_data,
+        mujoco.MjvOption(),
+        None,
+        mujoco.MjvCamera(),
+        mujoco.mjtCatBit.mjCAT_ALL,
+        scene,
+    )
+
+    ghost_geoms = {}
+    ignored_names = {"floor", "plane", "world", "ground"}
+    for geom in scene.geoms[: scene.ngeom]:
+        if geom.segid == -1:
+            continue
+
+        geom_model_id = int(geom.objid)
+        geom_name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_model_id)
+        body_id = mj_model.geom_bodyid[geom_model_id]
+        body_name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+        geom_rgba = mj_model.geom_rgba[geom_model_id]
+        if geom_name in ignored_names or body_name in ignored_names or geom_rgba[3] == 0:
+            continue
+
+        ghost_geoms[_reserve_user_geom(viewer)] = {
+            "model_id": geom_model_id,
+            "type": int(geom.type),
+            "size": np.array(geom.size, copy=True),
+            "rgba": np.array(geom.rgba, copy=True),
+            "dataid": int(geom.dataid),
+            "emission": float(geom.emission),
+            "specular": float(geom.specular),
+            "shininess": float(geom.shininess),
+        }
+
+    return ghost_geoms
+
+
+def render_ghost_robot(
+    viewer,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    alpha: float = 0.5,
+    ghost_geoms: dict[int, dict[str, Any]] | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Render or update a translucent ghost robot in a passive MuJoCo viewer."""
+
+    if viewer is None:
+        return {}
+
+    if ghost_geoms is None or len(ghost_geoms) == 0:
+        # Build the cache once from the model geoms, then only update transforms.
+        ghost_geoms = _build_ghost_geoms(viewer, mj_model, mj_data)
+
+    for scn_id, geom in ghost_geoms.items():
+        geom_model_id = geom["model_id"]
+        rgba = np.array(geom["rgba"], copy=True)
+        rgba[3] = alpha
+
+        decorative_geom = viewer.user_scn.geoms[scn_id]
+        mujoco.mjv_initGeom(
+            decorative_geom,
+            type=geom["type"],
+            rgba=rgba,
+            size=geom["size"],
+            pos=mj_data.geom_xpos[geom_model_id],
+            mat=mj_data.geom_xmat[geom_model_id].reshape(9),
+        )
+        decorative_geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+        decorative_geom.segid = -1
+        decorative_geom.objid = -1
+        decorative_geom.dataid = geom["dataid"]
+        decorative_geom.emission = geom["emission"]
+        decorative_geom.specular = geom["specular"]
+        decorative_geom.shininess = geom["shininess"]
+        decorative_geom.reflectance = 0.0
+
+    return ghost_geoms
+
+
+def render_ghost_trajectory(
+    viewer,
+    mj_model: mujoco.MjModel,
+    qpos_sequence: np.ndarray,
+    alphas: np.ndarray,
+    ghost_geoms: list[dict[int, dict[str, Any]] | None] | None = None,
+    scratch_data: mujoco.MjData | None = None,
+    subsample: int = 20,
+) -> tuple[list[dict[int, dict[str, Any]]], mujoco.MjData]:
+    """Render a sequence of ghost robots, typically used for planned trajectories."""
+
+    qpos_sequence = np.asarray(qpos_sequence)
+    alphas = np.asarray(alphas)
+    if subsample > 1:
+        qpos_sequence = qpos_sequence[::subsample]
+        alphas = alphas[::subsample]
+
+    if scratch_data is None:
+        scratch_data = mujoco.MjData(mj_model)
+    if ghost_geoms is None or len(ghost_geoms) != len(qpos_sequence):
+        ghost_geoms = [None] * len(qpos_sequence)
+
+    for idx, (qpos, alpha) in enumerate(zip(qpos_sequence, alphas, strict=False)):
+        scratch_data.qpos = qpos
+        mujoco.mj_forward(mj_model, scratch_data)
+        ghost_geoms[idx] = render_ghost_robot(
+            viewer,
+            mj_model,
+            scratch_data,
+            alpha=float(alpha),
+            ghost_geoms=ghost_geoms[idx],
+        )
+
+    return ghost_geoms, scratch_data
+#----------------------------------------------------------------------------
+def setup_tracking_camera(
+    viewer,
+    model: mujoco.MjModel,
+    body_name: str = "base",
+    distance: float = 2.5,
+    azimuth: float = 135.0,
+    elevation: float = -20.0,
+) -> None:
+    """Set the passive viewer camera to track a robot body.
+
+    Call once after ``viewer.sync()`` inside the ``with launch_passive(...)`` block.
+
+    Args:
+        viewer:     MuJoCo passive viewer handle.
+        model:      The MjModel used by the viewer.
+        body_name:  Name of the body to track (e.g. ``"base"``).
+        distance:   Camera distance from the tracked body [m].
+        azimuth:    Horizontal orbit angle [deg]. 180 = behind, 90 = right side.
+        elevation:  Vertical angle [deg]. Negative looks down at the robot.
+    """
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    if body_id < 0:
+        raise ValueError(
+            f"Body {body_name!r} not found in model. "
+            "Check the body name with mujoco.mj_id2name()."
+        )
+    viewer.cam.type        = mujoco.mjtCamera.mjCAMERA_TRACKING
+    viewer.cam.trackbodyid = body_id
+    viewer.cam.distance    = distance
+    viewer.cam.azimuth     = azimuth
+    viewer.cam.elevation   = elevation

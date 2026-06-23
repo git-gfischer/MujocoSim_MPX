@@ -9,8 +9,8 @@ import jax.numpy as jnp
 import jax
 
 import numpy as np
-import mpx.config.config_srbd as config
-import mpx.utils.mpc_wrapper_srbd as mpc_wrapper_srbd
+import mpx.config.robot_config.config_srbd as config
+import mpx.utils.utils_locomotion.mpc_wrapper_srbd as mpc_wrapper_srbd
 
 gpu_device = jax.devices('gpu')[0]
 jax.default_device(gpu_device)

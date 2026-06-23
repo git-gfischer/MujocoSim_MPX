@@ -10,7 +10,7 @@ This module now supports two usage styles:
 Typical class-based use::
 
     from mpx.config.sim_config.config_foot_ref_config import foot_ref_config
-    from mpx.utils.quadruped_wb.foot_reference import FootReferenceManager
+    from mpx.utils.quadruped_dyn_models.foot_reference import FootReferenceManager
 
     foot_ref = FootReferenceManager(foot_ref_config)
     markers = foot_ref.attach_desired_foot_markers(env.viewer, n_contact=4)
@@ -31,7 +31,7 @@ from mpx.config.sim_config.config_foot_ref_config import (
     foot_ref_config,
 )
 from mpx.utils.sim_utils import alloc_decor_geom
-from mpx.utils.rotation import yaw_rotation_from_quat
+from mpx.utils.math_utils.rotation import yaw_rotation_from_quat
 
 
 # Backward-compatible aliases (prefer ``foot_ref_config`` and ``FootReferenceManager``).
@@ -160,6 +160,61 @@ def tripod_foot_reference_world(
         sampling_mode=sampling_mode,
     )
     return base_frame_feet_to_world(p, quat, foot_sample, n_contact)
+
+
+def swing_foot_anchor_from_target(
+    current_anchor: np.ndarray,
+    leg_idx: int,
+    target_xyz_world: np.ndarray,
+) -> np.ndarray:
+    """
+    Return an updated world-frame foot anchor with the swing leg redirected to a specific target.
+
+    Stance legs keep their positions from ``current_anchor`` unchanged; only the slice
+    corresponding to ``leg_idx`` is replaced with ``target_xyz_world``.
+
+    Args:
+        current_anchor: Flat ``(3 * n_contact,)`` world-frame anchor vector (FL, FR, RL, RR × XYZ).
+        leg_idx:        Index of the swing leg (0-based).
+        target_xyz_world: Desired world-frame XYZ landing position for the swing foot.
+
+    Returns:
+        Updated flat ``(3 * n_contact,)`` anchor vector.
+    """
+    anchor = np.asarray(current_anchor, dtype=np.float64).copy()
+    anchor[3 * leg_idx : 3 * leg_idx + 3] = np.asarray(target_xyz_world, dtype=np.float64).reshape(3)
+    return anchor
+
+
+def foot_target_foot_local_to_world(
+    foot_current_world: np.ndarray,
+    quat: np.ndarray,
+    xyz_foot_local: np.ndarray,
+) -> np.ndarray:
+    """
+    Convert a foot-local frame target to a world-frame target.
+
+    The foot-local frame has its origin at the current foot position in the world and
+    its axes yaw-aligned with the robot base (same yaw rotation as the base frame, but
+    translated to the foot).  This means:
+
+    - X points forward along the robot heading
+    - Y points left
+    - Z points up
+
+    The conversion is:  ``xyz_world = foot_current_world + R_yaw @ xyz_foot_local``
+
+    Args:
+        foot_current_world: Current foot position in the world frame, shape ``(3,)``.
+        quat:               Base orientation quaternion ``[w, x, y, z]``, shape ``(4,)``.
+        xyz_foot_local:     Desired target expressed in the foot-local frame, shape ``(3,)``.
+
+    Returns:
+        Target position in the world frame, shape ``(3,)`` as a float64 numpy array.
+    """
+    ryaw = yaw_rotation_from_quat(jnp.asarray(quat, dtype=jnp.float32))
+    offset = np.asarray(ryaw @ jnp.asarray(xyz_foot_local, dtype=jnp.float32), dtype=np.float64)
+    return np.asarray(foot_current_world, dtype=np.float64).reshape(3) + offset
 
 
 def swing_goal_xyz_from_foot_ref(
@@ -446,6 +501,24 @@ class FootReferenceManager:
         self, foot_ref_flat: np.ndarray, contact_mask: np.ndarray, n_contact: int
     ) -> tuple[int, np.ndarray | None]:
         return swing_goal_xyz_from_foot_ref(foot_ref_flat, contact_mask, n_contact)
+
+    def swing_foot_anchor_from_target(
+        self,
+        current_anchor: np.ndarray,
+        leg_idx: int,
+        target_xyz_world: np.ndarray,
+    ) -> np.ndarray:
+        """Redirect swing leg ``leg_idx`` in ``current_anchor`` to ``target_xyz_world``."""
+        return swing_foot_anchor_from_target(current_anchor, leg_idx, target_xyz_world)
+
+    def foot_target_foot_local_to_world(
+        self,
+        foot_current_world: np.ndarray,
+        quat: np.ndarray,
+        xyz_foot_local: np.ndarray,
+    ) -> np.ndarray:
+        """Convert a foot-local frame offset to a world-frame target."""
+        return foot_target_foot_local_to_world(foot_current_world, quat, xyz_foot_local)
 
     def attach_desired_foot_markers(
         self,

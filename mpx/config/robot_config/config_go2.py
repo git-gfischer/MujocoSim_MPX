@@ -23,8 +23,8 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-import mpx.utils.models as mpc_dyn_model
-import mpx.utils.objectives as mpc_objectives
+import mpx.utils.quadruped_dyn_models.models as mpc_dyn_model
+import mpx.utils.quadruped_dyn_models.objectives as mpc_objectives  
 
 _DIR = os.path.dirname(os.path.realpath(__file__))
 _DEFAULT_MODEL_PATH = os.path.abspath(
@@ -40,32 +40,7 @@ class Go2Mode:
     LOCOMOTION = "locomotion"
     BALANCE = "balance"
 
-def _set_controller_weights(
-    n_joints: int,
-    n_contact: int,
-    Qp_diag: jnp.ndarray,
-    Qrot_diag: jnp.ndarray,
-    Qq_scale: float,
-    Qdp_diag: jnp.ndarray,
-    Qomega_diag: jnp.ndarray,
-    Qdq_scale: float,
-    Qtau_scale: float,
-    Q_grf_scale: float,
-    Qleg_tile: jnp.ndarray,
-) -> jnp.ndarray:
-    Qq = jnp.diag(jnp.ones(n_joints)) * Qq_scale
-    Qdq = jnp.diag(jnp.ones(n_joints)) * Qdq_scale
-    Qtau = jnp.diag(jnp.ones(n_joints)) * Qtau_scale
-    Q_grf = jnp.diag(jnp.ones(3 * n_contact)) * Q_grf_scale
-    Qleg = jnp.diag(jnp.tile(Qleg_tile, n_contact))
-    Qp = jnp.diag(Qp_diag)
-    Qrot = jnp.diag(Qrot_diag)
-    Qdp = jnp.diag(Qdp_diag)
-    Qomega = jnp.diag(Qomega_diag)
-    return jax.scipy.linalg.block_diag(
-        Qp, Qrot, Qq, Qdp, Qomega, Qdq, Qleg, Qtau, Q_grf
-    )
-
+#===========================================================
 # region _Go2Common
 class _Go2Common:
     """MuJoCo model topology and MPC dimensions shared by all Go2 behaviours."""
@@ -82,24 +57,13 @@ class _Go2Common:
     quat0 = jnp.array([1, 0, 0, 0])
     q0 = jnp.array([0, 0.9, -1.8, 0, 0.9, -1.8, 0, 0.9, -1.8, 0, 0.9, -1.8])
     q0_init = jnp.array([0, 0.9, -1.8, 0, 0.9, -1.8, 0, 0.9, -1.8, 0, 0.9, -1.8])
-    p_legs0 = jnp.array(
-        [
-            0.192,
-            0.142,
-            0.0,
-            0.192,
-            -0.142,
-            0.0,
-            -0.195,
-            0.142,
-            0.0,
-            -0.195,
-            -0.142,
-            0.0,
-        ]
-    )
+    p_legs0 = jnp.array([ 0.192, 0.142, .0,  # Initial position of the front left leg
+                          0.192, -0.142, .0, # Initial position of the front right leg
+                         -0.195, 0.142, .0,  # Initial position of the rear left leg
+                         -0.195, -0.142, .0  # Initial position of the rear right leg
+                         ])
 
-    n_joints: int = 12
+    #n_joints: int = 12
     grf_as_state: bool = True
     u_ref = jnp.zeros(12)
 
@@ -108,25 +72,39 @@ class _Go2Common:
 
     # Default dynamics = locomotion model; ``Go2Balance`` overrides with
     # ``quadruped_wb_dynamics_balance``.
-    dynamics = staticmethod(mpc_dyn_model.quadruped_wb_dynamics)
+    #dynamics = staticmethod(mpc_dyn_model.quadruped_wb_dynamics)
     max_torque: float = 25.0
     min_torque: float = -25.0
 
-    swing_tracking: bool = True
-
+    #swing_tracking: bool = True
+    
     @property
-    def n_contact(self) -> int:
+    def n_joints(self) -> int: # number of joints (12)
+        return 12
+    
+    @property
+    def n_contact(self) -> int: # number of contact points (FL, FR, RL, RR)
         return len(self.contact_frame)
 
     @property
-    def n(self) -> int:
+    def n(self) -> int: # number of states (theta1, theta1_dot, theta2, theta2_dot)
         return 13 + 2 * self.n_joints + 6 * self.n_contact
 
     @property
-    def m(self) -> int:
+    def m(self) -> int: # number of controls (F)
         return self.n_joints
-#endregion
 
+    @property
+    def initial_state(self) -> jnp.ndarray:
+        """Nominal MPC state vector of length ``self.n`` (uses subclass ``p0``)."""
+        core = jnp.concatenate(
+            [self.p0, self.quat0, self.q0, jnp.zeros(6 + self.n_joints), self.p_legs0]
+        )
+        if self.grf_as_state:
+            return jnp.concatenate([core, jnp.zeros(3 * self.n_contact)])
+        return core
+#endregion
+#===========================================================
 # region Go2Locomotion
 class Go2Locomotion(_Go2Common):
     """Trot gait, terrain estimator on, lateral base position softly unconstrained."""
@@ -134,15 +112,7 @@ class Go2Locomotion(_Go2Common):
     behaviour: str = "locomotion"
     swing_tracking: bool = True
 
-    @property
-    def cost(self):
-        return partial(mpc_objectives.quadruped_wb_locomotion_obj)
-
-    @property
-    def hessian_approx(self):
-        return partial(mpc_objectives.quadruped_wb_locomotion_hessian_gn)
-
-    robot_height: float = 0.33
+    robot_height: float = 0.27
     p0 = jnp.array([0, 0, robot_height])
 
     # change the gait pattern
@@ -154,24 +124,45 @@ class Go2Locomotion(_Go2Common):
     duty_factor: float = 0.65
     step_freq: float = 1.35
     step_height: float = 0.18
-    initial_height: float = 0.1
+    initial_height: float = 0.27
 
     use_terrain_estimation: bool = True
+    solver_mode = "primal_dual"
 
-    W = _set_controller_weights(
-        n_joints=12,
-        n_contact=4,
-        Qp_diag=jnp.array([0.0, 0.0, 1e4]),
-        Qrot_diag=jnp.array([100.0, 100.0, 0.0]),
-        Qq_scale=1e-1,
-        Qdp_diag=jnp.array([1.0, 1.0, 1.0]) * 5e3,
-        Qomega_diag=jnp.array([1.0, 1.0, 1.0]) * 1e2,
-        Qdq_scale=1e0,
-        Qtau_scale=1e-1,
-        Q_grf_scale=1e-1,
-        Qleg_tile=jnp.array([1e4, 1e4, 1e5]),
-    )
-# endregion
+    @property
+    def cost(self):
+        return partial(mpc_objectives.quadruped_wb_obj, True, self.n_joints, self.n_contact, self.N)
+
+    @property
+    def dynamics(self):
+        n_joints = self.n_joints
+        dt = self.dt
+        def _factory(model, mjx_model, contact_id, body_id):
+            return partial(mpc_dyn_model.quadruped_wb_dynamics, model, mjx_model, contact_id, body_id, n_joints, dt)
+        return _factory
+
+    @property
+    def hessian_approx(self):
+        return None
+
+    @property
+    def W(self):        # define weights for the MPC controller-------
+        # Cost matrices (diagonal matrices created using jnp.diag)
+        Qp    = jnp.diag(jnp.array([0, 0, 1e4]))  # Cost matrix for position
+        Qrot  = jnp.diag(jnp.array([1000, 1000, 0]))  # Cost matrix for rotation
+        Qq    = jnp.diag(jnp.ones(self.n_joints)) * 1e-1  # Cost matrix for joint angles
+        Qdp   = jnp.diag(jnp.array([1, 1, 1])) * 5e3  # Cost matrix for position derivatives
+        Qomega= jnp.diag(jnp.array([1, 1, 1])) * 1e2  # Cost matrix for angular velocity
+        Qdq   = jnp.diag(jnp.ones(self.n_joints)) * 1e-1  # Cost matrix for joint angle derivatives
+        Qtau  = jnp.diag(jnp.ones(self.n_joints)) * 1e-1  # Cost matrix for torques
+        Q_grf = jnp.diag(jnp.ones(3 * self.n_contact)) * 1e-2  # Cost matrix for ground reaction forces
+
+        # For the leg contact cost, repeat the unit cost for each contact point.
+        Qleg = jnp.diag(jnp.tile(jnp.array([1e4, 1e4, 1e5]), self.n_contact))
+
+        # Combine all cost matrices into a block diagonal matrix
+        return jax.scipy.linalg.block_diag(Qp, Qrot, Qq, Qdp, Qomega, Qdq, Qleg, Qtau,Q_grf)
+    #------------------------------------------------
 
 # region Go2Balance
 class Go2Balance(_Go2Common):
@@ -200,6 +191,9 @@ class Go2Balance(_Go2Common):
     model layout (not supported here).
     """
 
+    #n_joints: int = 12
+    #n_contact: int = 4
+
     behaviour: str = "balance"
     swing_tracking: bool = True # this is the flag for the foot tracking cost
     use_balance_fixed_contact: bool = True
@@ -208,15 +202,21 @@ class Go2Balance(_Go2Common):
     use_tripod_nominal_foot_ref: bool = True
     tripod_foot_ref_sigma = jnp.array([0.03, 0.03, 0.005])
 
-    dynamics = staticmethod(mpc_dyn_model.quadruped_wb_dynamics_balance)
+    @property
+    def dynamics(self):
+        n_joints = self.n_joints
+        dt = self.dt
+        def _factory(model, mjx_model, contact_id, body_id):
+            return partial(mpc_dyn_model.quadruped_wb_dynamics, model, mjx_model, contact_id, body_id, n_joints, dt)
+        return _factory
 
     @property
     def cost(self):
-        return partial(mpc_objectives.quadruped_wb_balance_obj)
+        return partial(mpc_objectives.quadruped_wb_obj, True, self.n_joints, self.n_contact, self.N)
 
     @property
     def hessian_approx(self):
-        return partial(mpc_objectives.quadruped_wb_balance_hessian_gn)
+        return None
 
     robot_height: float = 0.27 # this is the nominal height of the robot
     p0 = jnp.array([0, 0, robot_height]) # this is the nominal position of the robot
@@ -230,23 +230,26 @@ class Go2Balance(_Go2Common):
 
     use_terrain_estimation: bool = False
 
-    # ``n_contact=4``: always four foot *slots* in the OCP (see class docstring). Stance layout
-    # (4 / 3 / 2 nominal stance feet) is selected only via ``balance_fixed_contact_mask``, not here.
-    # Tripod tuning note: large Qleg(z) on all four slots can fight measured feet; softer tiles help.
-    W = _set_controller_weights(
-        n_joints=12,
-        n_contact=4,
-        Qp_diag=jnp.array([9e2, 9e2, 1.2e4]), # this is the cost matrix for the position of the robot
-        Qrot_diag=jnp.array([2200.0, 2200.0, 2200.0]), # this is the cost matrix for the rotation of the robot
-        Qq_scale=1e2,
-        Qdp_diag=jnp.array([1.0, 1.0, 1.0]) * 8e3, # this is the cost matrix for the position derivatives of the robot
-        Qomega_diag=jnp.array([1.0, 1.0, 1.0]) * 3e2, # this is the cost matrix for the angular velocity of the robot
-        Qdq_scale=1e0, # this is the cost matrix for the joint angle derivatives of the robot
-        Qtau_scale=1e-1, # this is the cost matrix for the torques of the robot
-        Q_grf_scale=1e-2, # this is the cost matrix for the ground reaction forces of the robot
-        Qleg_tile=jnp.array([7e3, 7e3, 6e4]), # this is the cost matrix for the leg contacts of the robot
-    )
+    # define weights for the MPC controller-------
+    @property
+    def W(self):
+        # Cost matrices (diagonal matrices created using jnp.diag)
+        Qp    = jnp.diag(jnp.array([9e2, 9e2, 1.2e4]))  # Cost matrix for position
+        Qrot  = jnp.diag(jnp.array([2200.0, 2200.0, 2200.0]))  # Cost matrix for rotation
+        Qq    = jnp.diag(jnp.ones(self.n_joints)) * 1e2  # Cost matrix for joint angles
+        Qdp   = jnp.diag(jnp.array([1, 1, 1])) * 8e3  # Cost matrix for position derivatives
+        Qomega= jnp.diag(jnp.array([1, 1, 1])) * 3e2  # Cost matrix for angular velocity
+        Qdq   = jnp.diag(jnp.ones(self.n_joints)) * 1e0  # Cost matrix for joint angle derivatives
+        Qtau  = jnp.diag(jnp.ones(self.n_joints)) * 1e-1  # Cost matrix for torques
+        Q_grf = jnp.diag(jnp.ones(3 * self.n_contact)) * 1e-2  # Cost matrix for ground reaction forces
 
+        # For the leg contact cost, repeat the unit cost for each contact point.
+        Qleg = jnp.diag(jnp.tile(jnp.array([7e3, 7e3, 6e4]), self.n_contact))
+
+        # Combine all cost matrices into a block diagonal matrix
+        W = jax.scipy.linalg.block_diag(Qp, Qrot, Qq, Qdp, Qomega, Qdq, Qleg, Qtau,Q_grf)
+        return W
+    #------------------------------------------------
     def __init__(self, balance_stance: str | None = None) -> None:
         """
         Parameters

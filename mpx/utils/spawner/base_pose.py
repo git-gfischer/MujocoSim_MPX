@@ -62,6 +62,11 @@ class BasePoseRandomizer:
         robot_cfg.quat0 = jnp.asarray(quat0)
 
 
+# Backward-compatible aliases for older imports used by examples.
+FourLegBalanceBasePoseRandomizationConfig = BasePoseRandomizationConfig
+FourLegBalanceBasePoseRandomizer = BasePoseRandomizer
+
+
 @dataclass(frozen=True)
 class DesiredBasePoseVisualizationConfig:
     """Viewer styling for desired base orientation/height markers."""
@@ -128,3 +133,9 @@ class DesiredBasePoseVisualizer:
             color=np.array([1.0, 0.95, 0.2, self.cfg.height_alpha], dtype=np.float64),
             geom_id=self._height_id,
         )
+
+
+def make_desired_base_pose_visualizer(*, enabled: bool = True) -> DesiredBasePoseVisualizer:
+    """Build a desired-base-pose visualizer with default styling."""
+
+    return DesiredBasePoseVisualizer(DesiredBasePoseVisualizationConfig(enabled=enabled))

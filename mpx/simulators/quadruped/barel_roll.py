@@ -15,7 +15,7 @@ import copy
 from gym_quadruped.utils.mujoco.visual import render_sphere, render_vector,render_ghost_robot 
  
 import mpx.utils.mpc_wrapper as mpc_wrapper
-import mpx.config.config_barrel_roll as config
+import mpx.config.robot_config.config_barrel_roll as config
 
 from timeit import default_timer as timer
 import time

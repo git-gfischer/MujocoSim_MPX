@@ -10,7 +10,7 @@ from mujoco import mjx
 import mujoco.viewer
 from timeit import default_timer as timer
 import mpx.utils.mpc_wrapper as mpc_wrapper
-import mpx.config.config_talos as config
+import mpx.config.robot_config.config_talos as config
 # from gym_quadruped.quadruped_env import QuadrupedEnv
 from gym_quadruped.utils.mujoco.visual import render_ghost_robot
 from functools import partial
@@ -32,7 +32,7 @@ offset_x = jnp.tile(jnp.arange(robots_per_row),(1,robots_per_row)).flatten()
 offset_y = jnp.tile(jnp.arange(robots_per_row),(robots_per_row,1)).T.flatten()
 offset = jnp.concatenate([offset_x[:, None], offset_y[:, None], jnp.zeros((n_env, 5 + config.n_joints))], axis=-1)
 # Build model and data
-model = mujoco.MjModel.from_xml_path(dir_path + '/../data/pal_talos/scene_motor.xml')
+model = mujoco.MjModel.from_xml_path(dir_path + '/../../data/pal_talos/scene_motor.xml')
 data = mujoco.MjData(model)
 model.opt.timestep = 1/sim_frequency
 

@@ -7,7 +7,7 @@ Typical use::
         FootReferenceConfig,
         foot_ref_config,
     )
-    from mpx.utils.quadruped_wb.foot_reference import FootReferenceManager
+    from mpx.utils.quadruped_dyn_models.foot_reference import FootReferenceManager
 
     # Use defaults:
     foot_ref = FootReferenceManager(foot_ref_config)

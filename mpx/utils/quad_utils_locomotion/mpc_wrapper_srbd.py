@@ -2,7 +2,8 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 import mpx.utils.mpc_utils as mpc_utils
-import mpx.utils.models as mpc_dyn_model
+from mpx.utils.utils_locomotion.reference_generator_locomotion import reference_generator_srbd
+import mpx.utils.quadruped_dyn_models.models as mpc_dyn_model
 import mpx.utils.objectives as mpc_objectives
 import mujoco 
 from mujoco import mjx
@@ -67,7 +68,7 @@ class BatchedMPCControllerWrapper:
 
         work = partial(optimizers.mpc, cost, dynamics, hessian_approx, False)
         
-        reference_generator = partial(mpc_utils.reference_generator_srbd,
+        reference_generator = partial(reference_generator_srbd,
             config.use_terrain_estimator ,config.N, config.dt, config.n_contact , mass = config.mass, clearence_speed = config.clearence_speed, duty_factor = config.duty_factor,  step_freq= config.step_freq ,step_height=config.step_height,foot0 = config.p_legs0)
         
         whole_body_control = partial(mpc_utils.whole_body_interface, model, mjx_model, contact_id, body_id,config.whole_body_frequency,config.Kp,config.Kd)

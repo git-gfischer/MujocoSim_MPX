@@ -3,7 +3,6 @@ import types
 
 import jax.numpy as jnp
 import jax
-import mujoco
 # Update JAX configuration
 jax.config.update("jax_compilation_cache_dir", "./jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
@@ -21,17 +20,17 @@ from mpx.config.sim_config.config_quad_spawn import spawn_config
 from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config
 
 from mpx.utils.base_force_perturbation import RandomBaseForcePerturbation
-from mpx.utils.quadruped_wb.base_pose import (
-    DesiredBasePoseVisualizationConfig,
-    DesiredBasePoseVisualizer,
+
+from mpx.utils.spawner.base_pose import (
+    BasePoseRandomizationConfig,
     BasePoseRandomizer,
+    make_desired_base_pose_visualizer,
 )
 
-from mpx.utils.spawner import (
+from mpx.utils.spawner.spawner import (
     RobotMapSpawner,
+    RandomizedSpawnManager,
     SpawnCollisionError,
-    _random_map_respawn,
-    reset_robot_and_mpc,
 )
 
 from timeit import default_timer as timer
@@ -47,11 +46,11 @@ GO2_CONTROLLER_MODE = Go2Mode.BALANCE
 
 # Balance: BalanceStance.FOUR, TRIPOD_SWING_FL|FR|RL|RR, DIAG_FL_RR, DIAG_FR_RL.
 # Pass nominal MPC contact flags from the stance so MPC isn't fed all-ones detector contact while a leg is commanded swing.
-config = go2_config(GO2_CONTROLLER_MODE, balance_stance=BalanceStance.FOUR)
+config = go2_config(GO2_CONTROLLER_MODE, balance_stance=BalanceStance.TRIPOD_SWING_FL)
 
  # Define robot and scene parameters
 robot_name = "go2"   # "aliengo", "mini_cheetah", "go2", "hyqreal", ...
-scene_name = "random_boxes" # "random_boxes", "rough", "perlin", "flat", "random_boxes_sparse", "random_boxes_dense"
+scene_name = "flat" # "random_boxes", "rough", "perlin", "flat", "random_boxes_sparse", "random_boxes_dense"
 
 # endregion
 
@@ -82,40 +81,40 @@ obs = env.reset(random=False)
 # Define the MPC wrapper
 mpc = mpc_wrapper.MPCControllerWrapper(config)
 
-_base_pose_randomizer = FourLegBalanceBasePoseRandomizer(
-    nominal_p0=np.asarray(config.p0, dtype=np.float64),
-    nominal_quat0=np.asarray(config.quat0, dtype=np.float64),
-    # Spawn pose randomization: keep legacy in-example tuning.
-    cfg=FourLegBalanceBasePoseRandomizationConfig(
-        enabled=True,
-        z_offset_range=(-0.03, 0.06),
-        roll_range_deg=(-7.5, 7.5),
-        pitch_range_deg=(-7.5, 7.5),
-        yaw_range_deg=(-20.0, 20.0),
-    ),
-    rng_seed=spawn_config.rng_seed,
-)
-_desired_pose_randomizer = FourLegBalanceBasePoseRandomizer(
-    nominal_p0=np.asarray(config.p0, dtype=np.float64),
-    nominal_quat0=np.asarray(config.quat0, dtype=np.float64),
-    # Desired pose randomization: uses defaults from pose_ref_4leg_config.py.
-    cfg=FourLegBalanceBasePoseRandomizationConfig(),
-    rng_seed=None if spawn_config.rng_seed is None else (spawn_config.rng_seed + 1),
-)
-_desired_base_pose_visualizer = DesiredBasePoseVisualizer(
-    DesiredBasePoseVisualizationConfig(enabled=True)
-)
-
-
 
 
 # region spawner configuration ---------------------------------------------------
+
+_base_pose_randomizer = BasePoseRandomizer(
+    nominal_p0=np.asarray(config.p0, dtype=np.float64),
+    nominal_quat0=np.asarray(config.quat0, dtype=np.float64),
+    # Spawn pose randomization: configured via ``config_quad_spawn.py``.
+    cfg=BasePoseRandomizationConfig(
+        enabled=spawn_config.base_pose_randomization_enabled,
+        z_offset_range=spawn_config.base_pose_z_offset_range,
+        roll_range_deg=spawn_config.base_pose_roll_range_deg,
+        pitch_range_deg=spawn_config.base_pose_pitch_range_deg,
+        yaw_range_deg=spawn_config.base_pose_yaw_range_deg,
+    ),
+    rng_seed=spawn_config.rng_seed,
+)
+_desired_pose_randomizer = BasePoseRandomizer(
+    nominal_p0=np.asarray(config.p0, dtype=np.float64),
+    nominal_quat0=np.asarray(config.quat0, dtype=np.float64),
+    # Desired pose randomization: uses defaults from pose_ref_4leg_config.py.
+    cfg=BasePoseRandomizationConfig(),
+    rng_seed=None if spawn_config.rng_seed is None else (spawn_config.rng_seed + 1),
+)
+
+_desired_base_pose_visualizer = make_desired_base_pose_visualizer(enabled=True)
+
+
 spawn_region = spawn_config.spawn_region()
 _spawn_region_visual = None
 _spawner: RobotMapSpawner | None = None
+_spawn_manager: RandomizedSpawnManager
 
 if spawn_config.use_random_map_spawn:
-    _refresh_config_reset_pose()
     _rng = np.random.default_rng(spawn_config.rng_seed)
     _spawner = RobotMapSpawner(
         spawn_region,
@@ -134,28 +133,32 @@ if spawn_config.use_random_map_spawn:
         foot_relief_max=spawn_config.foot_relief_max,
         verbose=spawn_config.verbose,
     )
-    try:
-        _spawner.apply(env, config.p0, config.quat0, config.q0)
-    except SpawnCollisionError as e:
-        import traceback
-
-        print(f"[mjx_quad] spawn failed: {e}", flush=True)
-        traceback.print_exc()
-        raise
-else: # Spawn always in the same place
-    _refresh_config_reset_pose()
-    env.mjData.qpos[:] = np.asarray(
-        jnp.concatenate([config.p0, config.quat0, config.q0]), dtype=np.float64
-    )
-    env.mjData.qvel[:] = 0.0
-    mujoco.mj_forward(env.mjModel, env.mjData)
+elif spawn_config.show_spawn_region:
     # Region overlay still needs a spawner instance (same ``SpawnRegion`` bounds).
-    if spawn_config.show_spawn_region:
-        _spawner = RobotMapSpawner(spawn_region, check_collisions=False)
+    _spawner = RobotMapSpawner(spawn_region, check_collisions=False)
+
+_spawn_manager = RandomizedSpawnManager(
+    config=config,
+    mpc=mpc,
+    base_pose_randomizer=_base_pose_randomizer,
+    desired_pose_randomizer=_desired_pose_randomizer,
+    spawner=_spawner if spawn_config.use_random_map_spawn else None,
+    use_random_map_spawn=spawn_config.use_random_map_spawn,
+)
+
+try:
+    _spawn_manager.spawn(env)
+except SpawnCollisionError as e:
+    import traceback
+
+    print(f"[mjx_quad] spawn failed: {e}", flush=True)
+    traceback.print_exc()
+    raise
 # endregion
 
 
 env.render()  # creates passive viewer
+mpc.attach_swing_goal_marker(env.viewer)
 
 if spawn_config.show_spawn_region and _spawner is not None:
     _spawn_region_visual = _spawner.render_spawn_region(env.viewer, z=spawn_config.region_z)
@@ -182,9 +185,7 @@ def _mjx_quad_key_callback(self, keycode: int) -> None:
         and int(keycode) in spawn_config.respawn_keycodes
     ):
         print(f"[mjx_quad] random map respawn (key {keycode})", flush=True)
-        _refresh_config_reset_pose()
-        q, tau = reset_robot_and_mpc(env, config, mpc, _spawner)
-        _refresh_mpc_desired_pose()
+        q, tau = _spawn_manager.reset_robot_and_mpc(env)
         _base_force_pert.reset()
         return
     QuadrupedEnv._key_callback(self, keycode)
@@ -202,17 +203,13 @@ ids = []
 #               np.array([1, 0, 0, 1])))
 counter = 0
 # Main simulation loop
-tau = jnp.zeros(config.n_joints)
+q, tau = _spawn_manager.reset_robot_and_mpc(env)
 tau_old = jnp.zeros(config.n_joints)
 delay = int(0.007*sim_frequency)
 print('Delay: ',delay)
 
-q = config.q0.copy()
 dq = jnp.zeros(config.n_joints)
 mpc_time = 0
-mpc.reset(np.asarray(env.mjData.qpos, dtype=np.float64).copy(),
-          np.asarray(env.mjData.qvel, dtype=np.float64).copy())
-_refresh_mpc_desired_pose()
 
 
 def _mjx_quad_step(action):
@@ -266,6 +263,19 @@ while env.viewer.is_running(): # Main simulation loop
                 state, reward, is_terminated, is_truncated, info = _mjx_quad_step(tau + tau_fb)
                 counter += 1
         start = timer()
+        # Tripod: set a foot-local target once; unlock when the foot reaches it so the
+        # same offset can be re-captured from the new foot position on the next cycle.
+        _tripod_offsets = {
+            BalanceStance.TRIPOD_SWING_FL: (0, np.array([0.01,  0.01, 0.1])),
+            BalanceStance.TRIPOD_SWING_FR: (1, np.array([0.01, -0.01, 0.1])),
+            BalanceStance.TRIPOD_SWING_RL: (2, np.array([-0.01,  0.01, 0.1])),
+            BalanceStance.TRIPOD_SWING_RR: (3, np.array([-0.01, -0.01, 0.1])),
+        }
+        if config.balance_stance in _tripod_offsets:
+            _leg, _offset = _tripod_offsets[config.balance_stance]
+            mpc.is_swing_foot_target_reached(_leg, qpos)
+            mpc.set_swing_foot_target_foot_local(_leg, _offset, qpos)
+                
         tau, q, dq = mpc.run(qpos,qvel,input,contact)
         stop = timer()
 
@@ -281,12 +291,7 @@ while env.viewer.is_running(): # Main simulation loop
     state, reward, is_terminated, is_truncated, info = _mjx_quad_step(tau + tau_fb)
 
     if is_terminated or is_truncated:
-        _refresh_config_reset_pose()
-        if spawn_config.use_random_map_spawn and _spawner is not None:
-            _, q, tau = _random_map_respawn(env, config, mpc, _spawner)
-        else:
-            q, tau = reset_robot_and_mpc(env, config, mpc, None)
-        _refresh_mpc_desired_pose()
+        q, tau = _spawn_manager.reset_robot_and_mpc(env)
         _base_force_pert.reset()
 
     # time.sleep(0.1)

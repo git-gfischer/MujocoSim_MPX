@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 import jax 
-import mpx.utils.models as mpc_dyn_model
+import mpx.utils.quadruped_dyn_models.models as mpc_dyn_model
 import mpx.utils.objectives as mpc_objectives
 import os 
 import sys 

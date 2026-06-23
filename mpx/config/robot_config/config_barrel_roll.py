@@ -1,8 +1,9 @@
 import jax.numpy as jnp
 import jax 
-import mpx.utils.models as mpc_dyn_model
+import mpx.utils.quadruped_dyn_models.models as mpc_dyn_model
 import mpx.utils.objectives as mpc_objectives
 import mpx.utils.mpc_utils as mpc_utils
+from mpx.utils.utils_locomotion.reference_generator_locomotion import reference_barell_roll
 import os 
 from functools import partial
 
@@ -85,7 +86,7 @@ use_terrain_estimation = True  # Flag to use terrain estimation
 cost = partial(mpc_objectives.quadruped_wb_obj,False)
 hessian_approx = partial(mpc_objectives.quadruped_wb_hessian_gn,False)
 dynamics = mpc_dyn_model.quadruped_wb_dynamics
-reference = mpc_utils.reference_barell_roll
+reference = reference_barell_roll
 # dynamics = mpc_dyn_model.quadruped_wb_dynamics_learned_contact_model
 # dynamics = mpc_dyn_model.quadruped_wb_dynamics_explicit_contact
 max_torque = 40

@@ -21,17 +21,21 @@ import numpy as np
 
 import jax.numpy as jnp
 
+
 from mpx.utils.sim_utils import (
     _alloc_decor_geom, 
     _body_label, 
     _bodies_direct_parent_child,
     _geom_label,
     _leg_prefix_from_body_name, # 
-    _quat_mul_wxyz, # 
-    _quat_normalize_wxyz, # 
     geom_belongs_to_robot_under_root,
-    quat_yaw_wxyz,
     resolve_foot_geom_ids,
+)
+
+from mpx.utils.math_utils.quad_math import (
+    _quat_mul_wxyz,
+    _quat_normalize_wxyz,
+    quat_yaw_wxyz,
 )
 
 def reset_robot_and_mpc(env, config, mpc, spawner: RobotMapSpawner | None = None):
@@ -511,6 +515,42 @@ class RobotMapSpawner:
     def _debug(self, msg: str) -> None:
         if self.verbose:
             print(f"[RobotMapSpawner] {msg}", flush=True)
+    
+    @classmethod
+    def from_config(
+        cls,
+        cfg,  # BasePoseRandomizationConfig OR SpawnConfig
+        *,
+        foot_geom_names=(),
+        check_collisions: bool = False,
+        **kwargs,
+    ) -> "RobotMapSpawner":
+        """Build a spawner from BasePoseRandomizationConfig or SpawnConfig.
+
+        SpawnConfig: uses spawn_region() (manual_region_x/y + region_yaw).
+        BasePoseRandomizationConfig: uses yaw_range_deg only, XY fixed at 0.
+        """
+        # SpawnConfig path — has XY + yaw from manual_region_* and region_yaw
+        if hasattr(cfg, 'spawn_region'):
+            return cls(
+                region=cfg.spawn_region(),
+                foot_geom_names=foot_geom_names,
+                check_collisions=check_collisions,
+                **kwargs,
+            )
+        # BasePoseRandomizationConfig path — yaw only, XY fixed at origin
+        if not cfg.enabled:
+            region = SpawnRegion(x=(0.0, 0.0), y=(0.0, 0.0), yaw=(0.0, 0.0))
+        else:
+            yaw_lo = float(np.deg2rad(cfg.yaw_range_deg[0]))
+            yaw_hi = float(np.deg2rad(cfg.yaw_range_deg[1]))
+            region = SpawnRegion(x=(0.0, 0.0), y=(0.0, 0.0), yaw=(yaw_lo, yaw_hi))
+        return cls(
+            region=region,
+            foot_geom_names=foot_geom_names,
+            check_collisions=check_collisions,
+            **kwargs,
+        )
 
     def _evaluate_pose(self, model: mujoco.MjModel, qpos: np.ndarray) -> tuple[str | None, int]:
         trial = self._get_trial_data(model)
@@ -820,3 +860,45 @@ class RobotMapSpawner:
             "or increase ``foot_relief_max`` / set ``try_foot_vertical_relief=True``. "
             "Set verbose=True for per-attempt traces."
         )
+
+    def apply_to_data(self, model, data, p0, quat0, q0, *, xy_yaw=None, forward=True):
+
+        def finalize(qvec):
+            data.qpos[:] = np.asarray(qvec, dtype=np.float64).reshape(model.nq)
+            if self.reset_velocities:
+                data.qvel[:] = 0.0
+            if forward:
+                mujoco.mj_forward(model, data)
+            return np.asarray(data.qpos.copy(), dtype=np.float64)
+
+        qpos_candidate = self.build_qpos(p0, quat0, q0, xy_yaw=xy_yaw)
+
+        if not self.check_collisions:
+            return finalize(qpos_candidate)
+
+        # Stage 1: self-collision (invariant to XY/yaw)
+        p_nom = np.asarray(p0, dtype=np.float64).reshape(3)
+        qpos_inv = self.build_qpos(p0, quat0, q0, xy_yaw=(float(p_nom[0]), float(p_nom[1]), 0.0))
+        reason, _ = self._evaluate_self_collision_only(model, qpos_inv)
+        if reason is not None:
+            raise SpawnCollisionError(f"Nominal pose is self-colliding: {reason}")
+
+        # Stage 2: explicit xy_yaw — validate once with vertical relief
+        if xy_yaw is not None:
+            q_ok, reason, _ = self._seek_vertical_relief(model, qpos_candidate)
+            if q_ok is not None:
+                return finalize(q_ok)
+            raise SpawnCollisionError(f"Explicit xy_yaw failed after relief: {reason}")
+
+        # Stage 3: random sampling with rejection
+        for _ in range(self.max_spawn_attempts):
+            q_try = self.build_qpos(p0, quat0, q0)
+            q_ok, _, _ = self._seek_vertical_relief(model, q_try)
+            if q_ok is not None:
+                return finalize(q_ok)
+
+        raise SpawnCollisionError(
+            f"No collision-free spawn within {self.max_spawn_attempts} attempts."
+        )
+
+

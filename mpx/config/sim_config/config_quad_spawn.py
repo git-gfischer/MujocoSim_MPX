@@ -16,21 +16,33 @@ Typical use::
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
 
-from mpx.utils.spawner import SpawnRegion
+from mpx.utils.spawner.spawner import SpawnRegion
+import glfw
 
+
+# @dataclass(frozen=True)
+# class BasePoseRandomizationConfig:
+#     """Sampling ranges for base pose perturbations around a nominal pose."""
+
+#     enabled: bool = True
+#     z_offset_range: tuple[float, float] = (-0.2, 0.2)
+#     roll_range_deg: tuple[float, float] = (-40.5, 40.5)
+#     pitch_range_deg: tuple[float, float] = (-40.5, 40.5)
+#     yaw_range_deg: tuple[float, float] = (-180.0, 180.0)
+#     min_base_height: float = 0.05
 
 @dataclass
 class SpawnConfig:
     """Map spawn sampling, collision checks, viewer overlay, and keyboard respawn."""
 
     # XY/yaw sampling bounds (metres, radians). Base Z is not sampled here.
-    manual_region_x: tuple[float, float] = (0.5, 6.5)
-    manual_region_y: tuple[float, float] = (-3.5, 3.5)
+    manual_region_x: tuple[float, float] = (0.5, 6.5) # meters
+    manual_region_y: tuple[float, float] = (-3.5, 3.5) # meters
     region_yaw: tuple[float, float] = (-np.pi, np.pi)
 
     use_random_map_spawn: bool = True
@@ -50,11 +62,18 @@ class SpawnConfig:
     foot_relief_step: float = 0.005  # [m]
     foot_relief_max: float = 0.10  # [m]
 
+    # Base-pose randomization applied before spawn/reset in balance mode.
+    # base_pose: BasePoseRandomizationConfig = field(
+    # default_factory=BasePoseRandomizationConfig)
+
     rng_seed: int | None = None  # e.g. 0 for repeatable random poses
     verbose: bool = False
 
-    # GLFW keycodes: R, Backspace — new random map spawn (not MuJoCo fixed snapshot reset).
-    respawn_keycodes: tuple[int, ...] = (82, 259)
+    # GLFW keycodes: B, Backspace — new random map spawn (not MuJoCo fixed snapshot reset).
+    respawn_keycodes: tuple[int, ...] = (66, 259)
+
+    crash_height_fraction: float = 0.5   # fraction of robot_height
+    crash_tilt_deg: float = 60.0
 
     @property
     def check_self_collision(self) -> bool:

@@ -14,23 +14,18 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 import numpy as np
-# from gym_quadruped.utils.mujoco.visual import render_sphere ,render_vector
+from gym_quadruped.utils.mujoco.visual import render_sphere ,render_vector
 import mpx.utils.mpc_wrapper as mpc_wrapper
-import mpx.config.config_h1 as config
+import mpx.config.robot_config.config_talos as config
 
-model = mujoco.MjModel.from_xml_path(dir_path + '/../data/unitree_h1/mjx_scene_h1_walk.xml')
+model = mujoco.MjModel.from_xml_path(dir_path+'/../../data/pal_talos/talos_motor_rough.xml')
 data = mujoco.MjData(model)
-mpc_frequency = 50.0
 sim_frequency = 500.0
 model.opt.timestep = 1/sim_frequency
 
-# contact_id = []
-# for name in config.contact_frame:
-#     contact_id.append(mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_GEOM,name))
-# body_id = []
-# for name in config.body_name:
-#     body_id.append(mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_BODY,name))
-
+contact_id = []
+for name in config.contact_frame:
+    contact_id.append(mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_GEOM,name))
 mpc = mpc_wrapper.MPCControllerWrapper(config)
 data.qpos = jnp.concatenate([config.p0, config.quat0,config.q0])
 
@@ -64,17 +59,18 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             ref_base_lin_vel = jnp.array([0.3,0,0])
             ref_base_ang_vel = jnp.array([0,0,0.0])
             
-
+            # x0 = jnp.concatenate([qpos, qvel,jnp.zeros(3*config.n_contact)])
             input = np.array([ref_base_lin_vel[0],ref_base_lin_vel[1],ref_base_lin_vel[2],
                            ref_base_ang_vel[0],ref_base_ang_vel[1],ref_base_ang_vel[2],
                            1.0])
             
             #set this to the current contact state to use the blind step adaptation
             contact = np.zeros(config.n_contact)
-
+        
             start = timer()
-            tau, q, dq = mpc.run(qpos,qvel,input,contact)   
+            tau, q, dq  = mpc.run(qpos,qvel,input,contact)   
             stop = timer()
+            
             print(f"Time elapsed: {stop-start}")            
         counter += 1        
         data.ctrl = tau - 3*qvel[6:6+config.n_joints]

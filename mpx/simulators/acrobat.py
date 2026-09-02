@@ -10,7 +10,7 @@ os.environ.update({
 import jax.numpy as jnp
 import jax
 
-import  mpx.primal_dual_ilqr.primal_dual_ilqr.optimizers as optimizers
+import mpx.jax_ocp_solvers.optimizers as optimizers
 # Problem dimensions
 N = 100  # Number of stages
 n = 4    # Number of states (theta1, theta1_dot, theta2, theta2_dot)

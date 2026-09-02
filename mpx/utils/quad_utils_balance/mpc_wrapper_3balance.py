@@ -22,7 +22,7 @@ from mpx.utils.ref_gen_wrapper import whole_body_reference_partial
 
 import mujoco
 from mujoco import mjx
-import mpx.primal_dual_ilqr.primal_dual_ilqr.optimizers as optimizers
+import mpx.jax_ocp_solvers.optimizers as optimizers
 from mujoco.mjx._src.dataclasses import PyTreeNode
 from timeit import default_timer as timer
 from mpx.utils.mpc_wrapper import mpx_data, MPCData

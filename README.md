@@ -1,17 +1,25 @@
 
 
+<p align="left">
+ <img src="https://github.com/user-attachments/assets/faaee057-131d-47da-b841-8832d536e5c5" width="70%" /> 
+</p>
+
 This repo implements the code for legged robot MPC and Trajectory Optimization all in JAX. 
 
-
-
-
-
-**[Installation](#Installation)** | **[PrePrint](https://arxiv.org/abs/2506.07823)** | **[Video](https://youtu.be/zquKLxbAU_Y)** |
-
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/de8b9650-684e-4f31-82e4-9a0035f50f8e" width="48%" />
+  
+  <img src="https://github.com/user-attachments/assets/22d8fcd2-32f4-41c5-acb6-7eedf1bc66ee" width="48%" />
+</p>
+<div align="center">
+  <a href="#Installation"><b>Installation</b></a> |
+  <a href="https://arxiv.org/abs/2506.07823"><b>Paper</b></a> |
+  <a href="https://youtu.be/zquKLxbAU_Y"><b>Video</b></a> |
+  
+</div>
 
 
 ## Features
-
 **MPX** is a [JAX](https://github.com/google/jax) library that provides:
 
 ✅ **True GPU Parallelism**
@@ -22,74 +30,88 @@ Fully differentiable solver easily integrates into learning pipelines and suppor
 
 ✅ **A multiple-shooting SQP** formulation solves the KKT system in parallel, maintaining exactness and fast convergence.
 
-✅ **MJX MODELS** Support [MJX](https://mujoco.readthedocs.io/en/stable/mjx.html) whole body dynamics (included examples with **[Talos](https://github.com/iit-DLSLab/mpx/blob/main/examples/mjx_talos.py)**, **[H1](https://github.com/iit-DLSLab/mpx/blob/main/examples/mjx_h1.py)**, **[Aliengo](https://github.com/iit-DLSLab/mpx/blob/main/examples/mjx_quad.py)** and **Go2**)
+✅ **MJX MODELS** Support [MJX](https://mujoco.readthedocs.io/en/stable/mjx.html) whole body dynamics (included examples with [**Talos**](https://github.com/iit-DLSLab/mpx/blob/main/examples/mjx_talos.py), [**H1**](https://github.com/iit-DLSLab/mpx/blob/main/examples/mjx_h1.py), [**Aliengo**](https://github.com/iit-DLSLab/mpx/blob/main/examples/mjx_quad.py) and **Go2**)
 
 The solver is wrapped by the `MPCControllerWrapper` class, and all the settings (such as the dynamics model and cost function to be used) can be changed in the config files. Examples for various legged robots are provided in the `examples` folder.
-
 > **Note:**  
-> If you want to solve multiple MPC in parallel, use `BatchedMPCControllerWrapper` look at the examples/multi_env.py
-> `MPCControllerWrapper` and `BatchedMPCControllerWrapper` are designed to use the whole body model, if you want to use the srbd model, use `mpc_wrapper_srbd.py`; look at examples/srbd_quad.py
+> If you want to solve multiple MPC in parallel, look at the examples/multi_env.py
+> `MPCWrapper` is designed to use the whole body model, if you want to use the srbd model, use `mpc_wrapper_srbd.py`; look at examples/srbd_quad.py
 
+## Task examples
+| Acrobot Swing-Up | Quadruped Trot | Humanoid Jump | Quadruped Barrel Roll | Obstacle Avoidance |
+|---|---|---|---|---|
+| <img src="https://github.com/user-attachments/assets/af15576c-8fab-4e53-ac06-8f9e648703f6" width="100%" /> | <img src="https://github.com/user-attachments/assets/51f7eb3e-b344-4a92-9b16-837ca5dc71c6" width="100%" /> | <img src="https://github.com/user-attachments/assets/7b39eef5-a7d5-4243-a590-a6dab0b12af2" width="100%" /> | <img src="https://github.com/user-attachments/assets/7a875ce6-ea40-467a-b732-f473e5f40a02" width="100%" /> |<img width="100%" alt="obstacle_avoidance" src="https://github.com/user-attachments/assets/fbc6f156-c549-4353-a8c6-4ba43675aac5" />
 
+## Available solvers
+
+| Solver | Multiple shooting | Dynamics | Integrator | Stage Equality | Inequality constraints |
+|---|---|---|---|---|---|
+| `primal-dual` | ✔️ | Forward | Semi-implicit | ❎ | ❎ (Soft Cost barrier) |
+| `fddp` | ✔️ (dynamics defects) | Forward | Semi-implicit | ❎ | ❎ (Soft Cost barrier) |
+| `eq_primal_dual` | ✔️ | Forwward or Inverse | Explicit or  Implicit | ✔️ | ❎ (Soft Cost barrier) |
+| `eq_fddp` | ✔️ (dynamics defects) | Forwward or Inverse | Explicit or  Implicit | ✔️ | ❎ (Soft Cost barrier) |
+| `ip_primal_dual` | ✔️ | Forwward or Inverse | Explicit or  Implicit | ✔️ | ✔️ (interior point) |
 
 ## Installation
 
-
+### Prerequisites
+- Install [Pixi](https://pixi.prefix.dev/latest/) - a fast conda package manager
 
 ### Clone the repo
-
 ```
-git clone https://github.com/git-gfischer/MujocoSim_MPX
+git clone git@github.com:iit-DLSLab/mpx.git
 cd mpx && git submodule update --init --recursive
 ```
 
+### Set Up Environment with Pixi
+Pixi will automatically manage your environment with all dependencies including ROS 2 Humble, JAX, and build tools:
 
+```bash
+# Initialize the Pixi environment
+pixi install
 
-### Set Up Conda Environment
-
-Create and activate the conda environment:
-
+# Activate the environment
+pixi shell
 ```
-conda create -n mpx_env python=3.12 -y
+
+### Alternative: Traditional Conda Setup (Deprecated)
+For reference, the legacy conda setup is:
+```bash
+conda create -n mpx_env python=3.13 -y
 conda activate mpx_env
-```
-
-
-
-### Install with pip
-
-from the repo main folder
-
-```
 pip install -e .
 ```
 
 
-
 ## RUN example
+```bash
+# Using Pixi
+pixi run python mpx/examples/mjx_quad.py
 
-```
-conda activate mpx_env
+# Or activate the environment first
+pixi shell
 python mpx/examples/mjx_quad.py
-## Use the keyboard's arrows to control the robot ##
 ```
+
+Use the keyboard's arrows to control the robot.
+
 
 > **Note:**  
-> The first time running the script it can take more than a minute to JIT the solver
-
-
+The first time running the script it can take more than a minute to JIT the solver
 
 ## Citing this work
 
 ```bibtex
-@misc{2025primaldualilqrgpuacceleratedlearning,
-      title={Primal-Dual iLQR for GPU-Accelerated Learning and Control in Legged Robots}, 
-      author={Lorenzo Amatucci and João Sousa-Pinto and Giulio Turrisi and Dominique Orban and Victor Barasuol and Claudio Semini},
-      year={2025},
-      eprint={2506.07823},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2506.07823}, 
+@article{amatuccisousa26ral,
+ author={Amatucci, Lorenzo and Sousa-Pinto, João and Turrisi, Giulio and Orban, Dominique and Barasuol, Victor and Semini, Claudio},
+ title={Primal-Dual iLQR for GPU-Accelerated Learning and Control in Legged Robots},
+ year={2026},
+ volume={11},
+ number={1},
+ pages={1010-1017},
+ journal={IEEE Robotics and Automation Letters},
+ doi={10.1109/LRA.2025.3632610}
 }
 ```
+
 

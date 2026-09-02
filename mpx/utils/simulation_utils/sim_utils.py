@@ -171,6 +171,63 @@ def geom_positions(data: mujoco.MjData, geom_ids: Sequence[int], flatten: bool =
     positions = np.asarray([data.geom_xpos[int(geom_id)] for geom_id in geom_ids], dtype=np.float64)
     return positions.reshape(-1) if flatten else positions
 
+
+def geom_linear_velocities(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    geom_ids: Sequence[int],
+) -> np.ndarray:
+    """Return world-frame linear velocity at each geom origin, shape ``(n, 3)``."""
+    geom_ids = [int(g) for g in geom_ids]
+    velocities = np.zeros((len(geom_ids), 3), dtype=np.float64)
+    jacp = np.zeros((3, model.nv))
+    jacr = np.zeros((3, model.nv))
+    for i, geom_id in enumerate(geom_ids):
+        body_id = int(model.geom_bodyid[geom_id])
+        mujoco.mj_jac(model, data, jacp, jacr, data.geom_xpos[geom_id], body_id)
+        velocities[i] = jacp @ data.qvel
+    return velocities
+
+
+def _yaw_rotation_matrix_wxyz(quat: np.ndarray) -> np.ndarray:
+    """Yaw-only rotation matrix from base quaternion ``[w, x, y, z]``."""
+    w, x, y, z = (float(v) for v in np.asarray(quat, dtype=np.float64).reshape(4))
+    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    c, s = np.cos(yaw), np.sin(yaw)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def feet_yaw_base_kinematics(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    contact_geom_ids: Sequence[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Foot positions and linear velocities in the yaw-aligned base frame.
+
+    Origin at ``qpos[:3]``; axes X forward, Y left, Z up (yaw from ``qpos[3:7]`` only).
+
+    Returns flat ``(3 * n_feet,)`` arrays in FL, FR, RL, RR order.
+    """
+    contact_geom_ids = [int(g) for g in contact_geom_ids]
+    n_feet = len(contact_geom_ids)
+
+    base_pos = np.asarray(data.qpos[:3], dtype=np.float64)
+    base_vel = np.asarray(data.qvel[:3], dtype=np.float64)
+    ryaw = _yaw_rotation_matrix_wxyz(data.qpos[3:7])
+    ryaw_T = ryaw.T
+
+    foot_world = geom_positions(data, contact_geom_ids, flatten=False)
+    foot_vel_world = geom_linear_velocities(model, data, contact_geom_ids)
+
+    foot_pos_base = np.empty((n_feet, 3), dtype=np.float64)
+    foot_vel_base = np.empty((n_feet, 3), dtype=np.float64)
+    for i in range(n_feet):
+        foot_pos_base[i] = ryaw_T @ (foot_world[i] - base_pos)
+        foot_vel_base[i] = ryaw_T @ (foot_vel_world[i] - base_vel)
+
+    return foot_pos_base.reshape(-1), foot_vel_base.reshape(-1)
+
 def _reserve_user_geom(viewer) -> int:
     if viewer is None:
         return -1
@@ -442,3 +499,4 @@ def setup_tracking_camera(
     viewer.cam.distance    = distance
     viewer.cam.azimuth     = azimuth
     viewer.cam.elevation   = elevation
+#----------------------------------------------------------------------------

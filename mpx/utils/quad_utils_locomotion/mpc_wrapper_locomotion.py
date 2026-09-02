@@ -27,7 +27,7 @@ from mujoco.mjx._src.dataclasses import PyTreeNode
 from timeit import default_timer as timer
 from mpx.utils.mpc_wrapper import mpx_data, MPCData
 from mpx.utils.quad_utils_locomotion.reference_generator_locomotion import reference_generator_locomotion
-from mpx.utils.sim_utils import timer_run
+from mpx.utils.simulation_utils.sim_utils import timer_run
 
 def build_solver_step(config, cost, dynamics, hessian_approx, limited_memory):
     solver_mode = getattr(config, "solver_mode", "primal_dual")
@@ -121,7 +121,7 @@ class MPCWrapper:
         mujoco.mj_fwdPosition(self.model, data)
         self.data = mujoco.MjData(self.model)
         self.mjx_model = mjx.put_model(self.model)
-        robot_mass = data.qM[0]
+        robot_mass = data.M[0]
 
         self.contact_id = [
             mjx.name2id(self.mjx_model, mujoco.mjtObj.mjOBJ_GEOM, name)

@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from gym_quadruped.utils.mujoco.visual import render_vector
 
-from mpx.utils.sim_utils import _quat_mul_wxyz, _quat_from_rpy_wxyz
+from mpx.utils.math_utils.quad_math import _quat_mul_wxyz, _quat_from_rpy_wxyz
 from mpx.config.sim_config.base_pose_randomizer_config import BasePoseRandomizationConfig
 
 class BasePoseRandomizer:

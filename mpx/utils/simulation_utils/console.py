@@ -7,6 +7,11 @@ import glfw
 # Config imports
 import mpx.config.robot_config.config_aliengo as config_aliengo
 
+from mpx.utils.quad_utils_balance.foot_reference import (
+    swing_foot_anchor_from_target,
+    foot_target_foot_local_to_world,
+)
+
 class Console():
     def __init__(self, controller_node):
         self.controller_node = controller_node
@@ -276,3 +281,87 @@ class KeyboardVelocityCommand:
             return None
         self._overlay_dirty = False
         return self.overlay_text()
+
+#=============================================================================
+class SwingFootCommand:
+    """Keyboard control for the swing foot target in tripod balance mode.
+
+    Keys (GLFW):
+      I / K  : forward / backward  (robot X axis)
+      J / L  : left / right        (robot Y axis)
+      U / O  : up / down           (world Z axis)
+
+    Usage::
+
+        swing_cmd = SwingFootCommand(swing_leg_idx=0, step=0.025)
+
+        # In key_callback:
+        foot_anchor = swing_cmd.key_callback(key, foot_anchor, data.qpos[3:7])
+
+        # Check if a key was handled before passing to other handlers:
+        if not swing_cmd.is_swing_key(key):
+            command_handle.key_callback(key)
+    """
+
+    def __init__(self, swing_leg_idx: int = 0, step: float = 0.025):
+        self.swing_leg_idx = int(swing_leg_idx)
+        self.step = float(step)
+        self._overlay_dirty = False
+
+    def _deltas(self):
+        if glfw is None:
+            return {}
+        s = self.step
+        return {
+            glfw.KEY_I: np.array([ s, 0.0, 0.0]),   # forward
+            glfw.KEY_K: np.array([-s, 0.0, 0.0]),   # backward
+            glfw.KEY_J: np.array([0.0,  s, 0.0]),   # left
+            glfw.KEY_L: np.array([0.0, -s, 0.0]),   # right
+            glfw.KEY_U: np.array([0.0, 0.0,  s]),   # up
+            glfw.KEY_O: np.array([0.0, 0.0, -s]),   # down
+        }
+
+    def is_swing_key(self, key: int) -> bool:
+        """True if ``key`` is handled by this handler."""
+        return key in self._deltas()
+
+    def key_callback(
+        self,
+        key: int,
+        foot_anchor: np.ndarray,
+        base_quat_wxyz: np.ndarray,
+    ) -> np.ndarray:
+        """Move the swing foot target if a swing key was pressed.
+
+        Returns the (possibly updated) flat ``(3 * n_contact,)`` foot anchor.
+        """
+        deltas = self._deltas()
+        if key not in deltas:
+            return foot_anchor
+
+        idx = self.swing_leg_idx
+        current_world = np.asarray(foot_anchor[3*idx : 3*idx+3], dtype=np.float64)
+        new_target = foot_target_foot_local_to_world(
+            current_world, base_quat_wxyz, deltas[key]
+        )
+        updated = swing_foot_anchor_from_target(
+            np.asarray(foot_anchor, dtype=np.float64), idx, new_target
+        )
+        self._overlay_dirty = True
+        return updated
+
+    def overlay_text(self) -> tuple[str, str]:
+        return (
+            "I/K: fwd/bwd  J/L: left/right  U/O: up/down",
+            f"swing leg {self.swing_leg_idx}  step {self.step:.3f} m",
+        )
+
+    def consume_overlay_text(self) -> tuple[str, str] | None:
+        if not self._overlay_dirty:
+            return None
+        self._overlay_dirty = False
+        return self.overlay_text()
+
+    def reset(self) -> None:
+        """Reset overlay dirty flag (called on respawn)."""
+        self._overlay_dirty = False

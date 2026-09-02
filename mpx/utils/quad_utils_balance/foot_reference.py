@@ -29,8 +29,10 @@ import numpy as np
 from mpx.config.sim_config.config_foot_ref_config import (
     FootReferenceConfig,
     foot_ref_config,
+    RandomSwingFootConfig,
+    random_swing_foot_config,
 )
-from mpx.utils.sim_utils import alloc_decor_geom
+from mpx.utils.simulation_utils.sim_utils import alloc_decor_geom
 from mpx.utils.math_utils.rotation import yaw_rotation_from_quat
 
 
@@ -215,6 +217,24 @@ def foot_target_foot_local_to_world(
     ryaw = yaw_rotation_from_quat(jnp.asarray(quat, dtype=jnp.float32))
     offset = np.asarray(ryaw @ jnp.asarray(xyz_foot_local, dtype=jnp.float32), dtype=np.float64)
     return np.asarray(foot_current_world, dtype=np.float64).reshape(3) + offset
+
+
+def base_yaw_offset_to_world(
+    base_pos_world: np.ndarray,
+    quat: np.ndarray,
+    xyz_base: np.ndarray,
+) -> np.ndarray:
+    """
+    Convert a yaw-aligned base-frame offset to a world-frame point.
+
+    The base frame has its origin at the robot base (``qpos[:3]``) and axes:
+    X forward, Y left, Z up (yaw from ``quat`` only, roll/pitch ignored).
+
+    ``xyz_world = base_pos_world + R_yaw @ xyz_base``
+    """
+    ryaw = yaw_rotation_from_quat(jnp.asarray(quat, dtype=jnp.float32))
+    offset = np.asarray(ryaw @ jnp.asarray(xyz_base, dtype=jnp.float32), dtype=np.float64)
+    return np.asarray(base_pos_world, dtype=np.float64).reshape(3) + offset
 
 
 def swing_goal_xyz_from_foot_ref(
@@ -460,6 +480,384 @@ class DesiredFootMarkers:
 FootReferenceMarkers = DesiredFootMarkers
 
 
+def swing_foot_arrival_distance(
+    measured_world: np.ndarray,
+    target_world: np.ndarray,
+    *,
+    foot_geom_radius_m: float = 0.0,
+) -> tuple[float, float]:
+    """Return ``(xy_error, z_error)`` from measured foot geom center to target."""
+    diff = (
+        np.asarray(measured_world, dtype=np.float64).reshape(3)
+        - np.asarray(target_world, dtype=np.float64).reshape(3)
+    )
+    xy = float(np.linalg.norm(diff[:2]))
+    z = max(0.0, abs(float(diff[2])) - foot_geom_radius_m)
+    return xy, z
+
+
+def swing_foot_at_goal(
+    measured_world: np.ndarray,
+    target_world: np.ndarray,
+    cfg: RandomSwingFootConfig,
+) -> tuple[bool, float, float]:
+    """True when measured swing foot is close enough to the goal."""
+    xy, z = swing_foot_arrival_distance(
+        measured_world, target_world, foot_geom_radius_m=cfg.foot_geom_radius_m
+    )
+    on_ground = (
+        float(np.asarray(measured_world).reshape(3)[2]) < cfg.ground_contact_z_max
+        and float(np.asarray(target_world).reshape(3)[2]) < cfg.ground_contact_z_max
+    )
+    if on_ground:
+        arrived = xy <= cfg.arrival_tolerance_xy_m and z <= cfg.arrival_tolerance_z_m
+    else:
+        arrived = float(np.hypot(xy, z)) <= cfg.arrival_tolerance_xy_m
+    return arrived, xy, z
+
+
+def random_swing_bounds_box_pose(
+    base_pos_world: np.ndarray,
+    base_quat: np.ndarray,
+    x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
+    z_bounds: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """World-frame center, half-extents, and rotation for the sampling AABB.
+
+    The box is aligned with the yaw-aligned **base frame** (origin at ``base_pos_world``).
+    Its faces correspond to ``x_bounds``, ``y_bounds``, and ``z_bounds``.
+    """
+    center_base = np.array(
+        [
+            0.5 * (x_bounds[0] + x_bounds[1]),
+            0.5 * (y_bounds[0] + y_bounds[1]),
+            0.5 * (z_bounds[0] + z_bounds[1]),
+        ],
+        dtype=np.float64,
+    )
+    half_base = np.array(
+        [
+            0.5 * (x_bounds[1] - x_bounds[0]),
+            0.5 * (y_bounds[1] - y_bounds[0]),
+            0.5 * (z_bounds[1] - z_bounds[0]),
+        ],
+        dtype=np.float64,
+    )
+    center_world = base_yaw_offset_to_world(base_pos_world, base_quat, center_base)
+    ryaw = np.asarray(
+        yaw_rotation_from_quat(jnp.asarray(base_quat, dtype=jnp.float32)),
+        dtype=np.float64,
+    )
+    return center_world, half_base, ryaw.reshape(9)
+
+
+@dataclass
+class RandomSwingBoundsBoxMarker:
+    """Semi-transparent box for visualizing random swing-foot XYZ bounds in base frame."""
+
+    geom_id: int = -1
+    base_pos_world: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    base_quat: np.ndarray = field(
+        default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    )
+    color: np.ndarray = field(
+        default_factory=lambda: np.array([0.15, 0.95, 0.35, 0.22], dtype=np.float64)
+    )
+    active: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        viewer,
+        *,
+        color: np.ndarray | None = None,
+    ) -> RandomSwingBoundsBoxMarker:
+        if viewer is None:
+            raise ValueError(
+                "viewer is None; call env.render() before attach_random_swing_bounds_box"
+            )
+        marker = cls(
+            color=np.array([0.15, 0.95, 0.35, 0.22], dtype=np.float64)
+            if color is None
+            else np.asarray(color, dtype=np.float64).reshape(4),
+        )
+        marker.geom_id = alloc_decor_geom(viewer)
+        marker.draw(viewer, random_swing_foot_config, sync=False)
+        return marker
+
+    def set_frame(self, base_pos_world: np.ndarray, base_quat: np.ndarray) -> None:
+        self.base_pos_world = np.asarray(base_pos_world, dtype=np.float64).reshape(3).copy()
+        self.base_quat = np.asarray(base_quat, dtype=np.float64).reshape(4).copy()
+        self.active = True
+
+    def clear(self) -> None:
+        self.active = False
+
+    def draw(
+        self,
+        viewer,
+        cfg: RandomSwingFootConfig,
+        *,
+        sync: bool = True,
+    ) -> None:
+        if viewer is None or self.geom_id < 0:
+            return
+        geom = viewer.user_scn.geoms[self.geom_id]
+        if not self.active or not cfg.show_bounds_box:
+            rgba = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            pos = np.zeros(3, dtype=np.float64)
+            size = np.ones(3, dtype=np.float64) * 1e-6
+            mat = np.eye(3, dtype=np.float64).reshape(9)
+            emission = 0.0
+        else:
+            center, half, mat = random_swing_bounds_box_pose(
+                self.base_pos_world,
+                self.base_quat,
+                cfg.x_bounds,
+                cfg.y_bounds,
+                cfg.z_bounds,
+            )
+            rgba = np.asarray(self.color, dtype=np.float64).reshape(4)
+            pos = center
+            size = np.maximum(half, 1e-4)
+            emission = 0.15
+        mujoco.mjv_initGeom(
+            geom,
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=size,
+            pos=pos,
+            mat=mat,
+            rgba=rgba,
+        )
+        geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+        geom.segid = -1
+        geom.objid = -1
+        geom.emission = emission
+        if sync:
+            viewer.sync()
+
+
+class RandomSwingFootSampler:
+    """Samples a random swing-foot world-frame target within configurable XYZ bounds.
+
+    Bounds are expressed in the **yaw-aligned base frame** (origin at ``qpos[:3]``):
+
+    - X : forward along robot heading.
+    - Y : lateral (positive = left).
+    - Z : vertical (positive = up from base).
+
+    A uniform sample ``[x, y, z]`` inside the bounds box is mapped to world frame via
+    ``base_pos + R_yaw @ [x, y, z]``.
+
+    Keyboard shortcuts in the simulator (GLFW):
+      R  — sample a new random swing target immediately.
+      N  — toggle auto-randomise on every respawn on/off.
+    """
+
+    def __init__(self, cfg: RandomSwingFootConfig | None = None) -> None:
+        self.cfg: RandomSwingFootConfig = cfg if cfg is not None else random_swing_foot_config
+        self._enabled: bool = self.cfg.enabled
+        self._rng: np.random.Generator = np.random.default_rng()
+        self._arrival_cooldown_steps: int = 0
+        self._arrival_hold_steps: int = 0
+
+    # ── public properties ────────────────────────────────────────────────────
+
+    @property
+    def enabled(self) -> bool:
+        """True when random mode is active."""
+        return self._enabled
+
+    @property
+    def resample_on_respawn(self) -> bool:
+        """True when a new random target should be drawn on every respawn."""
+        return self._enabled and self.cfg.resample_on_respawn
+
+    @property
+    def resample_on_arrival(self) -> bool:
+        """True when a new random target should be drawn after reaching the goal."""
+        return self._enabled and self.cfg.resample_on_arrival
+
+    # ── control ─────────────────────────────────────────────────────────────
+
+    def reset_arrival_state(self) -> None:
+        """Clear arrival-resample cooldown and hold counter (call on respawn / manual resample)."""
+        self._arrival_cooldown_steps = 0
+        self._arrival_hold_steps = 0
+
+    def toggle(self) -> bool:
+        """Toggle random mode on/off.  Returns the **new** enabled state."""
+        self._enabled = not self._enabled
+        return self._enabled
+
+    def enable(self) -> None:
+        self._enabled = True
+
+    def disable(self) -> None:
+        self._enabled = False
+
+    # ── sampling ─────────────────────────────────────────────────────────────
+
+    def sample_offset_base(self) -> np.ndarray:
+        """Draw a random XYZ sample inside ``cfg`` bounds (base frame)."""
+        return np.array([
+            self._rng.uniform(*self.cfg.x_bounds),
+            self._rng.uniform(*self.cfg.y_bounds),
+            self._rng.uniform(*self.cfg.z_bounds),
+        ], dtype=np.float64)
+
+    def sample_offset_local(self) -> np.ndarray:
+        """Alias for :meth:`sample_offset_base` (backward compatibility)."""
+        return self.sample_offset_base()
+
+    def sample_swing_world(
+        self,
+        base_pos_world: np.ndarray,
+        base_quat: np.ndarray,
+    ) -> np.ndarray:
+        """Return a random world-frame swing-foot target from base-frame bounds.
+
+        Args:
+            base_pos_world: Robot base position in world frame ``qpos[:3]``.
+            base_quat:      Base orientation quaternion ``[w, x, y, z]`` ``qpos[3:7]``.
+
+        Returns:
+            New world-frame target position ``(3,)`` as float64.
+        """
+        xyz_base = self.sample_offset_base()
+        return base_yaw_offset_to_world(base_pos_world, base_quat, xyz_base)
+
+    def try_resample_on_arrival(
+        self,
+        foot_anchor: np.ndarray,
+        swing_leg_idx: int,
+        measured_swing_world: np.ndarray,
+        base_pos_world: np.ndarray,
+        base_quat: np.ndarray,
+        *,
+        sim_dt: float,
+        cooldown_steps: int | None = None,
+        hold_steps: int | None = None,
+    ) -> tuple[np.ndarray, int, int, bool]:
+        """Resample swing target if the foot has reached the current goal.
+
+        The next target is sampled uniformly in the base-frame bounds box.
+
+        Args:
+            foot_anchor: Flat ``(3 * n_contact,)`` world-frame anchor.
+            swing_leg_idx: Index of the swing leg.
+            measured_swing_world: Current measured swing foot XYZ in world frame.
+            base_pos_world:     Robot base position ``qpos[:3]`` (sampling frame origin).
+            base_quat: Base orientation ``[w, x, y, z]``.
+            sim_dt: Simulation timestep [s] (for cooldown conversion).
+            cooldown_steps: Optional per-env cooldown override (multi-env).
+            hold_steps: Optional per-env hold-step override (multi-env).
+
+        Returns:
+            ``(updated_foot_anchor, new_cooldown_steps, new_hold_steps, did_resample)``.
+        """
+        if not self.resample_on_arrival:
+            cd = 0 if cooldown_steps is None else int(cooldown_steps)
+            hs = 0 if hold_steps is None else int(hold_steps)
+            return np.asarray(foot_anchor, dtype=np.float64), cd, hs, False
+
+        if cooldown_steps is None:
+            if self._arrival_cooldown_steps > 0:
+                self._arrival_cooldown_steps -= 1
+                return (
+                    np.asarray(foot_anchor, dtype=np.float64),
+                    self._arrival_cooldown_steps,
+                    self._arrival_hold_steps,
+                    False,
+                )
+            cd_after = 0
+            hold_after = self._arrival_hold_steps
+        elif cooldown_steps > 0:
+            hs = 0 if hold_steps is None else int(hold_steps)
+            return np.asarray(foot_anchor, dtype=np.float64), cooldown_steps - 1, hs, False
+        else:
+            cd_after = 0
+            hold_after = 0 if hold_steps is None else int(hold_steps)
+
+        target = np.asarray(
+            foot_anchor[3 * swing_leg_idx : 3 * swing_leg_idx + 3], dtype=np.float64
+        )
+        measured = np.asarray(measured_swing_world, dtype=np.float64).reshape(3)
+        arrived, xy_err, z_err = swing_foot_at_goal(measured, target, self.cfg)
+
+        if not arrived:
+            if cooldown_steps is None:
+                self._arrival_hold_steps = 0
+            hold_after = 0
+            return np.asarray(foot_anchor, dtype=np.float64), 0, hold_after, False
+
+        if cooldown_steps is None:
+            self._arrival_hold_steps += 1
+            hold_after = self._arrival_hold_steps
+        else:
+            hold_after = int(hold_steps) + 1
+
+        if hold_after < self.cfg.arrival_hold_steps:
+            return np.asarray(foot_anchor, dtype=np.float64), 0, hold_after, False
+
+        # Sample next target in base-frame bounds.
+        new_target = self.sample_swing_world(base_pos_world, base_quat)
+        updated = swing_foot_anchor_from_target(foot_anchor, swing_leg_idx, new_target)
+        cooldown = max(1, int(round(self.cfg.resample_cooldown_s / sim_dt)))
+        if cooldown_steps is None:
+            self._arrival_cooldown_steps = cooldown
+            self._arrival_hold_steps = 0
+            cd_after = cooldown
+            hold_after = 0
+        else:
+            cd_after = cooldown
+            hold_after = 0
+        return updated, cd_after, hold_after, True
+
+    def bounds_summary(self) -> str:
+        """Short human-readable summary of the current bounds."""
+        c = self.cfg
+        return (
+            f"x∈[{c.x_bounds[0]:+.2f}, {c.x_bounds[1]:+.2f}]  "
+            f"y∈[{c.y_bounds[0]:+.2f}, {c.y_bounds[1]:+.2f}]  "
+            f"z∈[{c.z_bounds[0]:+.2f}, {c.z_bounds[1]:+.2f}]"
+        )
+
+    def attach_bounds_box_marker(
+        self,
+        viewer,
+        *,
+        enabled: bool | None = None,
+        color: np.ndarray | None = None,
+    ) -> RandomSwingBoundsBoxMarker | None:
+        """Create a passive-viewer box for ``x_bounds`` / ``y_bounds`` / ``z_bounds``."""
+        if enabled is None:
+            enabled = self.cfg.show_bounds_box
+        if not enabled:
+            return None
+        marker_color = self.cfg.bounds_box_color_rgba if color is None else color
+        return RandomSwingBoundsBoxMarker.create(viewer, color=marker_color)
+
+    def update_bounds_box_marker(
+        self,
+        marker: RandomSwingBoundsBoxMarker | None,
+        viewer,
+        base_pos_world: np.ndarray,
+        base_quat: np.ndarray,
+        *,
+        sync: bool = False,
+    ) -> None:
+        """Redraw the base-frame sampling box (moves with the robot base)."""
+        if marker is None or viewer is None:
+            return
+        if self.enabled and self.cfg.show_bounds_box:
+            marker.set_frame(base_pos_world, base_quat)
+        else:
+            marker.clear()
+        marker.draw(viewer, self.cfg, sync=sync)
+
+
 @dataclass
 class FootReferenceManager:
     """
@@ -496,6 +894,26 @@ class FootReferenceManager:
             measured_foot=measured_foot,
             contact_mask=contact_mask,
         )
+
+    def nominal_swing_foot_world(
+        self,
+        p,
+        quat,
+        foot0,
+        n_contact: int,
+        swing_leg_idx: int,
+    ) -> np.ndarray:
+        """Unperturbed nominal swing-foot XYZ in world frame (``p_legs0`` + yaw)."""
+        flat = self.tripod_foot_reference_world(
+            key=jax.random.PRNGKey(0),
+            p=p,
+            quat=quat,
+            foot0=foot0,
+            n_contact=n_contact,
+            sigma=np.array([0.0, 0.0, 0.0]),
+        )
+        arr = np.asarray(flat, dtype=np.float64).reshape(-1)
+        return arr[3 * swing_leg_idx : 3 * swing_leg_idx + 3].copy()
 
     def swing_goal_xyz_from_foot_ref(
         self, foot_ref_flat: np.ndarray, contact_mask: np.ndarray, n_contact: int

@@ -3,7 +3,7 @@ import jax
 import os 
 import sys 
 dir_path = os.path.dirname(os.path.realpath(__file__))
-model_path = os.path.abspath(os.path.join(dir_path, '..')) + '/data/aliengo/aliengo.xml'  # Path to the MuJoCo model XML file
+model_path = os.path.abspath(os.path.join(dir_path, '../..')) + '/data/aliengo/aliengo.xml'  # Path to the MuJoCo model XML file
 # Joint names and related configuration
 joints_name = [
     'FL_hip_joint', 'FL_thigh_joint', 'FL_calf_joint',
@@ -25,7 +25,7 @@ whole_body_frequency = 200
 timer_t = jnp.array([0.5, 0.0, 0.0, 0.5])  # Timer values for each leg
 duty_factor = 0.65  # Duty factor for the gait
 step_freq = 1.35   # Step frequency in Hz
-step_height = 0.065  # Step height in meters
+step_height = 0.2  # Step height in meters
 robot_height = 0.35  # Height of the robot's base in meters
 clearence_speed = 0.4
 use_terrain_estimator = False  # Whether to use state estimation

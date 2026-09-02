@@ -123,7 +123,7 @@ class Go2Locomotion(_Go2Common):
 
     duty_factor: float = 0.65
     step_freq: float = 1.35
-    step_height: float = 0.18
+    step_height: float = 0.05
     initial_height: float = 0.27
 
     use_terrain_estimation: bool = True

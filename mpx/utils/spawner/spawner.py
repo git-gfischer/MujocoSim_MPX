@@ -22,12 +22,12 @@ import numpy as np
 import jax.numpy as jnp
 
 
-from mpx.utils.sim_utils import (
-    _alloc_decor_geom, 
-    _body_label, 
+from mpx.utils.simulation_utils.sim_utils import (
+    _alloc_decor_geom,
+    _body_label,
     _bodies_direct_parent_child,
     _geom_label,
-    _leg_prefix_from_body_name, # 
+    _leg_prefix_from_body_name,
     geom_belongs_to_robot_under_root,
     resolve_foot_geom_ids,
 )

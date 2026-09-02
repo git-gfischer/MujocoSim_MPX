@@ -1,9 +1,11 @@
 import jax
 from jax import numpy as jnp
 from functools import partial
+import mujoco
+from mujoco import mjx
 from mujoco.mjx._src import math
 from mpx.utils.math_utils.rotation import quat_yaw_wxyz, yaw_from_quat_wxyz
-from mpx.utils.sim_utils import timer_run
+from mpx.utils.simulation_utils.sim_utils import timer_run
 from mpx.estimators.terrain_orientation import terrain_orientation
 
 

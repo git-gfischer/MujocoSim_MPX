@@ -16,7 +16,7 @@ Example (usage in another simulation loop)
 ------------------------------------------
 ```python
 import numpy as np
-from mpx.utils.base_force_perturbation import RandomBaseForcePerturbation
+from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
 
 # Build scheduler from config defaults
 base_force = RandomBaseForcePerturbation.from_config(sim_dt=1.0 / sim_frequency)

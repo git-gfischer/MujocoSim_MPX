@@ -27,7 +27,7 @@ from mujoco.mjx._src.dataclasses import PyTreeNode
 from timeit import default_timer as timer
 from mpx.utils.mpc_wrapper import mpx_data, MPCData
 from mpx.utils.quad_utils_balance.reference_generator_balance import reference_generator_balance
-from mpx.utils.sim_utils import timer_run
+from mpx.utils.simulation_utils.sim_utils import timer_run
 
 def build_solver_step(config, cost, dynamics, hessian_approx, limited_memory):
     solver_mode = getattr(config, "solver_mode", "primal_dual")
@@ -209,7 +209,8 @@ class MPCWrapper:
         del x0, X, reference, parameter
         return U[0, : self.config.n_joints]
 
-    def _run_impl(self, data, x0, input, contact, base_quat_ref, use_base_quat_ref):
+    def _run_impl(self, data, x0, input, contact, base_quat_ref, use_base_quat_ref,
+                                                  foot_ref_anchor, use_foot_ref_anchor):
         _, contact_time = self._timer_run(
             data.duty_factor,
             data.step_freq,
@@ -227,8 +228,8 @@ class MPCWrapper:
             input=input,
             liftoff=data.liftoff,
             contact=contact,
-            foot_ref_anchor=x0[self.foot_slice],
-            use_foot_ref_anchor=False,
+            foot_ref_anchor=foot_ref_anchor,
+            use_foot_ref_anchor=use_foot_ref_anchor,
             base_quat_ref=base_quat_ref,
             use_base_quat_ref=use_base_quat_ref,
         )
@@ -270,13 +271,23 @@ class MPCWrapper:
         )
         return data, tau, q, dq
 
-    def run(self, data, x0, input, contact=None, base_quat_ref=None, use_base_quat_ref=None):
+    def run(self, data, x0, input, contact=None, base_quat_ref=None, use_base_quat_ref=None,
+            foot_ref_anchor=None, use_foot_ref_anchor=None):
         contact = self.default_contact if contact is None else jnp.asarray(contact)
         if base_quat_ref is None:
             base_quat_ref = x0[3:7]          # track current quat if not provided
         if use_base_quat_ref is None:
             use_base_quat_ref = jnp.array(False)
-        data, tau, _, _ = self._run_impl(data, x0, input, contact, base_quat_ref, use_base_quat_ref)
+        if foot_ref_anchor is None: 
+            foot_ref_anchor    = x0[self.foot_slice]
+        if use_foot_ref_anchor is None: 
+            use_foot_ref_anchor = jnp.array(False)
+
+        data, tau, _, _ = self._run_impl(
+            data, x0, input, contact,
+            base_quat_ref, use_base_quat_ref,
+            foot_ref_anchor, use_foot_ref_anchor,
+        )
         return data, tau
 
     def reset(self, data, qpos, qvel, foot):

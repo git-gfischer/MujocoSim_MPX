@@ -16,7 +16,8 @@ dependencies = [
     "jax[cuda12]",
     "mujoco",
     "mujoco-mjx",
-    "gym-quadruped",
+    "readchar",
+    "matplotlib",
     "trajax @ git+https://github.com/google/trajax"
 ]
 

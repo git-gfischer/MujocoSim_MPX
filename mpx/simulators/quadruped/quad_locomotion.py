@@ -1,4 +1,5 @@
-
+# Usage: python quad_locomotion.py --headless --steps 2000 --scene flat --robot go2 --nav random --n-env 8 
+# dataset_collection: python quad_locomotion.py --collect --scene flat --robot go2 --nav random
 import argparse
 import os
 import sys
@@ -32,15 +33,22 @@ from mpx.utils.quad_utils_locomotion.mpc_wrapper_locomotion import MPCWrapper
 
 
 from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config, ExtBaseForceConfig
-from mpx.utils.base_force_perturbation import RandomBaseForcePerturbation
+from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
 
 from mpx.config.sim_config.config_quad_spawn import spawn_config, SpawnConfig
 from mpx.utils.spawner.spawner import RobotMapSpawner
 
-from mpx.utils.console import KeyboardVelocityCommand
-import mpx.utils.sim_utils as sim_utils
+from mpx.utils.simulation_utils.console import KeyboardVelocityCommand
+import mpx.utils.simulation_utils.sim_utils as sim_utils
 
-from mpx.estimators.quad_contact_estimation import estimate_contacts
+from mpx.navigation.pointNav import PointNavigator
+
+from mpx.utils.simulation_utils.live_plotter import ProprioceptivePlotter
+from mpx.utils.dataset_collection.episode_recorder import setup_sim_collection
+from mpx.utils.dataset_collection.dataset_bucket_system import GaitType
+from mpx.config.sim_config.config_dataset_bucket import dataset_collection_config
+
+from mpx.estimators.quad_contact_estimation import estimate_contacts, estimate_foot_grf
 
 # Set GPU device for JAX
 # gpu_device = jax.devices('gpu')[0]
@@ -70,7 +78,17 @@ def _build_solve_fn(mpc):
     return solve_mpc
 #endregion------------------------------------------------
 
-def main(headless=False, steps=500, scene="flat", robot="go2"):
+def main(
+    headless=False,
+    steps=500,
+    scene="flat",
+    robot="go2",
+    nav="vel",
+    plot=False,
+    collect=False,
+    collect_out=None,
+    episode_duration_s=None,
+):
     model = mujoco.MjModel.from_xml_path(
         dir_path + f"/../../data/{robot}/scene_{scene}.xml"
     )
@@ -85,8 +103,27 @@ def main(headless=False, steps=500, scene="flat", robot="go2"):
     contact_ids = sim_utils.geom_ids(model, config.contact_frame)
     mpc = MPCWrapper(config, limited_memory=True)
     command_handle = KeyboardVelocityCommand()
+    # Navigation mode: "vel" = keyboard velocity, "random" = auto random goals,
+    # "pointuser" = user-pointed goal (double-click ground + G in the viewer).
+    use_navigation = nav in ("random", "pointuser")
+    navigator = PointNavigator(
+        robot_height=config.robot_height,
+        auto_resample=(nav == "random"),
+    )
     solve_mpc = _build_solve_fn(mpc)
     reset_mpc = jax.jit(mpc.reset)
+
+    plotter = ProprioceptivePlotter(window_size=200) if plot and not collect else None
+    collect_hooks = setup_sim_collection(
+        collect,
+        gait_type=GaitType.TROT,
+        scene=scene,
+        sim_hz=sim_frequency,
+        robot=robot,
+        episode_duration_s=episode_duration_s,
+        collect_out=collect_out,
+        cfg=dataset_collection_config,
+    )
 
     # region Spawner configuration---------------------------
     spawner = RobotMapSpawner.from_config(
@@ -111,8 +148,9 @@ def main(headless=False, steps=500, scene="flat", robot="go2"):
     #------------------------------------------------
 
     # region reset helper -------------------------------------
-    def _respawn():
+    def _respawn(*, manual: bool = False, crashed: bool = False):
         nonlocal mpc_data, tau, q_ref, counter
+        collect_hooks.on_respawn(manual=manual, crashed=crashed)
         spawner.apply_to_data(model, data, config.p0, config.quat0, config.q0)
         foot = jnp.asarray(sim_utils.geom_positions(data, contact_ids))
         mpc_data = reset_mpc(mpc.make_data(), data.qpos.copy(), data.qvel.copy(), foot)
@@ -121,6 +159,8 @@ def main(headless=False, steps=500, scene="flat", robot="go2"):
         counter = 0
         base_force_pert.reset()
         command_handle.reset()
+        if nav == "random":
+            navigator.reset(np.asarray(data.qpos))
         print("[respawn] new random yaw spawn", flush=True)
     # endregion
     #------------------------------------------------
@@ -158,6 +198,7 @@ def main(headless=False, steps=500, scene="flat", robot="go2"):
     tau.block_until_ready()
     _respawn()
     mpc_data = reset_mpc(mpc_data, data.qpos.copy(), data.qvel.copy(), foot)
+    collect_hooks.on_ready()
 
     period = int(sim_frequency / config.mpc_frequency)
     print(f"Controller period: {period} steps at {sim_frequency} Hz simulation frequency.")
@@ -174,11 +215,15 @@ def main(headless=False, steps=500, scene="flat", robot="go2"):
         if counter % period == 0:
             foot = jnp.asarray(sim_utils.geom_positions(data, contact_ids))
            
-            command = jnp.asarray(command_handle.mpc_input(config.robot_height))
+            if use_navigation:
+                command = jnp.asarray(navigator.mpc_input(qpos, config.robot_height))
+            else:
+                command = jnp.asarray(command_handle.mpc_input(config.robot_height))
             contact = jnp.asarray(estimate_contacts(data, contact_ids))
-            print(f"Contact: {contact}")
-            print(foot)
-            print(f"Command: {command}")
+            if not collect_hooks.enabled:
+                print(f"Contact: {contact}")
+                print(foot)
+                print(f"Command: {command}")
             
             start = timer()
             mpc_data, tau = solve_mpc(
@@ -195,7 +240,8 @@ def main(headless=False, steps=500, scene="flat", robot="go2"):
             # tau = jnp.clip(tau, config.min_torque, config.max_torque)
             # The shifted warm start is the next joint target used by the PD stabilizer.
             q_ref = mpc_data.X0[0, 7 : 7 + config.n_joints]
-            print(f"MPC time: {1e3 * (stop - start):.2f} ms")
+            if not collect_hooks.enabled:
+                print(f"MPC time: {1e3 * (stop - start):.2f} ms")
 
         data.ctrl = np.asarray(tau)
 
@@ -204,22 +250,40 @@ def main(headless=False, steps=500, scene="flat", robot="go2"):
         mujoco.mj_step(model, data)
         counter += 1
 
-        if _is_crashed(): _respawn()
+        collect_hooks.after_physics_step(
+            model, data, np.asarray(tau), contact_ids, base_force_pert, config.n_joints,
+        )
+
+        # One episode = one traverse to the goal. Checked here (not in the render
+        # loop) so headless collection runs get the same episode boundaries.
+        if use_navigation and navigator.reached(data.qpos):
+            collect_hooks.end_episode(reason="goal_reached")
+            if navigator.auto_resample:
+                navigator.sample_goal(np.asarray(data.qpos))
+
+        if _is_crashed():
+            _respawn(crashed=True)
          
 
     if headless:
         for _ in range(steps):
             step_controller()
+        collect_hooks.finish("")
         return
 
     def key_callback(key: int):
         if key in RESPAWN_KEYCODES:
-            _respawn()
+            _respawn(manual=True)
+        elif use_navigation and navigator.handle_key(key):
+            pass
         else:
             command_handle.key_callback(key)
 
     _spawn_region_visual = None
     _force_geom_id = -1 
+
+    if plotter is not None:
+        plotter.start()
 
     with mujoco.viewer.launch_passive(
         model,
@@ -229,6 +293,7 @@ def main(headless=False, steps=500, scene="flat", robot="go2"):
         viewer.sync()
         while viewer.is_running():
             overlay_text = command_handle.consume_overlay_text()
+            sim_utils.setup_tracking_camera(viewer, model, body_name="base")
             tic = timer()
             if overlay_text is not None:
                 viewer.set_texts((None, None, *overlay_text))
@@ -264,24 +329,88 @@ def main(headless=False, steps=500, scene="flat", robot="go2"):
             # endregion -------------------------------------
             #---------------------------------------------------
 
+            # Update / render the navigation goal (handles user-pointed goals
+            # via the camera lookat and auto-resamples random goals when reached).
+            if use_navigation:
+                navigator.update(np.asarray(data.qpos), viewer)
+
             step_controller()
+
+            # Stream all proprioception signals; only toggled-on plots render.
+            if plotter is not None:
+                n = config.n_joints
+                foot_xyz = sim_utils.geom_positions(data, contact_ids, flatten=False)
+                plotter.update(
+                    torque=np.asarray(tau),
+                    joint_pos=np.asarray(data.qpos[7 : 7 + n]),
+                    joint_vel=np.asarray(data.qvel[6 : 6 + n]),
+                    contacts=estimate_contacts(
+                        data, contact_ids, foot_positions=foot_xyz,
+                    ),
+                    grf=estimate_foot_grf(model, data, contact_ids),
+                    ang_vel=np.asarray(data.qvel[3:6]),
+                    lin_acc=np.asarray(data.qacc[:3]),
+                )
+
             toc = timer()
             if toc - tic < model.opt.timestep:
                 sleep_time = model.opt.timestep - (toc - tic)
                 time.sleep(sleep_time)
             viewer.sync()
 
+    if plotter is not None:
+        plotter.stop()
+
+    collect_hooks.finish("")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=500)
-    parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="rough")
+    parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="flat")
     parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal"], default="go2")
+    parser.add_argument(
+        "--nav",
+        type=str,
+        choices=["random", "pointuser", "vel"],
+        default="vel",
+        help="Navigation mode: random goals, user-pointed goal, or keyboard velocity.",
+    )
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Open the live proprioception plotter with a signal-toggle window.",
+    )
+    parser.add_argument(
+        "--collect",
+        action="store_true",
+        help="Collect proprioceptive dataset into contact-state buckets.",
+    )
+    parser.add_argument(
+        "--collect-out",
+        type=str,
+        default=None,
+        help="Output .npz path for --collect (default: dataset_loco_<robot>_<scene>.npz).",
+    )
+    parser.add_argument(
+        "--episode-duration",
+        type=float,
+        default=None,
+        help=(
+            "Episode length [s] for --collect "
+            f"(default: {dataset_collection_config.episode.episode_duration_s} from config)."
+        ),
+    )
     args = parser.parse_args()
     main(
         headless=args.headless,
         steps=args.steps,
         scene=args.scene,
         robot=args.robot,
+        nav=args.nav,
+        plot=args.plot,
+        collect=args.collect,
+        collect_out=args.collect_out,
+        episode_duration_s=args.episode_duration,
     )

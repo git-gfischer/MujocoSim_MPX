@@ -1,10 +1,10 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
-import mpx.utils.mpc_utils as mpc_utils
-from mpx.utils.utils_locomotion.reference_generator_locomotion import reference_generator_srbd
+import mpx.utils.simulation_utils.sim_utils as sim_utils
+from mpx.utils.quad_utils_locomotion.reference_generator_locomotion import reference_generator_srbd, whole_body_interface
 import mpx.utils.quadruped_dyn_models.models as mpc_dyn_model
-import mpx.utils.objectives as mpc_objectives
+import mpx.utils.quadruped_dyn_models.objectives as mpc_objectives
 import mujoco 
 from mujoco import mjx
 import mpx.primal_dual_ilqr.primal_dual_ilqr.optimizers as optimizers
@@ -71,13 +71,13 @@ class BatchedMPCControllerWrapper:
         reference_generator = partial(reference_generator_srbd,
             config.use_terrain_estimator ,config.N, config.dt, config.n_contact , mass = config.mass, clearence_speed = config.clearence_speed, duty_factor = config.duty_factor,  step_freq= config.step_freq ,step_height=config.step_height,foot0 = config.p_legs0)
         
-        whole_body_control = partial(mpc_utils.whole_body_interface, model, mjx_model, contact_id, body_id,config.whole_body_frequency,config.Kp,config.Kd)
+        whole_body_control = partial(whole_body_interface, model, mjx_model, contact_id, body_id,config.whole_body_frequency,config.Kp,config.Kd)
 
-        timer_t = partial(mpc_utils.timer_run, duty_factor=config.duty_factor, step_freq=config.step_freq)
+        timer_t = partial(sim_utils.timer_run, duty_factor=config.duty_factor, step_freq=config.step_freq)
 
         self._solve = jax.jit(jax.vmap(work))
         self._ref_gen = jax.jit(jax.vmap(reference_generator))
-        self._timer_run = jax.jit(jax.vmap(mpc_utils.timer_run, in_axes=(None,None,0, None)))
+        self._timer_run = jax.jit(jax.vmap(sim_utils.timer_run, in_axes=(None,None,0, None)))
         self._whole_body_interface = jax.jit(jax.vmap(whole_body_control))
 
         self.contact_time = jnp.tile(config.timer_t, (n_env, 1))

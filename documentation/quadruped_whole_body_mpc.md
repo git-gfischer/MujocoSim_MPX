@@ -75,15 +75,15 @@ $$n = 13 + 2 n_j + 6 n_c = 61.$$
 ```math
 x =
 \begin{bmatrix}
-p \in \mathbb{R}^{3} 
-q_{\mathrm{quat}} \in \mathbb{R}^{4} 
-q \in \mathbb{R}^{12} 
-\dot p \in \mathbb{R}^{3} 
-\omega \in \mathbb{R}^{3} 
-\dot q \in \mathbb{R}^{12} 
-p_{\mathrm{feet}} \in \mathbb{R}^{12} 
-\lambda \in \mathbb{R}^{12}
-\end{bmatrix}
+p \in \mathbb{R}^{3}; 
+q_{\mathrm{quat}} \in \mathbb{R}^{4}; 
+q \in \mathbb{R}^{12};
+\dot p \in \mathbb{R}^{3} ;
+\omega \in \mathbb{R}^{3} ;
+\dot q \in \mathbb{R}^{12} ;
+p_{\mathrm{feet}} \in \mathbb{R}^{12} ;
+\lambda \in \mathbb{R}^{12};
+\end{bmatrix};
 
 \begin{bmatrix}
 \text{base position} 

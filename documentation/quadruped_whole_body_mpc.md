@@ -70,11 +70,11 @@ sequenceDiagram
 
 With `grf_as_state=True` (Go2 locomotion):
 
-\[
+$$
 n = 13 + 2 n_j + 6 n_c = 61.
-\]
+$$
 
-\[
+$$
 x =
 \begin{bmatrix}
 p \in \mathbb{R}^{3} 
@@ -97,7 +97,7 @@ p_{\mathrm{feet}} \in \mathbb{R}^{12}
 \text{FL, FR, RL, RR positions} 
 \text{GRFs (XYZ per foot)}
 \end{bmatrix}.
-\]
+$$
 
 Control is joint torque only:
 

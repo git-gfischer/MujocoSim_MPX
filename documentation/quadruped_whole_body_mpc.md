@@ -84,7 +84,9 @@ q \in \mathbb{R}^{12};
 p_{\mathrm{feet}} \in \mathbb{R}^{12} ;
 \lambda \in \mathbb{R}^{12};
 \end{bmatrix};
+```
 
+```math
 \begin{bmatrix}
 \text{base position} 
 \text{base quaternion }(w,x,y,z) 

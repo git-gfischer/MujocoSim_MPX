@@ -35,7 +35,7 @@ class LivePlotterConfig:
     """Configuration for ``ProprioceptivePlotter``."""
 
     # If False, simulators skip spawning the plotter (replaces the old ``--plot`` flag).
-    enabled: bool = True
+    enabled: bool = False
 
     # Signal windows to spawn. Order is ignored; unknown names are skipped.
     signals: tuple[str, ...] = (  

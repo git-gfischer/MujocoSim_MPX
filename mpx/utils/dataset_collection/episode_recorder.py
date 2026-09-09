@@ -33,6 +33,10 @@ from mpx.config.sim_config.config_dataset_bucket import (
     DatasetCollectionConfig,
     dataset_collection_config,
 )
+from mpx.config.sim_config.config_sensor_noise import (
+    SensorNoiseConfig,
+    sensor_noise_config,
+)
 from mpx.utils.dataset_collection.dataset_bucket_system import (
     DATASET_SUMMARY_FILENAME,
     DatasetBucketSystem,
@@ -40,6 +44,7 @@ from mpx.utils.dataset_collection.dataset_bucket_system import (
     TerrainType,
     resolve_dataset_output_path,
 )
+from mpx.utils.simulation_utils.sensor_noise import SensorNoise
 from mpx.utils.simulation_utils.sim_utils import feet_yaw_base_kinematics
 
 if TYPE_CHECKING:
@@ -61,23 +66,34 @@ def pack_proprioceptive_sample(
     tau: NDArray,
     contact_ids: NDArray,
     n_joints: int,
+    sensor_noise: SensorNoise | None = None,
 ) -> NDArray[np.float32]:
     """
     Pack one control-step proprioceptive vector (66,).
 
     Layout: joint_pos[12] | joint_vel[12] | torque[12] | imu_acc[3] | imu_gyro[3]
             | foot_pos_base[12] | foot_vel_base[12]
+
+    Joint positions and IMU can be corrupted by ``sensor_noise``. Derived
+    channels (velocity, torque, foot kinematics) stay ground-truth.
     """
     foot_pos_base, foot_vel_base = feet_yaw_base_kinematics(
         model, data, np.asarray(contact_ids, dtype=np.int32),
     )
+    joint_pos = np.asarray(data.qpos[7 : 7 + n_joints], dtype=np.float32)
+    imu_acc = np.asarray(data.qacc[:3], dtype=np.float32)
+    imu_gyro = np.asarray(data.qvel[3:6], dtype=np.float32)
+    if sensor_noise is not None:
+        joint_pos, imu_acc, imu_gyro = sensor_noise.apply(
+            joint_pos, imu_acc, imu_gyro,
+        )
     return np.concatenate(
         [
-            np.asarray(data.qpos[7 : 7 + n_joints], dtype=np.float32),
+            joint_pos,
             np.asarray(data.qvel[6 : 6 + n_joints], dtype=np.float32),
             np.asarray(tau, dtype=np.float32).ravel()[:n_joints],
-            np.asarray(data.qacc[:3], dtype=np.float32),
-            np.asarray(data.qvel[3:6], dtype=np.float32),
+            imu_acc,
+            imu_gyro,
             np.asarray(foot_pos_base, dtype=np.float32),
             np.asarray(foot_vel_base, dtype=np.float32),
         ]
@@ -115,6 +131,7 @@ class EpisodeRecorder:
         sim_hz: float,
         config: EpisodeRecorderConfig | None = None,
         episode_prefix: str = "ep",
+        sensor_noise: SensorNoise | None = None,
     ) -> None:
         self.bucket = bucket_system
         self.gait_type = gait_type
@@ -124,6 +141,12 @@ class EpisodeRecorder:
 
         if sim_hz <= 0 or self.config.control_hz <= 0:
             raise ValueError("sim_hz and control_hz must be positive")
+        self.sensor_noise = sensor_noise
+        if self.sensor_noise is None:
+            self.sensor_noise = SensorNoise.from_config(
+                dt=1.0 / self.config.control_hz,
+                cfg=sensor_noise_config,
+            )
         self._decim = max(1, int(round(sim_hz / self.config.control_hz)))
         self._event_mode = self.config.episode_mode != "fixed_duration"
         self._max_control_steps = max(
@@ -175,6 +198,8 @@ class EpisodeRecorder:
         self._prop.clear()
         self._grf.clear()
         self._ext.clear()
+        if self.sensor_noise is not None:
+            self.sensor_noise.reset()
 
     def set_recording(self, active: bool, *, reason: str = "gate") -> bool:
         """
@@ -246,7 +271,10 @@ class EpisodeRecorder:
             return False
 
         self._prop.append(
-            pack_proprioceptive_sample(model, data, tau, contact_ids, n_joints)
+            pack_proprioceptive_sample(
+                model, data, tau, contact_ids, n_joints,
+                sensor_noise=self.sensor_noise,
+            )
         )
         self._grf.append(
             np.asarray(estimate_foot_grf(model, data, contact_ids), dtype=np.float64)
@@ -519,6 +547,18 @@ def setup_sim_collection(
         f"min episode {recorder.min_control_steps / ctrl_hz:.1f}s",
         flush=True,
     )
+    sn = recorder.sensor_noise
+    if sn.enabled:
+        rw = "on" if sn.imu_random_walk else "off"
+        print(
+            f"[collect] sensor noise: joint_pos σ={sn.joint_pos_std:.4g} rad, "
+            f"imu_acc σ={sn.imu_acc_std:.4g} m/s^2, "
+            f"imu_gyro σ={sn.imu_gyro_std:.4g} rad/s, "
+            f"imu_random_walk={rw}",
+            flush=True,
+        )
+    else:
+        print("[collect] sensor noise: disabled (ground-truth samples)", flush=True)
     print(f"[collect] output dir → {run_dir.resolve()}", flush=True)
     print(f"[collect] npz file  → {npz_path.resolve()}", flush=True)
     memory = recorder.bucket.dataset_memory["summary"]
@@ -555,6 +595,7 @@ def setup_sim_collection(
             "sim_hz": sim_hz,
             "control_hz": recorder.config.control_hz,
             "episode_duration_s": ep_duration,
+            "sensor_noise": recorder.sensor_noise.to_metadata(),
         },
     )
     atexit.register(hooks.finish, "")
@@ -573,6 +614,7 @@ def create_collection_session(
     bucket_capacity: int | None = None,
     episode_duration_s: float | None = None,
     control_hz: float | None = None,
+    sensor_noise_cfg: SensorNoiseConfig | None = None,
 ) -> EpisodeRecorder:
     """Build a recorder wired to a new :class:`DatasetBucketSystem`."""
     profile = cfg if cfg is not None else dataset_collection_config
@@ -591,6 +633,7 @@ def create_collection_session(
     )
     ep_duration = episode_duration_s if episode_duration_s is not None else e.episode_duration_s
     ctrl_hz = control_hz if control_hz is not None else e.control_hz
+    noise_cfg = sensor_noise_cfg if sensor_noise_cfg is not None else sensor_noise_config
     return EpisodeRecorder(
         bucket,
         gait_type=gait_type,
@@ -604,4 +647,5 @@ def create_collection_session(
             stride=e.window_stride,
         ),
         episode_prefix=episode_prefix,
+        sensor_noise=SensorNoise.from_config(dt=1.0 / ctrl_hz, cfg=noise_cfg),
     )

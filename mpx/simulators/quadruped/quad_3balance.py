@@ -51,6 +51,7 @@ from mpx.utils.math_utils.quad_math import yaw_from_quat, _quat_to_axes, quat_no
 from mpx.estimators.quad_contact_estimation import estimate_contacts, estimate_foot_grf
 
 from mpx.utils.simulation_utils.live_plotter import ProprioceptivePlotter
+from mpx.config.sim_config.config_live_plotter import live_plotter_config
 
 from mpx.utils.dataset_collection.episode_recorder import setup_sim_collection
 from mpx.utils.dataset_collection.dataset_bucket_system import GaitType
@@ -92,7 +93,6 @@ def main(
     steps=500,
     scene="flat",
     robot="go2",
-    plot=False,
     collect=False,
     collect_out=None,
     episode_duration_s=None,
@@ -118,8 +118,12 @@ def main(
     reset_mpc = jax.jit(mpc.reset)
     counter = 0
 
-    # Live proprioception plotter (toggle signals via the "Signal Selector" window).
-    plotter = ProprioceptivePlotter(window_size=200) if plot and not collect else None
+    # Live proprioception plotter (signals from sim_config).
+    plotter = (
+        ProprioceptivePlotter.from_config(cfg=live_plotter_config)
+        if live_plotter_config.enabled and not collect
+        else None
+    )
     collect_hooks = setup_sim_collection(
         collect,
         gait_type=GaitType.BALANCE,
@@ -499,6 +503,7 @@ def main(
                         config.balance_fixed_contact_mask, dtype=np.float32,
                     ),
                     grf=estimate_foot_grf(model, data, contact_ids),
+                    foot_vel=sim_utils.geom_linear_velocities(model, data, contact_ids),
                     ang_vel=np.asarray(data.qvel[3:6]),
                     lin_acc=np.asarray(data.qacc[:3]),
                 )
@@ -521,11 +526,6 @@ if __name__ == "__main__":
     parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="flat")
     parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal"], default="go2")
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument(
-        "--plot",
-        action="store_true",
-        help="Open the live proprioception plotter with a signal-toggle window.",
-    )
     parser.add_argument(
         "--collect",
         action="store_true",
@@ -552,7 +552,6 @@ if __name__ == "__main__":
         steps=args.steps,
         scene=args.scene,
         robot=args.robot,
-        plot=args.plot,
         collect=args.collect,
         collect_out=args.collect_out,
         episode_duration_s=args.episode_duration,

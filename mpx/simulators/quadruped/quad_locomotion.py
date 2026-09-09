@@ -34,6 +34,8 @@ from mpx.utils.quad_utils_locomotion.mpc_wrapper_locomotion import MPCWrapper
 
 from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config, ExtBaseForceConfig
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
+from mpx.config.sim_config.config_base_weight import base_weight_config, BaseWeightConfig
+from mpx.utils.simulation_utils.base_weight import BaseWeightForce
 
 from mpx.config.sim_config.config_quad_spawn import spawn_config, SpawnConfig
 from mpx.utils.spawner.spawner import RobotMapSpawner
@@ -44,6 +46,7 @@ import mpx.utils.simulation_utils.sim_utils as sim_utils
 from mpx.navigation.pointNav import PointNavigator
 
 from mpx.utils.simulation_utils.live_plotter import ProprioceptivePlotter
+from mpx.config.sim_config.config_live_plotter import live_plotter_config
 from mpx.utils.dataset_collection.episode_recorder import setup_sim_collection
 from mpx.utils.dataset_collection.dataset_bucket_system import GaitType
 from mpx.config.sim_config.config_dataset_bucket import dataset_collection_config
@@ -84,7 +87,6 @@ def main(
     scene="flat",
     robot="go2",
     nav="vel",
-    plot=False,
     collect=False,
     collect_out=None,
     episode_duration_s=None,
@@ -113,7 +115,11 @@ def main(
     solve_mpc = _build_solve_fn(mpc)
     reset_mpc = jax.jit(mpc.reset)
 
-    plotter = ProprioceptivePlotter(window_size=200) if plot and not collect else None
+    plotter = (
+        ProprioceptivePlotter.from_config(cfg=live_plotter_config)
+        if live_plotter_config.enabled and not collect
+        else None
+    )
     collect_hooks = setup_sim_collection(
         collect,
         gait_type=GaitType.TROT,
@@ -145,6 +151,8 @@ def main(
         sim_dt=1.0 / sim_frequency,
         cfg=ext_base_force_config,
     )
+    # Constant extra-mass load on the base (added after pulse write).
+    base_weight = BaseWeightForce.from_config(cfg=base_weight_config)
     #------------------------------------------------
 
     # region reset helper -------------------------------------
@@ -246,6 +254,7 @@ def main(
         data.ctrl = np.asarray(tau)
 
         base_force_pert.tick_and_apply(data) # apply random base force perturbation
+        base_weight.apply(data)  # extra mass: F = m g, world-down or base-normal
  
         mujoco.mj_step(model, data)
         counter += 1
@@ -280,7 +289,8 @@ def main(
             command_handle.key_callback(key)
 
     _spawn_region_visual = None
-    _force_geom_id = -1 
+    _force_geom_id = -1
+    _weight_geom_id = -1 
 
     if plotter is not None:
         plotter.start()
@@ -326,6 +336,22 @@ def main(
                 color=force_color,
                 geom_id=_force_geom_id,
             )
+            if base_weight.enabled and base_weight.magnitude > 0.0:
+                weight_vec = base_weight.force
+                weight_color = np.array([0.15, 0.45, 1.0, 0.85])
+                weight_scale = float(np.linalg.norm(weight_vec)) * 0.005
+            else:
+                weight_vec = np.array([0.0, 0.0, 1e-3])
+                weight_color = np.array([0.0, 0.0, 0.0, 0.0])
+                weight_scale = 1e-3
+            _weight_geom_id = sim_utils.render_vector(
+                viewer,
+                vector=weight_vec,
+                pos=base_pos + np.array([0.0, 0.0, 0.18]),
+                scale=weight_scale,
+                color=weight_color,
+                geom_id=_weight_geom_id,
+            )
             # endregion -------------------------------------
             #---------------------------------------------------
 
@@ -348,6 +374,7 @@ def main(
                         data, contact_ids, foot_positions=foot_xyz,
                     ),
                     grf=estimate_foot_grf(model, data, contact_ids),
+                    foot_vel=sim_utils.geom_linear_velocities(model, data, contact_ids),
                     ang_vel=np.asarray(data.qvel[3:6]),
                     lin_acc=np.asarray(data.qacc[:3]),
                 )
@@ -378,11 +405,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
-        "--plot",
-        action="store_true",
-        help="Open the live proprioception plotter with a signal-toggle window.",
-    )
-    parser.add_argument(
         "--collect",
         action="store_true",
         help="Collect proprioceptive dataset into contact-state buckets.",
@@ -409,7 +431,6 @@ if __name__ == "__main__":
         scene=args.scene,
         robot=args.robot,
         nav=args.nav,
-        plot=args.plot,
         collect=args.collect,
         collect_out=args.collect_out,
         episode_duration_s=args.episode_duration,

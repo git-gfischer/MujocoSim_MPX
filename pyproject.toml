@@ -47,6 +47,12 @@ rosdep = "*"
 compilers = "*"
 jaxlib = { version = "*", build = "*cuda*" }
 "cuda-nvcc" = "*"
+# ProprioceptiveImage addon (mpx/addons/ProprioceptiveImage)
+pyts = "*"
+easydict = "*"
+scikit-learn = "*"
+numba = "*"
+pyturbojpeg = "*"
 
 [tool.pixi.system-requirements]
 cuda = "12"

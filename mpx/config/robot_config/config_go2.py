@@ -122,8 +122,8 @@ class Go2Locomotion(_Go2Common):
     #timer_t = jnp.array([0.5, 0.5, 0.0, 0.0])  # bound (not reliable)
 
     duty_factor: float = 0.65
-    step_freq: float = 1.35
-    step_height: float = 0.05
+    step_freq: float = 1.35 # 1.35 #Hz
+    step_height: float = 0.1
     initial_height: float = 0.27
 
     use_terrain_estimation: bool = True

@@ -13,7 +13,12 @@ from collections import deque
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import CheckButtons, RangeSlider
+from matplotlib.widgets import CheckButtons, RangeSlider, Slider
+
+from mpx.config.sim_config.config_live_plotter import (
+    LivePlotterConfig,
+    live_plotter_config,
+)
 
 
 class MujocoPlotter:
@@ -25,9 +30,10 @@ class MujocoPlotter:
         self.legs = ['FL', 'FR', 'RL', 'RR']
         self.joint_names = ['HAA', 'HFE', 'KFE']
         self.predefined_plots = [
-            'Torque', 'JointPos', 'JointVel', 'FootContacts', 'GRF', 'LinAcc', 'AngVel',
+            'Torque', 'JointPos', 'JointVel', 'FootContacts', 'GRF', 'FootVel', 'LinAcc', 'AngVel',
         ]
         self.grf_components = ['Fx', 'Fy', 'Fz']
+        self.foot_vel_components = ['Vx', 'Vy', 'Vz']
         self.axis = ['X', 'Y', 'Z']
 
         self.all_plot_enable = enable
@@ -182,6 +188,25 @@ class MujocoPlotter:
             enabled_flag=enabled_flag,
         )
 
+    def foot_vel_plot(
+        self,
+        legs: list = None,
+        window_size: int = 50,
+        enable: bool = True,
+        enabled_flag=None,
+        y_limit: tuple[float, float] = (-3.0, 3.0),
+    ):  # noqa: D102
+        if enable is False or self.all_plot_enable is False:
+            return
+        self.fv_legs, self.foot_vel_components = self.predefined_plot(
+            name='FootVel',
+            y_limit=[y_limit],
+            legs=legs,
+            joint_names=self.foot_vel_components,
+            window_size=window_size,
+            enabled_flag=enabled_flag,
+        )
+
     def lin_acc_plot(self, axis: list = None, window_size: int = 50, enable: bool = True, enabled_flag=None):  # noqa: D102
         if enable is False or self.all_plot_enable is False:
             return
@@ -276,6 +301,17 @@ class MujocoPlotter:
         ]
         self.plots['GRF'].send_data(filtered)
 
+    def foot_vel_update(self, foot_vel, LegsAttr=False):  # noqa: D102
+        vel_arr = np.asarray(foot_vel, dtype=np.float64).reshape(-1)
+        components = self.foot_vel_components
+        filtered = [
+            vel_arr[i * 3 + j]
+            for i, leg in enumerate(self.legs)
+            for j, comp in enumerate(components)
+            if leg in self.fv_legs and comp in self.foot_vel_components
+        ]
+        self.plots['FootVel'].send_data(filtered)
+
     def lin_acc_update(self, lin_acc):  # noqa: D102
         self.predefine_update('LinAcc', lin_acc, self.lin_acc, [], legs_attr=False)
 
@@ -304,74 +340,32 @@ class MujocoPlotter:
 
 
 # ===========================================================================
-class SignalControlPanel(mp.Process):
-    """Checkbox window to toggle which signal plots are visible (live).
-
-    Runs in its own process. It mutates the shared ``mp.Value('b')`` flags that
-    each plot window reads to withdraw/deiconify itself.
-    """
-
-    def __init__(self, flags: dict):
-        super().__init__()
-        # list of (name, mp.Value) so it survives the fork without pickling dicts of Values
-        self._items = list(flags.items())
-        self.daemon = True
-
-    def run(self):
-        import matplotlib.pyplot as plt
-        from matplotlib.widgets import CheckButtons
-
-        def _shutdown(*_):
-            plt.close('all')
-            os._exit(0)
-
-        signal.signal(signal.SIGTERM, _shutdown)
-        signal.signal(signal.SIGINT, _shutdown)
-
-        names = [name for name, _ in self._items]
-        states = [bool(flag.value) for _, flag in self._items]
-
-        fig, ax = plt.subplots(figsize=(3.2, 0.5 * len(names) + 1.0))
-        fig.canvas.manager.set_window_title('Signal Selector')
-        ax.set_title('Toggle proprioception plots')
-        check = CheckButtons(ax, names, states)
-
-        def _on_clicked(label):
-            for name, flag in self._items:
-                if name == label:
-                    flag.value = not flag.value
-
-        check.on_clicked(_on_clicked)
-        plt.show(block=True)
-
-
-# ===========================================================================
 class ProprioceptivePlotter:
-    """Live proprioception plotter with lazy plot processes and low-latency updates.
+    """Live proprioception plotter with config-selected windows and low-latency updates.
 
-    Only the signal windows toggled ON in the **Signal Selector** are spawned.
-    The simulator writes the latest sample into shared memory each step; each plot
-    process reads that snapshot at display rate (no queue backlog).
+    Which signal windows spawn is set in ``LivePlotterConfig.signals``. Each window
+    keeps a buffer-length slider so the visible history can change at runtime.
 
     Usage::
 
-        plotter = ProprioceptivePlotter(window_size=200)
+        plotter = ProprioceptivePlotter.from_config()
         plotter.start()
         plotter.update(
             torque=tau, joint_pos=qpos_joints, joint_vel=qvel_joints,
             contacts=contacts, contact_nominal=mpc_mask,
-            grf=foot_grf, ang_vel=base_ang_vel, lin_acc=base_lin_acc,
+            grf=foot_grf, foot_vel=foot_lin_vel, ang_vel=base_ang_vel, lin_acc=base_lin_acc,
         )
         plotter.stop()
     """
 
-    SIGNALS = ['Torque', 'JointPos', 'JointVel', 'FootContacts', 'GRF', 'AngVel', 'LinAcc']
+    SIGNALS = ['Torque', 'JointPos', 'JointVel', 'FootContacts', 'GRF', 'FootVel', 'AngVel', 'LinAcc']
     _BUILDERS = {
         'Torque': 'torque_plot',
         'JointPos': 'jointpos_plot',
         'JointVel': 'jointvel_plot',
         'FootContacts': 'footContact_plot',
         'GRF': 'grf_plot',
+        'FootVel': 'foot_vel_plot',
         'AngVel': 'ang_vel_plot',
         'LinAcc': 'lin_acc_plot',
     }
@@ -379,48 +373,63 @@ class ProprioceptivePlotter:
     def __init__(
         self,
         window_size: int = 200,
+        signals: list[str] | tuple[str, ...] | None = None,
+        buffer_range: tuple[int, int] = (50, 1000),
         default_enabled: list | None = None,
     ):
-        self.window_size = window_size
-        self.flags = {name: mp.Value('b', False) for name in self.SIGNALS}
-        for name in (default_enabled if default_enabled is not None else ['FootContacts', 'AngVel']):
-            if name in self.flags:
-                self.flags[name].value = True
+        self.window_size = int(window_size)
+        self.buffer_range = buffer_range
+        requested = signals if signals is not None else default_enabled
+        if requested is None:
+            requested = live_plotter_config.signals
+        unknown = [name for name in requested if name not in self.SIGNALS]
+        if unknown:
+            print(f'[ProprioceptivePlotter] ignoring unknown signals: {unknown}')
+        self.signals = [name for name in self.SIGNALS if name in requested]
 
         self._helper = MujocoPlotter(enable=True)
         self._active: dict[str, MultiLivePlotter] = {}
-        self.control_panel = SignalControlPanel(self.flags)
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg: LivePlotterConfig = live_plotter_config,
+    ) -> ProprioceptivePlotter:
+        """Build from :class:`LivePlotterConfig` (signals + initial buffer)."""
+        return cls(
+            window_size=cfg.window_size,
+            signals=cfg.signals,
+            buffer_range=cfg.buffer_range,
+        )
 
     def _build_plot(self, name: str) -> MultiLivePlotter:
         """Create a fresh ``MultiLivePlotter`` for ``name`` (not started)."""
         builder = getattr(self._helper, self._BUILDERS[name])
         if name == 'FootContacts':
-            builder(window_size=self.window_size, enabled_flag=self.flags[name], dual_nominal=True)
+            builder(
+                window_size=self.window_size,
+                dual_nominal=True,
+            )
         else:
-            builder(window_size=self.window_size, enabled_flag=self.flags[name])
+            builder(window_size=self.window_size)
         plot = self._helper.plots.pop(name)
         plot.interactive = True
+        plot.buffer_range = self.buffer_range
         return plot
 
     def _sync_processes(self) -> None:
-        """Start/stop plot processes to match the Signal Selector flags."""
-        for name in self.SIGNALS:
-            if self.flags[name].value:
-                plot = self._active.get(name)
-                if plot is None or not plot.is_alive():
-                    if plot is not None:
-                        plot.shutdown()
-                    plot = self._build_plot(name)
-                    plot.start()
-                    self._active[name] = plot
-            else:
-                plot = self._active.pop(name, None)
+        """Keep configured plot processes alive."""
+        for name in self.signals:
+            plot = self._active.get(name)
+            if plot is None or not plot.is_alive():
                 if plot is not None:
                     plot.shutdown()
+                plot = self._build_plot(name)
+                plot.start()
+                self._active[name] = plot
 
     def start(self):
-        """Launch the Signal Selector; plot windows start when toggled ON."""
-        self.control_panel.start()
+        """Spawn the signal windows listed in the live-plotter config."""
         self._sync_processes()
 
     def update(
@@ -432,6 +441,7 @@ class ProprioceptivePlotter:
         contacts=None,
         contact_nominal=None,
         grf=None,
+        foot_vel=None,
         ang_vel=None,
         lin_acc=None,
     ):
@@ -451,18 +461,18 @@ class ProprioceptivePlotter:
             )
         if grf is not None and 'GRF' in self._active:
             self._active['GRF'].send_data(list(np.asarray(grf, dtype=np.float64).reshape(-1)))
+        if foot_vel is not None and 'FootVel' in self._active:
+            self._active['FootVel'].send_data(list(np.asarray(foot_vel, dtype=np.float64).reshape(-1)))
         if ang_vel is not None and 'AngVel' in self._active:
             self._active['AngVel'].send_data(list(np.asarray(ang_vel).ravel()))
         if lin_acc is not None and 'LinAcc' in self._active:
             self._active['LinAcc'].send_data(list(np.asarray(lin_acc).ravel()))
 
     def stop(self):
-        """Terminate all plotter and control-panel processes."""
+        """Terminate all plotter processes."""
         for plot in list(self._active.values()):
             plot.shutdown()
         self._active.clear()
-        with contextlib.suppress(Exception):
-            self.control_panel.terminate()
 
 
 # ===========================================================================
@@ -487,6 +497,7 @@ class MultiLivePlotter(mp.Process):
         enabled_flag=None,
         dual_secondary: bool = False,
         secondary_labels: list | None = None,
+        buffer_range: tuple[int, int] = (50, 1000),
     ):
         super(MultiLivePlotter, self).__init__()
 
@@ -529,6 +540,7 @@ class MultiLivePlotter(mp.Process):
         self._withdrawn = False
         self.interactive = False
         self._visible = None
+        self.buffer_range = buffer_range
 
         self.daemon = True
 
@@ -604,7 +616,7 @@ class MultiLivePlotter(mp.Process):
         for i in range(self.num_subplots, len(self.axs)):
             self.axs[i].axis('off')
 
-        # Optional in-figure controls: per-subplot show/hide + live y-limits.
+        # Optional in-figure controls: per-subplot show/hide, y-limits, buffer length.
         if self.interactive:
             self._setup_interactive_controls()
 
@@ -619,22 +631,20 @@ class MultiLivePlotter(mp.Process):
         plt.show(block=True)  # Block execution here to keep the figure open
 
     def _setup_interactive_controls(self):
-        """Embed widgets to pick subplots (joint/axis) and edit y-limits live.
+        """Embed widgets to pick subplots, edit y-limits, and change buffer length.
 
         Runs inside the plotter process, so the widget callbacks can mutate the
-        axes directly without any cross-process communication. A checkbox column
-        selects which joint/axis subplots are shown; a range slider sets the
-        shared y-limits at runtime.
+        axes and deques directly without any cross-process communication.
         """
         n = self.num_subplots
         labels = [str(self.subplot_titles[i]) for i in range(n)]
         self._visible = [True] * n
 
-        # Reserve room on the right (subplot selector) and bottom (y-limit slider).
-        self.fig.subplots_adjust(right=0.80, bottom=0.14)
+        # Reserve room on the right (subplot selector) and bottom (sliders).
+        self.fig.subplots_adjust(right=0.80, bottom=0.18)
 
         # --- Subplot selector: choose which joint/axis subplots are shown. ---
-        check_ax = self.fig.add_axes([0.815, 0.10, 0.175, 0.85])
+        check_ax = self.fig.add_axes([0.815, 0.16, 0.175, 0.80])
         check_ax.set_title('show', fontsize=8)
         try:
             self._check = CheckButtons(check_ax, labels, self._visible, useblit=False)
@@ -656,7 +666,7 @@ class MultiLivePlotter(mp.Process):
         # --- Live y-limit editing via a range slider (applied to every subplot). ---
         lo, hi = self._current_ylim()
         span = (hi - lo) if hi > lo else 1.0
-        slider_ax = self.fig.add_axes([0.18, 0.04, 0.5, 0.03])
+        slider_ax = self.fig.add_axes([0.18, 0.08, 0.5, 0.03])
         self._ylim_slider = RangeSlider(
             slider_ax, 'y-lim', lo - span, hi + span, valinit=(lo, hi),
         )
@@ -670,6 +680,32 @@ class MultiLivePlotter(mp.Process):
             self.fig.canvas.draw_idle()
 
         self._ylim_slider.on_changed(_on_ylim)
+
+        # --- Live visualization buffer (sliding-window length). ---
+        buf_lo, buf_hi = self.buffer_range
+        buf_lo = max(2, int(buf_lo))
+        buf_hi = max(buf_lo + 1, int(buf_hi))
+        init_buf = int(np.clip(self.window_size, buf_lo, buf_hi))
+        buf_ax = self.fig.add_axes([0.18, 0.03, 0.5, 0.03])
+        self._buffer_slider = Slider(
+            buf_ax, 'buffer', buf_lo, buf_hi, valinit=init_buf, valstep=1,
+        )
+
+        def _on_buffer(val):
+            self._set_window_size(int(val))
+            self.fig.canvas.draw_idle()
+
+        self._buffer_slider.on_changed(_on_buffer)
+
+    def _set_window_size(self, n: int) -> None:
+        """Resize the in-process sliding windows and x-limits."""
+        n = max(2, int(n))
+        self.window_size = n
+        self.data_buffers = [deque(buf, maxlen=n) for buf in self.data_buffers]
+        if self.secondary_buffers is not None:
+            self.secondary_buffers = [deque(buf, maxlen=n) for buf in self.secondary_buffers]
+        for ax in self.axs[: self.num_subplots]:
+            ax.set_xlim(0, n)
 
     def _current_ylim(self):
         """Return the initial (ymin, ymax) used to seed the y-limit text boxes."""

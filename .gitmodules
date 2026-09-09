@@ -1,3 +1,6 @@
 [submodule "mpx/jax_ocp_solvers"]
 	path = mpx/jax_ocp_solvers
 	url = https://github.com/iit-DLSLab/jax_ocp_solvers/
+[submodule "mpx/addons/ProprioceptiveImage"]
+	path = mpx/addons/ProprioceptiveImage
+	url = https://github.com/git-gfischer/ProprioceptiveImage.git

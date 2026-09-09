@@ -121,7 +121,7 @@ class MPCWrapper:
         mujoco.mj_fwdPosition(self.model, data)
         self.data = mujoco.MjData(self.model)
         self.mjx_model = mjx.put_model(self.model)
-        robot_mass = data.qM[0]
+        robot_mass = data.M[0]
 
         self.contact_id = [
             mjx.name2id(self.mjx_model, mujoco.mjtObj.mjOBJ_GEOM, name)

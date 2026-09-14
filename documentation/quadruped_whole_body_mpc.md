@@ -10,7 +10,7 @@ This note walks through the **online locomotion MPC** as implemented in this rep
 | OCP solver                | `mpx/jax_ocp_solvers/`                                              | Multiple-shooting SQP with parallel TVLQR KKT solve   |
 
 
-Related: gait knobs (`timer_t`, `duty_factor`, `step_freq`, cost `W`) are documented in `[gait_duty_factor_mpc_gains.md](gait_duty_factor_mpc_gains.md)`. The solver paper is [arXiv:2506.07823](https://arxiv.org/abs/2506.07823). Go2 defaults used below: N=25, \Delta t=0.02\mathrm{s}, MPC rate 50\mathrm{Hz}, n_j=12 joints, n_c=4 feet.
+Related: gait knobs (`timer_t`, `duty_factor`, `step_freq`, cost `W`) are documented in `[gait_duty_factor_mpc_gains.md](gait_duty_factor_mpc_gains.md)`. How MuJoCo realizes contact forces (geom μ, `solref`/`solimp`, `min(foot, floor)`) is in `[mujoco_contact_friction.md](mujoco_contact_friction.md)`. The solver paper is [arXiv:2506.07823](https://arxiv.org/abs/2506.07823). Go2 defaults used below: N=25, \Delta t=0.02\mathrm{s}, MPC rate 50\mathrm{Hz}, n_j=12 joints, n_c=4 feet.
 
 ---
 
@@ -568,7 +568,7 @@ For each foot, with \mu = 0.5:
 h_i = \mu \lambda_{i,z} - \sqrt{\lambda_{i,x}^2 + \lambda_{i,y}^2 + \varepsilon}.
 
 
-Penalty \psi is a clipped log/quadratic barrier (`penalty`): log when h > \sigma, quadratic extension when the cone is violated or tight. It is multiplied by \pi_{t,i} so swing feet are not forced into the cone. This is **not** a guaranteed friction constraint.
+Penalty \psi is a clipped log/quadratic barrier (`penalty`): log when h > \sigma, quadratic extension when the cone is violated or tight. It is multiplied by \pi_{t,i} so swing feet are not forced into the cone. This is **not** a guaranteed friction constraint. The MuJoCo plant uses a different μ (`min` of the two geoms); see [mujoco_contact_friction.md](mujoco_contact_friction.md).
 
 ### 7.2 Torque and speed barriers
 

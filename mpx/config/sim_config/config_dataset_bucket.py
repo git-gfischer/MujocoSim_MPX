@@ -1,6 +1,12 @@
 """
 Dataset collection settings for proprioceptive bucket storage.
 
+Collected data lands in one run directory per session::
+
+    <output_root_dir>/<run_folder>/episodes/<episode_id>.parquet   per-timestep rows
+    <output_root_dir>/<run_folder>/episodes.parquet                per-episode metadata
+    <output_root_dir>/<run_folder>/index.parquet                   balanced label-timestep index
+
 Typical use::
 
     from mpx.config.sim_config.config_dataset_bucket import dataset_collection_config
@@ -45,36 +51,40 @@ class DatasetOutputConfig:
     # Placeholders: {prefix} {robot} {scene} {gait} {terrain} {timestamp}
     run_folder_pattern: str = "{prefix}_{robot}_{scene}_{gait}_{timestamp}"
 
-    # Default ``.npz`` filename inside the run folder.
-    filename_pattern: str = "{prefix}_{robot}_{scene}_{gait}_{terrain}_{timestamp}.npz"
-
     # Append a timestamp so consecutive runs do not overwrite each other.
     use_timestamp: bool = True
 
-    # Write a small ``.json`` metadata file next to the ``.npz``.
+    # Write ``run_metadata.json`` in the run folder alongside the parquet files.
     write_metadata_json: bool = True
 
-    # Rewrite the ``.npz`` on disk after each completed episode (safe if sim is killed).
+    # Refresh ``episodes.parquet`` + ``index.parquet`` after each completed episode
+    # (episode tables are always written once, when the episode closes).
     save_after_each_episode: bool = True
+
+    # Parquet codec for the per-timestep episode tables. "zstd" roughly halves
+    # the size of float sensor traces; "snappy" is faster, "none" disables it.
+    parquet_compression: str = "zstd"
 
 
 @dataclass
 class DatasetBucketConfig:
-    """Parameters for :class:`DatasetBucketSystem` (windowing, thresholds, capacity)."""
+    """Parameters for :class:`DatasetBucketSystem` (thresholds, capacity).
 
-    # Sliding-window length [control steps]. 30 @ 50 Hz ≈ 600 ms.
-    window_size: int = 30
+    There is deliberately no window length here. Collection stores whole
+    trajectories and indexes *labelled timesteps*; the window a model sees is a
+    training-time choice, made by the PyTorch dataset.
+    """
 
-    # Max stored windows per (contact, perturbation, terrain, gait) bucket.
+    # Max stored samples per (contact, perturbation, terrain, gait) bucket.
     bucket_capacity: int = 5_000
 
     # Per-foot GRF magnitude [N] above which a foot counts as in contact.
     contact_force_threshold: float = 5.0
 
-    # External base-force norm [N] above which a window is perturbation-active.
+    # External base-force norm [N] above which a sample is perturbation-active.
     perturbation_force_threshold: float = 5.0
 
-    # Target minimum fraction of stored windows with active perturbation.
+    # Target minimum fraction of stored samples with active perturbation.
     min_perturbation_ratio: float = 0.25
 
 
@@ -96,21 +106,33 @@ class EpisodeCollectionConfig:
     # Event mode: hard cap that force-closes an episode that never fires an event.
     episode_duration_s: float = 60.0
 
-    # Shortest episode accepted into the buckets. Shorter ones are dropped, since
-    # an episode must span at least one full window to yield a training sample.
+    # Shortest episode accepted into the buckets. Shorter ones are dropped as
+    # too short to be worth a trajectory. This is the only length floor: it must
+    # be at least as long as the longest window any downstream dataset will cut.
     min_episode_duration_s: float = 1.0
 
-    # Stride between sliding windows inside :meth:`DatasetBucketSystem.add_episode`.
-    window_stride: int = 1
+    # Stride between indexed label timesteps inside
+    # :meth:`DatasetBucketSystem.add_episode`. 1 indexes every step.
+    label_stride: int = 1
+
+    # Keep episodes that ended in a fall or a lost pose (``terminate_by="failure"``).
+    # The steps leading into a failure are where contact/GRF estimates break down,
+    # so they are collected by default. A manual respawn is never stored.
+    store_failed_episodes: bool = True
 
 
 @dataclass
 class DatasetExportConfig:
-    """Defaults for ``export`` / ``export_split`` / ``save_npz``."""
+    """Defaults for the balanced sample index and the episode-level split."""
 
     max_per_bucket: int | None = None
+
+    # Train/val/test is assigned per episode, so overlapping windows cut from one
+    # episode never straddle a split boundary.
     val_ratio: float = 0.15
     test_ratio: float = 0.10
+    split_seed: int = 0
+
     shuffle_seed: int = 42
 
     # Diagnostics in :meth:`DatasetBucketSystem.print_summary`.
@@ -129,9 +151,6 @@ class DatasetCollectionConfig:
     episode: EpisodeCollectionConfig = field(default_factory=EpisodeCollectionConfig)
     export: DatasetExportConfig = field(default_factory=DatasetExportConfig)
     output: DatasetOutputConfig = field(default_factory=DatasetOutputConfig)
-
-    # Deprecated: prefer ``output.filename_pattern`` + :func:`resolve_dataset_output_path`.
-    default_output_pattern: str = "dataset_{prefix}_{robot}_{scene}.npz"
 
 
 # Default profile used by simulators and examples.

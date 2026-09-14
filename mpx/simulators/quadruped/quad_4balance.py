@@ -1,5 +1,5 @@
-#Usage: python quad_4balance.py --collect --collect-out 4balance_flat_001.npz --episode-duration 60.0
-# tag: dataset collection   collect_out: 4balance_flat_001.npz, episode_duration: 60.0
+#Usage: python quad_4balance.py --collect --collect-out 4balance_flat_001 --episode-duration 60.0
+# tag: dataset collection   collect_out: 4balance_flat_001, episode_duration: 60.0
 
 import argparse
 import os
@@ -29,6 +29,10 @@ from mpx.utils.quad_utils_balance.mpc_wrapper_4balance import MPCWrapper
 
 from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config, ExtBaseForceConfig
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
+from mpx.config.sim_config.config_base_weight import base_weight_config
+from mpx.utils.simulation_utils.base_weight import BaseWeightForce
+from mpx.config.sim_config.config_reset_randomization import balance_reset_randomization_config
+from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
 
 from mpx.config.sim_config.config_quad_spawn import spawn_config, SpawnConfig
 from mpx.utils.spawner.spawner import RobotMapSpawner
@@ -39,7 +43,10 @@ from mpx.utils.quad_utils_balance.desired_pose_sampler import (
 import mpx.utils.simulation_utils.sim_utils as sim_utils
 from mpx.utils.math_utils.quad_math import yaw_from_quat, _quat_to_axes, quat_normalize_wxyz, quat_mul_wxyz
 
-from mpx.utils.dataset_collection.episode_recorder import setup_sim_collection
+from mpx.utils.dataset_collection.episode_recorder import (
+    read_episode_conditions,
+    setup_sim_collection,
+)
 from mpx.utils.dataset_collection.dataset_bucket_system import GaitType
 from mpx.config.sim_config.config_dataset_bucket import dataset_collection_config
 
@@ -156,6 +163,8 @@ def main(
         sim_dt=1.0 / sim_frequency,
         cfg=ext_base_force_config,
     )
+    base_weight = BaseWeightForce.from_config(cfg=base_weight_config)
+    reset_randomizer = ResetRandomizer.from_config(balance_reset_randomization_config)
     #------------------------------------------------
 
     # region desired pose sampler configuration---------------------------------------
@@ -198,10 +207,31 @@ def main(
         base_force_pert.reset()
         pi.reset()
 
+        sample, mpc_data = reset_randomizer.sample_and_apply(
+            ResetTargets(
+                model=model,
+                foot_geom_ids=contact_ids,
+                base_weight=base_weight,
+                navigator=None,
+                mpc_data=mpc_data,
+            )
+        )
+        meta = sample.to_metadata()
+        collect_hooks.set_episode_conditions(
+            randomization=meta,
+            **read_episode_conditions(model, contact_ids, base_weight),
+        )
+        extra = ""
+        if meta:
+            extra = "  " + "  ".join(
+                f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in meta.items()
+            )
         print(
             f"[respawn] height={desired_height:.3f} m  "
             f"spawn_yaw={np.rad2deg(yaw_from_quat(spawn_quat)):.1f}°  "
-            f"desired_yaw={np.rad2deg(yaw_from_quat(desired_quat)):.1f}°",
+            f"desired_yaw={np.rad2deg(yaw_from_quat(desired_quat)):.1f}°"
+            f"{extra}",
             flush=True,
         )
     # endregion
@@ -309,7 +339,8 @@ def main(
         data.ctrl = np.asarray(tau)
 
         base_force_pert.tick_and_apply(data) # apply random base force perturbation
- 
+        base_weight.apply(data)
+
         mujoco.mj_step(model, data)
         counter += 1
 
@@ -345,6 +376,7 @@ def main(
 
     _spawn_region_visual = None
     _force_geom_id = -1
+    _weight_geom_id = -1
 
     _desired_x_visual = -1   # forward (red)
     _desired_y_visual = -1   # left    (green)
@@ -388,6 +420,22 @@ def main(
                 scale=force_scale,
                 color=force_color,
                 geom_id=_force_geom_id,
+            )
+            if base_weight.enabled and base_weight.magnitude > 0.0:
+                weight_vec = base_weight.force
+                weight_color = np.array([0.15, 0.45, 1.0, 0.85])
+                weight_scale = float(np.linalg.norm(weight_vec)) * 0.005
+            else:
+                weight_vec = np.array([0.0, 0.0, 1e-3])
+                weight_color = np.array([0.0, 0.0, 0.0, 0.0])
+                weight_scale = 1e-3
+            _weight_geom_id = sim_utils.render_vector(
+                viewer,
+                vector=weight_vec,
+                pos=base_pos + np.array([0.0, 0.0, 0.18]),
+                scale=weight_scale,
+                color=weight_color,
+                geom_id=_weight_geom_id,
             )
             # endregion -------------------------------------
             #---------------------------------------------------
@@ -439,7 +487,7 @@ if __name__ == "__main__":
         "--collect-out",
         type=str,
         default=None,
-        help="Optional .npz filename (relative paths go inside the auto-created run folder).",
+        help="Run directory name for --collect (relative names go under the configured dataset root; default: auto-named from robot/scene/gait/time).",
     )
     parser.add_argument(
         "--episode-duration",

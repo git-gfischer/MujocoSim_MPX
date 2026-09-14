@@ -53,6 +53,7 @@ easydict = "*"
 scikit-learn = "*"
 numba = "*"
 pyturbojpeg = "*"
+pyarrow = ">=23.0.1,<24"
 
 [tool.pixi.system-requirements]
 cuda = "12"

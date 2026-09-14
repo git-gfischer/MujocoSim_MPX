@@ -58,12 +58,12 @@ def _bar_chart(
         ax.barh(positions, counts, color=color)
         ax.set_yticks(positions, labels)
         ax.invert_yaxis()
-        ax.set_xlabel("Stored/exported windows (count)")
+        ax.set_xlabel("Stored/exported samples (count)")
     else:
         positions = np.arange(len(labels))
         ax.bar(positions, counts, color=color)
         ax.set_xticks(positions, labels, rotation=35, ha="right")
-        ax.set_ylabel("Windows")
+        ax.set_ylabel("Samples")
     ax.set_title(title)
     ax.grid(axis="y" if not horizontal else "x", alpha=0.25)
 
@@ -122,6 +122,43 @@ def _plot_distribution(
     range_axis.grid(axis="y", alpha=0.25)
 
 
+def _plot_episode_conditions(
+    axis: plt.Axes,
+    runs: Sequence[Mapping[str, Any]],
+) -> None:
+    """Scatter the per-episode friction and payload, coloured by outcome."""
+    by_outcome: dict[str, list[tuple[float, float]]] = {}
+    for run in runs:
+        for episode in run.get("episodes", []) or []:
+            friction = episode.get("friction")
+            payload = episode.get("payload_kg")
+            if friction is None or payload is None:
+                continue
+            outcome = str(episode.get("terminate_by", "unknown"))
+            by_outcome.setdefault(outcome, []).append((float(friction), float(payload)))
+
+    axis.set_title("Episode conditions (friction vs payload)")
+    if not by_outcome:
+        axis.text(0.5, 0.5, "No episode records", ha="center", va="center")
+        axis.set_axis_off()
+        return
+
+    colors = {"success": "tab:green", "failure": "tab:red", "truncated": "tab:gray"}
+    for outcome, points in sorted(by_outcome.items()):
+        friction, payload = zip(*points)
+        axis.scatter(
+            friction,
+            payload,
+            label=f"{outcome} ({len(points)})",
+            color=colors.get(outcome, "tab:blue"),
+            alpha=0.7,
+        )
+    axis.set_xlabel("Foot sliding friction μ")
+    axis.set_ylabel("Payload [kg]")
+    axis.legend()
+    axis.grid(alpha=0.25)
+
+
 def plot_dataset_summary(
     summary_path: str | Path,
     *,
@@ -148,7 +185,7 @@ def plot_dataset_summary(
     summary = payload["summary"]
     runs = _run_records(payload)
 
-    figure, axes = plt.subplots(4, 3, figsize=(21, 20), layout="constrained")
+    figure, axes = plt.subplots(5, 3, figsize=(21, 25), layout="constrained")
     figure.suptitle(
         f"Dataset collection summary — {Path(summary_path).resolve()}",
         fontsize=16,
@@ -159,12 +196,12 @@ def plot_dataset_summary(
     overview.axis("off")
     perturbation_ratio = float(summary.get("perturbation_ratio", 0.0))
     force_stats = summary.get("perturbation_force_n", {})
-    force_windows = int(force_stats.get("windows", 0))
+    force_samples = int(force_stats.get("samples", 0))
     force_description = (
         f"{float(force_stats.get('mean', 0.0)):.1f} ± "
         f"{float(force_stats.get('std', 0.0)):.1f} N"
-        if force_windows
-        else "No perturbed windows"
+        if force_samples
+        else "No perturbed samples"
     )
     overview.text(
         0.02,
@@ -172,12 +209,13 @@ def plot_dataset_summary(
         "\n".join(
             [
                 "OVERVIEW",
-                f"Dataset files:             {int(summary.get('dataset_files', 0)):,}",
-                f"Total windows:             {int(summary.get('windows', 0)):,}",
-                f"Collection windows stored: {int(summary.get('collection_windows_stored', 0)):,}",
-                f"Collection windows seen:   {int(summary.get('collection_windows_seen', 0)):,}",
-                f"Perturbation windows:      {int(summary.get('perturbation_windows', 0)):,}",
+                f"Collection runs:           {int(summary.get('dataset_files', 0)):,}",
+                f"Total samples:             {int(summary.get('samples', 0)):,}",
+                f"Collection samples stored: {int(summary.get('collection_samples_stored', 0)):,}",
+                f"Collection samples seen:   {int(summary.get('collection_samples_seen', 0)):,}",
+                f"Perturbation samples:      {int(summary.get('perturbation_samples', 0)):,}",
                 f"Perturbation ratio:        {perturbation_ratio:.1%}",
+                f"Rare-contact samples:      {int(summary.get('rare_contact_samples', 0)):,}",
                 f"Perturbation force (mean ± std): {force_description}",
                 f"Perturbation force range:  "
                 f"{float(force_stats.get('min', 0.0)):.1f}–"
@@ -194,10 +232,10 @@ def plot_dataset_summary(
     )
 
     perturbation = axes[0, 1]
-    perturbed = int(summary.get("perturbation_windows", 0))
-    total_windows = int(summary.get("windows", 0))
-    unperturbed = max(total_windows - perturbed, 0)
-    if total_windows:
+    perturbed = int(summary.get("perturbation_samples", 0))
+    total_samples = int(summary.get("samples", 0))
+    unperturbed = max(total_samples - perturbed, 0)
+    if total_samples:
         perturbation.pie(
             [perturbed, unperturbed],
             labels=["Perturbed", "Unperturbed"],
@@ -206,37 +244,37 @@ def plot_dataset_summary(
             startangle=90,
         )
     else:
-        perturbation.text(0.5, 0.5, "No windows", ha="center", va="center")
+        perturbation.text(0.5, 0.5, "No samples", ha="center", va="center")
     perturbation.set_title("Perturbation coverage")
 
     _bar_chart(
         axes[0, 2],
         summary.get("contact_state_counts", {}),
-        "Windows by contact state",
+        "Samples by contact state",
         horizontal=True,
     )
-    _bar_chart(axes[1, 0], summary.get("terrain_counts", {}), "Windows by terrain")
-    _bar_chart(axes[1, 1], summary.get("gait_counts", {}), "Windows by gait", color="tab:green")
+    _bar_chart(axes[1, 0], summary.get("terrain_counts", {}), "Samples by terrain")
+    _bar_chart(axes[1, 1], summary.get("gait_counts", {}), "Samples by gait", color="tab:green")
 
     bucket_counts = summary.get("bucket_counts", {})
     _bar_chart(
         axes[1, 2],
         bucket_counts,
-        "Stored/exported windows by bucket",
+        "Stored/exported samples by bucket",
         color="tab:purple",
         horizontal=True,
     )
 
     run_axis = axes[2, 0]
     if runs:
-        run_windows = [int(record.get("export", {}).get("windows", 0)) for record in runs]
-        run_axis.plot(range(1, len(runs) + 1), run_windows, marker="o", color="tab:blue")
+        run_samples = [int(record.get("export", {}).get("samples", 0)) for record in runs]
+        run_axis.plot(range(1, len(runs) + 1), run_samples, marker="o", color="tab:blue")
         run_axis.set_xlabel("Collection run (chronological)")
-        run_axis.set_ylabel("Exported windows")
+        run_axis.set_ylabel("Exported samples")
         run_axis.grid(alpha=0.25)
     else:
         run_axis.text(0.5, 0.5, "No run records", ha="center", va="center")
-    run_axis.set_title("Windows per collection run")
+    run_axis.set_title("Samples per collection run")
 
     _plot_distribution(
         axes[2, 1],
@@ -263,12 +301,26 @@ def plot_dataset_summary(
             range(1, len(runs) + 1), ratios, marker="o", color="tab:orange"
         )
         run_ratio_axis.set_xlabel("Collection run (chronological)")
-        run_ratio_axis.set_ylabel("Perturbed-window ratio")
+        run_ratio_axis.set_ylabel("Perturbed-sample ratio")
         run_ratio_axis.set_ylim(0.0, 1.0)
         run_ratio_axis.grid(alpha=0.25)
     else:
         run_ratio_axis.text(0.5, 0.5, "No run records", ha="center", va="center")
     run_ratio_axis.set_title("Perturbation coverage per collection run")
+
+    _bar_chart(
+        axes[4, 0],
+        summary.get("split_counts", {}),
+        "Samples by episode split",
+        color="tab:cyan",
+    )
+    _bar_chart(
+        axes[4, 1],
+        summary.get("terminate_by_counts", {}),
+        "Episodes by termination outcome",
+        color="tab:brown",
+    )
+    _plot_episode_conditions(axes[4, 2], runs)
 
     if output_path is not None:
         destination = Path(output_path)

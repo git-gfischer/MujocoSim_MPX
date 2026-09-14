@@ -36,6 +36,8 @@ from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config, 
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
 from mpx.config.sim_config.config_base_weight import base_weight_config, BaseWeightConfig
 from mpx.utils.simulation_utils.base_weight import BaseWeightForce
+from mpx.config.sim_config.config_reset_randomization import loco_reset_randomization_config
+from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
 
 from mpx.config.sim_config.config_quad_spawn import spawn_config, SpawnConfig
 from mpx.utils.spawner.spawner import RobotMapSpawner
@@ -47,7 +49,10 @@ from mpx.navigation.pointNav import PointNavigator
 
 from mpx.utils.simulation_utils.live_plotter import ProprioceptivePlotter
 from mpx.config.sim_config.config_live_plotter import live_plotter_config
-from mpx.utils.dataset_collection.episode_recorder import setup_sim_collection
+from mpx.utils.dataset_collection.episode_recorder import (
+    read_episode_conditions,
+    setup_sim_collection,
+)
 from mpx.utils.dataset_collection.dataset_bucket_system import GaitType
 from mpx.config.sim_config.config_dataset_bucket import dataset_collection_config
 
@@ -153,6 +158,7 @@ def main(
     )
     # Constant extra-mass load on the base (added after pulse write).
     base_weight = BaseWeightForce.from_config(cfg=base_weight_config)
+    reset_randomizer = ResetRandomizer.from_config(loco_reset_randomization_config)
     #------------------------------------------------
 
     # region reset helper -------------------------------------
@@ -169,7 +175,28 @@ def main(
         command_handle.reset()
         if nav == "random":
             navigator.reset(np.asarray(data.qpos))
-        print("[respawn] new random yaw spawn", flush=True)
+        sample, mpc_data = reset_randomizer.sample_and_apply(
+            ResetTargets(
+                model=model,
+                foot_geom_ids=contact_ids,
+                base_weight=base_weight,
+                navigator=navigator if use_navigation else None,
+                mpc_data=mpc_data,
+            )
+        )
+        meta = sample.to_metadata()
+        collect_hooks.set_episode_conditions(
+            randomization=meta,
+            **read_episode_conditions(model, contact_ids, base_weight),
+        )
+        if meta:
+            bits = "  ".join(
+                f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in meta.items()
+            )
+            print(f"[respawn] randomized {bits}", flush=True)
+        else:
+            print("[respawn] new random yaw spawn", flush=True)
     # endregion
     #------------------------------------------------
 
@@ -413,7 +440,7 @@ if __name__ == "__main__":
         "--collect-out",
         type=str,
         default=None,
-        help="Output .npz path for --collect (default: dataset_loco_<robot>_<scene>.npz).",
+        help="Run directory name for --collect (relative names go under the configured dataset root; default: auto-named from robot/scene/gait/time).",
     )
     parser.add_argument(
         "--episode-duration",

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 class ExtBaseForceConfig:
     """Configuration for ``RandomBaseForcePerturbation``."""
 
-    enabled: bool = False
+    enabled: bool = True
 
     # Random constant force pulse magnitude [N].
     force_magnitude_range: tuple[float, float] = (10.0, 50.0)

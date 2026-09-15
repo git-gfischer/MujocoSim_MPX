@@ -90,6 +90,7 @@ from mpx.utils.dataset_collection.dataset_schema import (
     randomization_group_id,
 )
 from mpx.utils.dataset_collection.episode_storage import EpisodeStore
+from mpx.utils.dataset_collection.make_signal_bounds import ensure_signal_bounds_file
 from mpx.utils.dataset_collection.signal_bounds import (
     CLIPPING_LIMIT,
     clipping_audit,
@@ -519,7 +520,8 @@ class EpisodeRecorder:
         self.episode_randomization: Dict[str, dict] = {}
         self.clipping_audits: List[Dict[str, float]] = []
         self.contact_statistics: List[Dict[str, float]] = []
-        self._bounds = load_signal_bounds()
+        ensure_signal_bounds_file(robot=self.robot or "go2")
+        self._bounds = load_signal_bounds(robot=self.robot or "go2")
 
     # ── properties ───────────────────────────────────────────────────────────
 

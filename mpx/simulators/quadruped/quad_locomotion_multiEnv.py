@@ -39,7 +39,7 @@ jax.config.update("jax_compilation_cache_dir", "./jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
-from mpx.utils.quad_utils_locomotion.mpc_wrapper_locomotion import MPCWrapper
+from mpx.utils.quad_utils_locomotion.mpc_wrapper_inverse import make_locomotion_mpc
 
 from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
@@ -55,10 +55,10 @@ from mpx.estimators.quad_contact_estimation import estimate_contacts
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _robot_config(robot: str):
+def _robot_config(robot: str, mpc_model: str = "whole_body"):
     if robot == "go2":
         from mpx.config.robot_config.config_go2 import go2_config, Go2Mode
-        return go2_config(Go2Mode.LOCOMOTION)
+        return go2_config(Go2Mode.LOCOMOTION, mpc_model=mpc_model)
     raise ValueError(f"Unsupported robot: {robot}")
 
 
@@ -89,9 +89,10 @@ def main(
     robot: str = "go2",
     nav: str = "random",
     n_env: int = 8,
+    mpc_model: str = "whole_body",
 ):
     # ── Config & CPU model ──────────────────────────────────────────────────
-    config = _robot_config(robot)
+    config = _robot_config(robot, mpc_model=mpc_model)
 
     model = mujoco.MjModel.from_xml_path(
         dir_path + f"/../../data/{robot}/scene_{scene}.xml"
@@ -125,7 +126,7 @@ def main(
     ]
 
     # ── Batched MPC ──────────────────────────────────────────────────────────
-    mpc = MPCWrapper(config, limited_memory=True)
+    mpc = make_locomotion_mpc(config, limited_memory=True)
 
     # batch_mpc_data: every field gains a leading (N,) axis via vmap.
     batch_mpc_data = jax.vmap(lambda _: mpc.make_data())(jnp.arange(n_env))
@@ -141,12 +142,7 @@ def main(
         foot_pos = jnp.array(
             [mjx_d.geom_xpos[mjx_contact_ids[k]] for k in range(config.n_contact)]
         ).flatten()
-        return (
-            mpc.initial_state
-            .at[mpc.qpos_slice].set(mjx_d.qpos)
-            .at[mpc.qvel_slice].set(mjx_d.qvel)
-            .at[mpc.foot_slice].set(foot_pos)
-        ), foot_pos
+        return mpc.pack_state(mjx_d.qpos, mjx_d.qvel, foot_pos), foot_pos
 
     build_x0_batch = jax.jit(jax.vmap(_build_x0))
 
@@ -391,6 +387,13 @@ if __name__ == "__main__":
     parser.add_argument("--n-env", type=int, default=8,
                         help="Number of parallel environments.")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--mpc-model",
+        type=str,
+        choices=["whole_body", "inverse_dynamics"],
+        default="whole_body",
+        help="Go2 MPC transcription: whole-body (default) or inverse-dynamics.",
+    )
     args = parser.parse_args()
     main(
         headless=args.headless,
@@ -399,4 +402,5 @@ if __name__ == "__main__":
         robot=args.robot,
         nav=args.nav,
         n_env=args.n_env,
+        mpc_model=args.mpc_model,
     )

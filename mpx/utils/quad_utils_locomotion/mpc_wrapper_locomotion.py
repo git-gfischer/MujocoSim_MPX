@@ -188,6 +188,15 @@ class MPCWrapper:
             config.u_ref,
         )
 
+    def pack_state(self, qpos, qvel, foot):
+        """Pack measured qpos / qvel / feet into the whole-body MPC state."""
+        return (
+            self.initial_state
+            .at[self.qpos_slice].set(jnp.ravel(qpos))
+            .at[self.qvel_slice].set(jnp.ravel(qvel))
+            .at[self.foot_slice].set(jnp.ravel(foot))
+        )
+
     def make_data(self):
         """Allocate the pytree state used by the pure functional API."""
 

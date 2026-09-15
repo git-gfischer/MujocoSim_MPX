@@ -40,7 +40,10 @@ class VelocityCommandConfig:
     # two the audited v4 run had none of.
     vx_mps: Tuple[float, float] = (-1.0, 1.0)
     vy_mps: Tuple[float, float] = (-0.5, 0.5)
-    yaw_rate_rps: Tuple[float, float] = (-1.0, 1.0)
+    # Was (-1.0, 1.0). Pulled back to match the navigator cap: a pure turn
+    # segment spends the whole combined-load budget on yaw, so 1.0 rad/s was a
+    # 57 deg/s spin with no linear motion to stabilise it.
+    yaw_rate_rps: Tuple[float, float] = (-0.8, 0.8)
 
     # How long one command is held, before the ramp to the next.
     hold_s: Tuple[float, float] = (2.0, 5.0)

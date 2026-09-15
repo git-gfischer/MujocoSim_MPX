@@ -229,10 +229,10 @@ def test_joint_pos_bounds_carry_a_noise_margin():
 
 
 def test_knee_velocity_bound_covers_the_observed_motion():
-    """joint_vel_true was measured at 22.61 rad/s against a 20.0 bound."""
+    """Go2 actuator speed is 30.1 rad/s; observed 22.61 rad/s must sit inside it."""
     bounds = load_signal_bounds()
     kfe = bounds["signals"]["joint_vel"]["bounds"]["KFE"]
-    assert kfe[1] >= 22.61
+    assert kfe[1] >= 30.1
 
 
 # ── R2-7: clearance columns ──────────────────────────────────────────────────

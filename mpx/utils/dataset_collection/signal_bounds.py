@@ -2,12 +2,10 @@
 Global signal bounds and stance values for Proprioceptive Image normalisation.
 
 The PI encoder normalises every signal against ``s_min``/``s_max`` and centres it
-on a ``stance_value``. If those bounds are derived per run folder from the data
-in it, the same joint angle maps to a different pixel value in ``flat/trot`` than
-in ``stairs/crawl``, and any cross-terrain comparison measures the normalisation
-rather than the model. So the bounds live in **one** datasheet-derived file,
-``datasets/signal_bounds.json``, committed to the repository and identical for
-every run.
+on a ``stance_value``. Those limits are a **robot** property (MJCF joint and
+actuator ranges, rated joint speed, kinematic foot envelope), not a fit to a
+run folder. ``make_signal_bounds`` writes the one file
+``datasets/signal_bounds.json``; collection regenerates it for the active robot.
 
 Each run embeds the file's SHA-256 and an inline copy in its
 ``run_metadata.json``. A loader that is handed two folders with different hashes
@@ -46,14 +44,18 @@ def default_signal_bounds_path() -> Path:
     return repo_root / "datasets" / SIGNAL_BOUNDS_FILENAME
 
 
-def load_signal_bounds(path: str | Path | None = None) -> Dict[str, Any]:
-    """Read the bounds file. Missing or malformed is an error, never a default."""
+def load_signal_bounds(
+    path: str | Path | None = None,
+    robot: str = "go2",
+) -> Dict[str, Any]:
+    """Read the bounds file, generating it from the robot MJCF if it is missing."""
     bounds_path = Path(path) if path is not None else default_signal_bounds_path()
     if not bounds_path.is_file():
-        raise FileNotFoundError(
-            f"Global signal bounds not found at '{bounds_path}'. This file is "
-            f"required: PI normalisation must not be fitted per run folder."
+        from mpx.utils.dataset_collection.make_signal_bounds import (
+            ensure_signal_bounds_file,
         )
+
+        ensure_signal_bounds_file(bounds_path, robot=robot or "go2")
     try:
         payload = json.loads(bounds_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:

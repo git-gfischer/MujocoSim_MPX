@@ -1,6 +1,7 @@
-# Usage: python quad_locomotion.py --headless --steps 2000 --scene flat --robot go2 --nav random --n-env 8 
+# Usage: python quad_locomotion.py --headless --steps 2000 --scene flat --robot go2 --nav random --n-env 8 --gait trot
 # dataset_collection: python quad_locomotion.py --collect --scene flat --robot go2 --nav random
-# Spot: python quad_locomotion.py --scene flat --robot spot
+# Note for dataset collection: python -m mpx.utils.dataset_collection.make_signal_bounds --robot go2
+
 import argparse
 import os
 import sys
@@ -28,10 +29,8 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 #from gym_quadruped.quadruped_env import QuadrupedEnv
 #from gym_quadruped.utils.mujoco.visual import render_vector
 
-from mpx.utils.quad_utils_locomotion.mpc_wrapper_locomotion import MPCWrapper
+from mpx.utils.quad_utils_locomotion.mpc_wrapper_inverse import make_locomotion_mpc
 #from mpx.utils.quad_utils_locomotion.mpc_wrapper_locomotion import LocomotionMPCControllerWrapper
-
-
 
 from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config, ExtBaseForceConfig
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
@@ -79,10 +78,26 @@ _ROBOT_DATA_DIR = {
 
 
 #region ================Helper functions================
-def robot_config(robot):
+def robot_config(robot, gait=None, mpc_model="whole_body"):
+    """Locomotion config for ``robot``, optionally on a named gait.
+
+    ``gait=None`` keeps each robot's own default (``config_go2.DEFAULT_GAIT``
+    for the Go2). Only the Go2 has a gait registry today; asking for one on
+    another robot is an error rather than a silently ignored flag.
+    """
     if robot == "go2":
         from mpx.config.robot_config.config_go2 import go2_config, Go2Mode
-        return go2_config(Go2Mode.LOCOMOTION)
+        return go2_config(Go2Mode.LOCOMOTION, gait=gait, mpc_model=mpc_model)
+    if mpc_model not in (None, "whole_body"):
+        raise ValueError(
+            f"--mpc-model {mpc_model!r} is only supported for the go2 "
+            f"(got robot {robot!r})."
+        )
+    if gait is not None:
+        raise ValueError(
+            f"--gait is only supported for the go2 (got robot {robot!r}); "
+            "the other robot configs have a single hardcoded gait."
+        )
     if robot == "spot":
         from mpx.config.robot_config.config_spot import spot_config, SpotMode
         return spot_config(SpotMode.LOCOMOTION)
@@ -99,12 +114,7 @@ def _scene_xml_path(robot: str, scene: str) -> str:
 def _build_solve_fn(mpc):
     @jax.jit
     def solve_mpc(mpc_data, qpos, qvel, foot, command, contact):
-        x0 = (
-            mpc.initial_state
-            .at[mpc.qpos_slice].set(qpos)
-            .at[mpc.qvel_slice].set(qvel)
-            .at[mpc.foot_slice].set(foot)
-        )
+        x0 = mpc.pack_state(qpos, qvel, foot)
         return mpc.run(mpc_data, x0, command, contact)
 
     return solve_mpc
@@ -119,11 +129,15 @@ def main(
     collect=False,
     collect_out=None,
     episode_duration_s=None,
+    gait=None,
+    mpc_model="whole_body",
 ):
     model = mujoco.MjModel.from_xml_path(_scene_xml_path(robot, scene))
 
     # robot configuration
-    config = robot_config(robot)
+    config = robot_config(robot, gait=gait, mpc_model=mpc_model)
+    if hasattr(config, "gait"):
+        print(f"[gait] {config.gait.summary()}", flush=True)
 
     data = mujoco.MjData(model)
     # 500 Hz by default: the contact solver's 10 ms time constant then spans 5
@@ -133,7 +147,7 @@ def main(
     model.opt.timestep = 1 / sim_frequency
 
     contact_ids = sim_utils.geom_ids(model, config.contact_frame)
-    mpc = MPCWrapper(config, limited_memory=True)
+    mpc = make_locomotion_mpc(config, limited_memory=True)
     command_handle = KeyboardVelocityCommand()
     # Navigation mode: "vel" = keyboard velocity, "random" = auto random goals,
     # "pointuser" = user-pointed goal (double-click ground + G in the viewer).
@@ -141,6 +155,9 @@ def main(
     navigator = PointNavigator(
         robot_height=config.robot_height,
         auto_resample=(nav == "random"),
+        # The navigator's command is refreshed once per MPC tick, which is what
+        # its yaw slew limit integrates against.
+        control_dt=1.0 / config.mpc_frequency,
     )
     # Segmented velocity command for data collection. Goal-following never
     # commands a yaw rate directly and never reverses, so a collected dataset
@@ -539,6 +556,26 @@ if __name__ == "__main__":
         default="vel",
         help="Navigation mode: random goals, user-pointed goal, or keyboard velocity.",
     )
+    parser.add_argument(
+        "--gait",
+        type=str,
+        choices=["trot", "pace", "crawl", "bound"],
+        default=None,
+        help=(
+            "Locomotion gait (go2 only). Selects the matched timing / swing / "
+            "weight set from config_go2.GO2_GAITS. Default: config_go2.DEFAULT_GAIT."
+        ),
+    )
+    parser.add_argument(
+        "--mpc-model",
+        type=str,
+        choices=["whole_body", "inverse_dynamics"],
+        default="whole_body",
+        help=(
+            "Go2 MPC transcription: whole-body dynamics (default) or "
+            "inverse-dynamics with equality constraints."
+        ),
+    )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
         "--collect",
@@ -570,4 +607,6 @@ if __name__ == "__main__":
         collect=args.collect,
         collect_out=args.collect_out,
         episode_duration_s=args.episode_duration,
+        gait=args.gait,
+        mpc_model=args.mpc_model,
     )

@@ -8,8 +8,16 @@
   <default>
     <default class="go2">
       <geom friction="0.6" margin="0.001" condim="3"/>
-      <joint axis="0 1 0" damping="2" armature="0.01"/>
-      <motor ctrlrange="-23.7 23.7"/>
+      <!-- Joint limits are constraints, not hard stops. With MuJoCo's default
+           softness the MPC pushed joints up to 0.06 rad past the datasheet
+           range (measured on both the noisy and the noise-free state), which
+           then clipped under PI normalisation. solreflimit 0.004 s = 2 sim
+           steps at 500 Hz, the stiffest value that stays stable. -->
+      <joint axis="0 1 0" damping="2" armature="0.01"
+             solreflimit="0.004 1" solimplimit="0.98 0.9999 0.0005 0.5 2"/>
+      <!-- Unitree Go2 datasheet limits. ctrlrange bounds the command;
+           forcerange bounds the force MuJoCo actually applies. -->
+      <motor ctrlrange="-23.7 23.7" forcerange="-23.7 23.7"/>
 
       <default class="abduction">
         <joint axis="1 0 0" range="-1.0472 1.0472"/>
@@ -19,7 +27,7 @@
       </default>
       <default class="knee">
         <joint range="-2.7227 -0.83776"/>
-        <motor ctrlrange="-45.43 45.43"/>
+        <motor ctrlrange="-45.43 45.43" forcerange="-45.43 45.43"/>
       </default>
       <default class="visual">
         <geom type="mesh" contype="0" conaffinity="0" group="2"/>
@@ -33,7 +41,11 @@
         <default class="foot">
           <!-- <geom size="0.0175" pos="-0.002 0 -0.213" priority="1" solimp="0.015 1 0.031" condim="6"
             friction="0.8 0.02 0.01"/> -->
-          <geom size="0.0175" pos="-0.002 0 -0.213" priority="1" solref = "0.02 1" solimp="0.9 0.99 0.01 0.5 2" condim="6"
+          <!-- solref timeconst 0.01 s = 5 sim steps at 500 Hz, damping ratio 1
+               (critically damped). The v3 value of 0.02 s with a 1 cm solimp
+               boundary layer made the foot springy and produced the 1-frame
+               contact dropouts. Keep timeconst >= 2 * opt.timestep. -->
+          <geom size="0.0175" pos="-0.002 0 -0.213" priority="1" solref="0.01 1" solimp="0.9 0.95 0.001" condim="6"
             friction="1.2 0.02 0.01"/>
         </default>
       </default>

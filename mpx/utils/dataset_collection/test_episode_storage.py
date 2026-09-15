@@ -74,7 +74,7 @@ def make_record(
         payload_kg=1.25,
         terminate_by=terminate_by,
         terminate_reason="goal_reached",
-        split=split,
+        split_assigned=split,
         reset_randomization={"step_freq": 1.4},
     )
     return EpisodeRecord(metadata=metadata, arrays=arrays)
@@ -227,19 +227,19 @@ def test_perturbation_flag_follows_the_external_force(tmp_path):
 
 # ── episode-level split ──────────────────────────────────────────────────────
 
-def test_windows_of_one_episode_never_straddle_a_split(tmp_path):
+def test_index_has_no_split_column(tmp_path):
+    """Splits live in datasets/manifest.json, joined on randomization_group_id."""
     store = EpisodeStore(tmp_path)
     bucket = DatasetBucketSystem(
         bucket_capacity=1_000, dataset_summary_path=None, store=store
     )
     bucket.add_episode(make_record("ep_train", n_steps=80, split="train"))
-    bucket.add_episode(make_record("ep_test", n_steps=80, split="test"))
     bucket.save_dataset(tmp_path)
 
-    splits_per_episode = {}
-    for row in store.read_index():
-        splits_per_episode.setdefault(row["episode_id"], set()).add(row["split"])
-    assert splits_per_episode == {"ep_train": {"train"}, "ep_test": {"test"}}
+    row = store.read_index()[0]
+    assert "split" not in row
+    assert row["randomization_group_id"]
+    assert {"post_failure", "valid", "window_valid_w10", "run_id"} <= set(row)
 
 
 def test_split_index_rows_groups_by_split(tmp_path):
@@ -269,7 +269,8 @@ def test_single_foot_samples_are_kept_and_flagged(tmp_path):
     assert result["rare"] == 60
     index = store.read_index()
     assert all(row["rare_contact"] for row in index)
-    assert all(row["contact_state"] == "RARE" for row in index)
+    # v4 names each single-support pattern, so no two patterns share a label.
+    assert all(row["contact_state"] == "SINGLE_FL" for row in index)
     assert all(row["contact_bits"] == "1000" for row in index)
 
 

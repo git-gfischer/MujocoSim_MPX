@@ -44,6 +44,7 @@ from mpx.utils.dataset_collection.dataset_schema import (
 EPISODES_DIRNAME = "episodes"
 EPISODE_TABLE_FILENAME = "episodes.parquet"
 INDEX_FILENAME = "index.parquet"
+BALANCED_INDEX_FILENAME = "index_balanced.parquet"
 
 _PYARROW_HINT = (
     "Parquet storage needs pyarrow. Install it into the project environment "
@@ -128,13 +129,28 @@ def index_arrow_schema():
 
     ``t`` is the labelled timestep: the step the row's contact state, GRF and
     perturbation flag describe. It is window-length agnostic on purpose.
+
+    There is no ``split`` column: train/val/test lives in ``datasets/manifest.json``
+    and is joined on ``randomization_group_id``, so a group cannot be split.
     """
     pa, _ = _pyarrow()
     return pa.schema(
         [
             pa.field("episode_id", pa.string(), nullable=False),
             pa.field("t", pa.int32(), nullable=False),
-            pa.field("split", pa.string(), nullable=False),
+            pa.field("run_id", pa.string(), nullable=False),
+            pa.field("randomization_group_id", pa.string(), nullable=False),
+            pa.field("seed", pa.int64(), nullable=False),
+            pa.field("terminate_reason", pa.string(), nullable=False),
+            # True once the robot became unrecoverable in a failure episode.
+            pa.field("post_failure", pa.bool_(), nullable=False),
+            # True where the realised contact differs from the pattern the
+            # controller planned: the subset where reading the plan fails.
+            pa.field("schedule_mismatch", pa.bool_(), nullable=False),
+            # Usable for training: currently "not post_failure".
+            pa.field("valid", pa.bool_(), nullable=False),
+            # A 10-step causal window ending here lies inside this episode.
+            pa.field("window_valid_w10", pa.bool_(), nullable=False),
             pa.field("terrain", pa.string(), nullable=False),
             pa.field("gait", pa.string(), nullable=False),
             pa.field("contact_state", pa.string(), nullable=False),
@@ -155,20 +171,27 @@ def episode_table_arrow_schema():
     return pa.schema(
         [
             pa.field("episode_id", pa.string(), nullable=False),
+            pa.field("run_id", pa.string()),
             pa.field("robot", pa.string()),
             pa.field("scene", pa.string()),
             pa.field("terrain", pa.string()),
             pa.field("gait", pa.string()),
+            pa.field("mode", pa.string()),
             pa.field("timestamp", pa.string()),
             pa.field("ended_at", pa.string()),
             pa.field("control_hz", pa.float32()),
+            pa.field("sim_hz", pa.float32()),
+            pa.field("substeps_per_control", pa.int32()),
             pa.field("n_steps", pa.int32()),
             pa.field("duration_s", pa.float32()),
             pa.field("friction", pa.float32()),
             pa.field("payload_kg", pa.float32()),
             pa.field("terminate_by", pa.string()),
             pa.field("terminate_reason", pa.string()),
-            pa.field("split", pa.string()),
+            # Cached from the manifest; the manifest is the authority.
+            pa.field("split_assigned", pa.string()),
+            pa.field("seed", pa.int64()),
+            pa.field("randomization_group_id", pa.string()),
             # Sampled reset knobs vary per profile, so they travel as JSON text
             # rather than forcing a fixed column per knob.
             pa.field("reset_randomization", pa.string()),
@@ -217,6 +240,10 @@ class EpisodeStore:
     def index_path(self) -> Path:
         return self.run_dir / INDEX_FILENAME
 
+    @property
+    def balanced_index_path(self) -> Path:
+        return self.run_dir / BALANCED_INDEX_FILENAME
+
     def episode_path(self, episode_id: str) -> Path:
         return self.episodes_dir / f"{episode_id}.parquet"
 
@@ -257,6 +284,26 @@ class EpisodeStore:
         table = pa.Table.from_pylist(list(rows), schema=schema)
         self._write_table_atomic(pq, table, self.index_path)
         return self.index_path
+
+    def write_balanced_index(self, rows: Iterable[Mapping[str, Any]]) -> Path:
+        """
+        Write ``index_balanced.parquet``: ``(episode_id, t, weight)``.
+
+        The materialised class-balanced view. It carries weights, not a subset,
+        so the complete index stays the ground truth for "what rows exist".
+        """
+        pa, pq = _pyarrow()
+        schema = pa.schema(
+            [
+                pa.field("episode_id", pa.string(), nullable=False),
+                pa.field("t", pa.int32(), nullable=False),
+                pa.field("weight", pa.float32(), nullable=False),
+            ],
+            metadata={b"mpx_schema_version": str(EPISODE_SCHEMA_VERSION).encode()},
+        )
+        table = pa.Table.from_pylist(list(rows), schema=schema)
+        self._write_table_atomic(pq, table, self.balanced_index_path)
+        return self.balanced_index_path
 
     def _write_table_atomic(self, pq, table, path: Path) -> None:
         """Write a parquet file beside its destination, then rename over it."""

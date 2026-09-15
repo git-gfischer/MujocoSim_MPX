@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 
 from mpx.utils.dataset_collection.dataset_bucket_system import (
-    RARE_CONTACT_STATE,
     contact_state_name,
+    is_rare_contact,
 )
 from mpx.utils.dataset_collection.dataset_schema import (
     EPISODE_COLUMNS,
@@ -33,10 +33,11 @@ from mpx.utils.dataset_collection.dataset_schema import (
 def test_every_requested_channel_has_a_column():
     names = {c.name for c in EPISODE_COLUMNS}
     assert {"joint_pos", "joint_vel", "joint_torque"} <= names
-    assert {"imu_acc", "imu_gyro"} <= names
+    assert {"imu_acc_body", "imu_gyro_body"} <= names
     assert {"foot_pos_base", "foot_vel_base"} <= names
     assert {"contact", "grf_world", "external_force", "base_lin_vel"} <= names
     assert {"rare_contact", "dt_since_transition"} <= names
+    assert {"joint_torque_measured", "base_quat", "contact_raw"} <= names
 
 
 def test_ground_truth_channels_are_targets():
@@ -92,11 +93,28 @@ def test_contact_bits_threshold_force_magnitude():
     np.testing.assert_array_equal(bits[2], [0, 0, 0, 0])
 
 
-def test_single_foot_stance_is_rare_not_dropped():
+def test_single_foot_stance_gets_its_own_name():
+    """v4 names all 16 patterns, so no two share a label."""
     assert contact_state_name((1, 1, 1, 1)) == "FULL"
     assert contact_state_name((1, 0, 0, 1)) == "DIAG_FL_RR"
-    for pattern in ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)):
-        assert contact_state_name(pattern) == RARE_CONTACT_STATE
+    expected = {
+        (1, 0, 0, 0): "SINGLE_FL",
+        (0, 1, 0, 0): "SINGLE_FR",
+        (0, 0, 1, 0): "SINGLE_RL",
+        (0, 0, 0, 1): "SINGLE_RR",
+    }
+    for pattern, name in expected.items():
+        assert contact_state_name(pattern) == name
+        assert is_rare_contact(pattern)
+    assert not is_rare_contact((1, 1, 1, 1))
+
+
+def test_every_bit_pattern_has_a_unique_name():
+    names = [
+        contact_state_name((a, b, c, d))
+        for a in (0, 1) for b in (0, 1) for c in (0, 1) for d in (0, 1)
+    ]
+    assert len(set(names)) == 16
 
 
 # ── dt since transition ──────────────────────────────────────────────────────
@@ -146,7 +164,7 @@ def test_timer_and_shutdown_truncate_rather_than_judge():
 
 # ── episode split ────────────────────────────────────────────────────────────
 
-def test_split_is_deterministic_for_an_episode_id():
+def test_split_is_deterministic_for_a_group_id():
     first = assign_split("run_00042")
     assert all(assign_split("run_00042") == first for _ in range(5))
 

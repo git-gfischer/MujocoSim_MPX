@@ -11,7 +11,9 @@ from mpx.utils.dataset_collection.dataset_bucket_system import (
     GaitType,
     TerrainType,
 )
+from mpx.utils.dataset_collection.dataset_bucket_system import is_rare_contact
 from mpx.utils.dataset_collection.dataset_schema import (
+    EPISODE_COLUMNS,
     EpisodeMetadata,
     EpisodeRecord,
 )
@@ -50,24 +52,34 @@ def make_recorder(
 
 
 def feed(recorder: EpisodeRecorder, stances) -> None:
-    """Push one buffered row per entry of ``stances`` (each a 4-foot pattern)."""
+    """
+    Push one buffered row per entry of ``stances`` (each a 4-foot pattern).
+
+    Writes every v4 column so ``_build_arrays`` sees a complete table, which is
+    what the recorder would have produced from a real step.
+    """
     for stance in stances:
+        loaded = np.asarray(stance, dtype=np.float64) * 50.0
         grf = np.zeros((4, 3), dtype=np.float32)
-        grf[:, 2] = np.asarray(stance, dtype=np.float32) * 50.0
-        row = {
-            "joint_pos": np.zeros(12, dtype=np.float32),
-            "joint_vel": np.zeros(12, dtype=np.float32),
-            "joint_torque": np.zeros(12, dtype=np.float32),
-            "imu_acc": np.zeros(3, dtype=np.float32),
-            "imu_gyro": np.zeros(3, dtype=np.float32),
-            "foot_pos_base": np.zeros(12, dtype=np.float32),
-            "foot_vel_base": np.zeros(12, dtype=np.float32),
-            "grf_world": grf.reshape(-1),
-            "base_lin_vel": np.zeros(3, dtype=np.float32),
-            "external_force": np.zeros(3, dtype=np.float32),
-        }
-        for name in recorder.SAMPLED_COLUMNS:
-            recorder._buffer[name].append(row[name])
+        grf[:, 2] = loaded
+
+        row = {c.name: np.zeros(c.shape, dtype=c.dtype) for c in EPISODE_COLUMNS}
+        row["contact"] = np.asarray(stance, dtype=np.uint8)
+        row["contact_raw"] = np.asarray(stance, dtype=np.uint8)
+        row["grf_world"] = grf.reshape(-1)
+        row["grf_mean_n"] = loaded.astype(np.float32)
+        row["grf_max_n"] = loaded.astype(np.float32)
+        # Unit quaternion: the post-failure predicate reads this.
+        row["base_quat"] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        row["base_height_terrain"] = np.float32(0.30)
+        row["rare_contact"] = np.bool_(is_rare_contact(stance))
+
+        for name, value in row.items():
+            recorder._buffer[name].append(value)
+        recorder._buffer["t"][-1] = np.int32(recorder._control_step)
+        recorder._buffer["time_s"][-1] = np.float32(
+            recorder._control_step / CONTROL_HZ
+        )
         recorder._control_step += 1
 
 
@@ -194,7 +206,7 @@ def test_every_episode_gets_a_split():
     feed(recorder, [(1, 1, 1, 1)] * 4)
     recorder.end_episode(reason="goal_reached")
     episode = next(iter(recorder.bucket.episodes.values()))
-    assert episode.split in ("train", "val", "test")
+    assert episode.split_assigned in ("train", "val", "test")
 
 
 # ── scene mapping ────────────────────────────────────────────────────────────

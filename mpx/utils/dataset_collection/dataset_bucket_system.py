@@ -63,7 +63,10 @@ from mpx.utils.dataset_collection.episode_storage import (
 )
 
 DATASET_SUMMARY_FILENAME = "dataset_summary.json"
-DATASET_SUMMARY_SCHEMA_VERSION = 3
+# Kept in step with EPISODE_SCHEMA_VERSION: they version the same on-disk
+# generation, and a run reporting 4 and 3 in the same metadata file only
+# looked like a bug.
+DATASET_SUMMARY_SCHEMA_VERSION = 4
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -89,10 +92,10 @@ class TerrainType(Enum):
 # CONTACT STATE DEFINITIONS  (FL, FR, RL, RR) — 1 = contact, 0 = swing
 # ══════════════════════════════════════════════════════════════════════════════
 
-# The 12 named gait states. They are the taxonomy used for bucket keys and
+# The 12 nominal gait states. This is the taxonomy used for bucket keys and
 # summaries — not the training label, which is the raw 4-bit vector stored on
 # every timestep.
-VALID_CONTACT_STATES: Dict[str, Tuple[int, int, int, int]] = {
+NOMINAL_GAIT_STATES: Dict[str, Tuple[int, int, int, int]] = {
     "FULL":        (1, 1, 1, 1),   # 1111 — standing / crawl / 4-leg balance
     "SWING_RR":    (1, 1, 1, 0),   # 1110 — rear-right  swing
     "SWING_RL":    (1, 1, 0, 1),   # 1101 — rear-left   swing
@@ -107,9 +110,23 @@ VALID_CONTACT_STATES: Dict[str, Tuple[int, int, int, int]] = {
     "FLIGHT":      (0, 0, 0, 0),   # 0000 — no foot contact (bound flight)
 }
 
-# The remaining four patterns are the single-foot stances (1000, 0100, 0010,
-# 0001). They are outliers of the gait taxonomy, not extra classes: they are
-# kept, flagged, and bucketed together instead of being dropped or named.
+# The remaining four patterns are the single-support stances. v3 collapsed all
+# four into one "RARE" bucket, so two different bit patterns shared a name and
+# the label was ambiguous. Each now gets its own name; the 16 patterns and the 16
+# names are in bijection.
+SINGLE_SUPPORT_STATES: Dict[str, Tuple[int, int, int, int]] = {
+    "SINGLE_FL": (1, 0, 0, 0),
+    "SINGLE_FR": (0, 1, 0, 0),
+    "SINGLE_RL": (0, 0, 1, 0),
+    "SINGLE_RR": (0, 0, 0, 1),
+}
+
+VALID_CONTACT_STATES: Dict[str, Tuple[int, int, int, int]] = {
+    **NOMINAL_GAIT_STATES,
+    **SINGLE_SUPPORT_STATES,
+}
+
+# v3 label for the four single-support patterns. Kept only for reading old data.
 RARE_CONTACT_STATE = "RARE"
 
 CONTACT_STATE_BITS: Dict[str, str] = {
@@ -130,10 +147,65 @@ IDX_TO_CONTACT_STATE: Dict[int, str] = {
 }
 
 
+# Standard leg phase offsets, FL FR RL RR, as fractions of one gait cycle.
+# Two legs sharing an offset swing together.
+GAIT_PHASE_OFFSETS: Dict[str, Tuple[float, float, float, float]] = {
+    "trot":  (0.5, 0.0, 0.0, 0.5),   # diagonal pairs
+    "pace":  (0.5, 0.0, 0.5, 0.0),   # lateral pairs
+    "bound": (0.5, 0.5, 0.0, 0.0),   # front pair / hind pair
+    "crawl": (0.25, 0.75, 0.0, 0.5), # one leg at a time
+}
+
+
+def gait_from_phase_offsets(timer_t, tolerance: float = 0.05) -> GaitType:
+    """
+    Identify the gait from the controller's per-leg phase offsets.
+
+    The gait label must come from what the controller is actually doing. The
+    audited run hardcoded ``GaitType.TROT`` in the simulator while
+    ``config_go2.timer_t`` held a crawl pattern, so every episode — and every run
+    folder name — claimed a gait the robot never walked.
+
+    Falls back to ``TRANSITION`` for an unrecognised pattern rather than guessing.
+    """
+    offsets = np.asarray(timer_t, dtype=np.float64).reshape(-1)[:4] % 1.0
+    for name, reference in GAIT_PHASE_OFFSETS.items():
+        expected = np.asarray(reference, dtype=np.float64) % 1.0
+        # The same gait may be written with any leg taken as phase zero, so try
+        # every whole-cycle shift. Compare element-wise, never sorted: sorting
+        # discards WHICH leg holds which phase, and trot [0.5,0,0,0.5] and pace
+        # [0.5,0,0.5,0] sort to the same multiset.
+        for anchor in range(4):
+            shifted = (offsets - offsets[anchor]) % 1.0
+            aligned = (expected - expected[anchor]) % 1.0
+            # Phases live on a circle, so 0.98 and 0.00 are 0.02 apart.
+            delta = np.abs(shifted - aligned)
+            delta = np.minimum(delta, 1.0 - delta)
+            if np.all(delta <= tolerance):
+                return GaitType(name)
+    return GaitType.TRANSITION
+
+
 def contact_state_name(bits: Sequence[int]) -> str:
-    """Named gait state for a 4-bit pattern, or ``"RARE"`` when it has none."""
+    """
+    Name for a 4-bit contact pattern.
+
+    All 16 patterns have a name: the 12 nominal gait states plus the four
+    ``SINGLE_<foot>`` single-support stances. Nothing falls through to a shared
+    catch-all, so a name identifies a pattern uniquely.
+    """
     key = tuple(int(b) for b in bits)
     return BINARY_TO_CONTACT_STATE.get(key, RARE_CONTACT_STATE)
+
+
+def is_rare_contact(bits: Sequence[int]) -> bool:
+    """
+    True when the pattern is single support, i.e. outside the nominal gait set.
+
+    This is the v3 ``rare_contact`` flag, kept as a deprecated column. Prefer
+    testing ``contact_state.startswith("SINGLE_")``, which also says which foot.
+    """
+    return tuple(int(b) for b in bits) in set(SINGLE_SUPPORT_STATES.values())
 
 
 def contact_bits_string(bits: Sequence[int]) -> str:
@@ -206,18 +278,21 @@ class SampleRef:
 
     episode_id:    str
     t:             int
-    contact_state: str                        # named gait state or "RARE"
+    contact_state: str                        # one of the 16 named patterns
     contact_bits:  Tuple[int, int, int, int]  # FL FR RL RR
     grf_total_n:        float                 # sum of per-foot |GRF| at t
     external_force_n:   float                 # |F_ext| at t
     perturbation_active: bool
     gait_type:     GaitType
     terrain_type:  TerrainType
+    post_failure:  bool = False               # after the robot became unrecoverable
+    valid:         bool = True                # usable for training
+    schedule_mismatch: bool = False           # foot is not where the plan said
 
     @property
     def rare_contact(self) -> bool:
-        """True when the pattern is outside the 12 named gait states."""
-        return self.contact_state == RARE_CONTACT_STATE
+        """True when the pattern is single support (deprecated v3 flag)."""
+        return self.contact_state in SINGLE_SUPPORT_STATES
 
 
 @dataclass(frozen=True)
@@ -266,10 +341,16 @@ class DatasetBucketSystem:
        is always taken from a single episode file it can never cross an
        episode boundary.
 
-    3. Bucket assignment and reservoir sampling
-       Each (contact_state, perturbation_active, terrain, gait) combination
-       gets its own capped bucket. Reservoir sampling ensures that after N
-       samples have been seen, the bucket holds a uniform random subset.
+    3. Bucket assignment (bookkeeping only)
+       Each (contact_state, perturbation_active, terrain, gait) combination gets
+       its own bucket, and ``bucket_key`` travels on every index row so a sampler
+       can stratify on it. Buckets no longer **drop** samples: v4.0 equalised the
+       three majority contact states and silently discarded 2,069 of 23,994 rows
+       (11.2% of `0110`, 10.9% of `1001`, 6.5% of `1111`, 0% of everything else),
+       which changed the class prior — accuracy over that index was not accuracy
+       over the real distribution, and comparing it to MI-HGNN / ECNN numbers
+       computed on unbalanced data would be apples to oranges. Balancing is now a
+       training-time **weight**, not a deletion.
 
     4. Perturbation ratio enforcement
        Hard minimum fraction of stored samples that must be perturbation-active.
@@ -330,6 +411,14 @@ class DatasetBucketSystem:
             in memory — used by tests and by the ``__main__`` demo.
         """
         self.bucket_capacity              = bucket_capacity
+        # Crash predicate for the per-frame ``post_failure`` flag; mirrors the
+        # simulators' own ``_is_crashed`` test.
+        self.crash_height_m               = 0.15
+        self.crash_tilt_deg               = 60.0
+        # Sustained-collapse predicate: below this height for this many control
+        # steps means the robot is resting on something other than its feet.
+        self.collapse_height_m            = 0.175
+        self.collapse_dwell_steps         = 25      # 0.5 s at 50 Hz
         self.contact_force_threshold      = contact_force_threshold
         self.perturbation_force_threshold = perturbation_force_threshold
         self.min_perturbation_ratio       = min_perturbation_ratio
@@ -432,8 +521,17 @@ class DatasetBucketSystem:
 
         gait_type = GaitType(metadata.gait)
         terrain_type = TerrainType(metadata.terrain)
+        post_failure = self.post_failure_mask(record)
 
         contact = np.asarray(record.arrays["contact"], dtype=np.uint8).reshape(-1, 4)
+        # Where the foot is NOT where the controller planned it to be: a slip, an
+        # early landing, a missed step. This is the subset on which reading the
+        # commanded torque cannot score, so it is the honest benchmark for a
+        # method that claims to perceive contact rather than recite the plan.
+        schedule = np.asarray(
+            record.arrays["contact_schedule"], dtype=np.uint8
+        ).reshape(-1, 4)
+        schedule_mismatch = (contact != schedule).any(axis=1)
         grf = np.asarray(record.arrays["grf_world"], dtype=np.float64).reshape(-1, 4, 3)
         ext = np.asarray(record.arrays["external_force"], dtype=np.float64).reshape(-1, 3)
 
@@ -454,7 +552,7 @@ class DatasetBucketSystem:
 
             bits = tuple(int(b) for b in contact[label_index])
             state = contact_state_name(bits)
-            if state == RARE_CONTACT_STATE:
+            if is_rare_contact(bits):
                 n_rare += 1
 
             perturb_active = self._is_perturbation_active(ext_norms[label_index])
@@ -462,6 +560,9 @@ class DatasetBucketSystem:
             sample = SampleRef(
                 episode_id          = episode_id,
                 t                   = label_index,
+                post_failure        = bool(post_failure[label_index]),
+                valid               = not bool(post_failure[label_index]),
+                schedule_mismatch   = bool(schedule_mismatch[label_index]),
                 contact_state       = state,
                 contact_bits        = bits,
                 grf_total_n         = float(grf_totals[label_index]),
@@ -478,7 +579,7 @@ class DatasetBucketSystem:
                 gait_type           = gait_type,
             )
 
-            if self._reservoir_add(key, sample):
+            if self._bucket_add(key, sample):
                 n_added += 1
             else:
                 n_rejected += 1
@@ -490,41 +591,75 @@ class DatasetBucketSystem:
             "total_seen": n_added + n_rejected,
         }
 
+    def post_failure_mask(self, record: EpisodeRecord) -> np.ndarray:
+        """
+        Per-frame flag: the robot had already become unrecoverable at this step.
+
+        v3 kept 1,625 frames of a tumbling robot with no row-level marker, so they
+        could not be filtered or stratified without joining back to the episode
+        table. Only failure episodes can contain such frames; the predicate is the
+        simulators' own crash test (base too low, or rolled/pitched past 60°), and
+        once it first holds every later frame of the episode is flagged, since the
+        robot does not recover.
+        """
+        n_steps = record.n_steps
+        mask = np.zeros(n_steps, dtype=bool)
+        if record.metadata.terminate_by != "failure":
+            return mask
+
+        height = np.asarray(
+            record.arrays["base_height_terrain"], dtype=np.float64
+        ).reshape(-1)
+        quat = np.asarray(record.arrays["base_quat"], dtype=np.float64).reshape(-1, 4)
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+        pitch = np.arcsin(np.clip(2.0 * (w * y - z * x), -1.0, 1.0))
+
+        # Instantaneous predicates: too low, or rolled/pitched past the limit.
+        crashed = (
+            (height < self.crash_height_m)
+            | (np.abs(roll) > np.deg2rad(self.crash_tilt_deg))
+            | (np.abs(pitch) > np.deg2rad(self.crash_tilt_deg))
+        )
+
+        # Sustained collapse: a folded robot rests just above the hard floor,
+        # level, and stays there. One pilot logged 26 s of exactly that as a
+        # clean episode. Flag a low stance only once it has persisted, so a deep
+        # squat is not mistaken for a fall.
+        low = height < self.collapse_height_m
+        if low.any():
+            run_length = 0
+            for step, is_low in enumerate(low):
+                run_length = run_length + 1 if is_low else 0
+                if run_length >= self.collapse_dwell_steps:
+                    crashed[step] = True
+
+        first = np.flatnonzero(crashed)
+        if first.size:
+            mask[first[0] :] = True
+        return mask
+
     # ══════════════════════════════════════════════════════════════════════════
     # RESERVOIR SAMPLING  (private)
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _reservoir_add(self, key: BucketKey, sample: SampleRef) -> bool:
+    def _bucket_add(self, key: BucketKey, sample: SampleRef) -> bool:
         """
-        Add a sample to its bucket using reservoir sampling (Vitter's Algorithm R).
+        File a sample under its bucket. **Never drops.**
 
-        While the bucket has free capacity every sample is stored directly.
-        Once full, each new sample replaces a random existing one with
-        probability (capacity / n_seen), ensuring that after N total samples
-        the bucket holds a uniform random subset of all N seen.
+        The index must contain every row in the episode files: it is a lookup
+        table, and dropping rows here silently reweights the classes for anyone
+        who counts over it. Class balance is applied at training time as a
+        per-sample weight (see :meth:`class_weights`), which is reversible and
+        visible, and is applied to the train split only.
 
-        Returns True if the sample was stored, False if discarded.
+        Returns True always; the signature is kept so callers still read as
+        "was this stored".
         """
         self.bucket_seen_count[key] += 1
-        n_seen = self.bucket_seen_count[key]
-        bucket = self.buckets[key]
-
-        if len(bucket) < self.bucket_capacity:
-            # Free space — store unconditionally
-            bucket.append(sample)
-            self._update_global_counters(sample, delta=+1)
-            return True
-
-        # Bucket full — replace with probability capacity / n_seen
-        replace_idx = random.randint(0, n_seen - 1)
-        if replace_idx < self.bucket_capacity:
-            evicted = bucket[replace_idx]
-            self._update_global_counters(evicted, delta=-1)
-            bucket[replace_idx] = sample
-            self._update_global_counters(sample, delta=+1)
-            return True
-
-        return False    # Rejected by reservoir sampling
+        self.buckets[key].append(sample)
+        self._update_global_counters(sample, delta=+1)
+        return True
 
     def _update_global_counters(self, sample: SampleRef, delta: int) -> None:
         """Increment or decrement global counters when a sample is stored/evicted."""
@@ -615,7 +750,7 @@ class DatasetBucketSystem:
         for samples in self.buckets.values():
             for sample in samples:
                 metadata = self.episodes.get(sample.episode_id)
-                counts[metadata.split if metadata else "train"] += 1
+                counts[metadata.split_assigned if metadata else "train"] += 1
         return dict(counts)
 
     def episode_outcome_counts(self) -> Dict[str, int]:
@@ -778,10 +913,14 @@ class DatasetBucketSystem:
         """
         Build the balanced label index: one row per exported sample.
 
-        Each row names the ``(episode_id, t)`` a sampler reads, the split its
-        episode belongs to, and the bucket it was balanced into. No window
-        length appears: the sampler chooses ``W`` and skips rows with
-        ``t < W - 1``.
+        Each row names the ``(episode_id, t)`` a sampler reads plus the bucket it
+        was balanced into. No window length appears: the sampler chooses ``W`` and
+        skips rows with ``t < W - 1``.
+
+        There is deliberately **no** ``split`` column. Train/val/test comes from
+        ``datasets/manifest.json`` at load time, joined on
+        ``randomization_group_id`` — episodes sharing randomization are
+        near-duplicates and must land in the same split.
 
         Parameters
         ----------
@@ -806,7 +945,22 @@ class DatasetBucketSystem:
                     {
                         "episode_id":          sample.episode_id,
                         "t":                   int(sample.t),
-                        "split":               metadata.split if metadata else "train",
+                        "run_id":              metadata.run_id if metadata else "",
+                        "randomization_group_id": (
+                            metadata.randomization_group_id if metadata else ""
+                        ),
+                        "seed": (
+                            int(metadata.seed)
+                            if metadata is not None and metadata.seed is not None
+                            else -1
+                        ),
+                        "terminate_reason": (
+                            metadata.terminate_reason if metadata else ""
+                        ),
+                        "post_failure":        bool(sample.post_failure),
+                        "valid":               bool(sample.valid),
+                        "schedule_mismatch":   bool(sample.schedule_mismatch),
+                        "window_valid_w10":    int(sample.t) >= 9,
                         "terrain":             sample.terrain_type.value,
                         "gait":                sample.gait_type.value,
                         "contact_state":       sample.contact_state,
@@ -821,6 +975,54 @@ class DatasetBucketSystem:
 
         if shuffle:
             random.Random(seed).shuffle(rows)
+        return rows
+
+    def class_weights(self, alpha: float = 0.5) -> Dict[str, float]:
+        """
+        Per-contact-state sampling weights, ``(1 / count) ** alpha``.
+
+        The replacement for dropping rows. ``alpha = 0`` is the natural
+        distribution, ``alpha = 1`` fully equalises the classes, and the default
+        0.5 sits between: it lifts the rare single-support states without
+        pretending they are as common as a trot diagonal. Record the value used
+        in the manifest, and apply it to the **train** split only — reweighting
+        val or test would make the reported metric describe a distribution that
+        does not exist.
+        """
+        counts = self.contact_state_counts()
+        if not counts:
+            return {}
+        weights = {
+            state: (1.0 / max(count, 1)) ** float(alpha)
+            for state, count in counts.items()
+        }
+        # Normalise so the mean weight over the stored samples is 1.0, which
+        # keeps loss magnitudes comparable across alpha settings.
+        total = sum(weights[state] * count for state, count in counts.items())
+        scale = sum(counts.values()) / total if total else 1.0
+        return {state: w * scale for state, w in weights.items()}
+
+    def balanced_index_rows(
+        self,
+        alpha: float = 0.5,
+        max_per_bucket: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        The index with a ``weight`` column — the materialised balanced view.
+
+        Shipped as ``index_balanced.parquet`` beside the complete index, so the
+        balancing is inspectable rather than baked into which rows exist.
+        """
+        weights = self.class_weights(alpha)
+        rows = []
+        for row in self.index_rows(max_per_bucket=max_per_bucket, shuffle=False):
+            rows.append(
+                {
+                    "episode_id": row["episode_id"],
+                    "t": row["t"],
+                    "weight": float(weights.get(row["contact_state"], 1.0)),
+                }
+            )
         return rows
 
     def split_index_rows(
@@ -838,7 +1040,8 @@ class DatasetBucketSystem:
         """
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for row in self.index_rows(max_per_bucket=max_per_bucket, shuffle=True, seed=seed):
-            grouped[row["split"]].append(row)
+            metadata = self.episodes.get(row["episode_id"])
+            grouped[metadata.split_assigned if metadata else "train"].append(row)
         return dict(grouped)
 
     def save_dataset(
@@ -850,9 +1053,10 @@ class DatasetBucketSystem:
         max_per_bucket: Optional[int] = None,
         shuffle: bool = True,
         seed: Optional[int] = None,
+        balance_alpha: float = 0.5,
     ) -> Path:
         """
-        Write the episode metadata table and the balanced label index.
+        Write the episode metadata table and the label index.
 
         Episode tables themselves were already written by :meth:`add_episode`.
         Returns the path of ``index.parquet``.
@@ -864,11 +1068,14 @@ class DatasetBucketSystem:
             store = EpisodeStore(Path(run_dir))
 
         store.write_episode_table(list(self.episodes.values()))
+        # index.parquet is COMPLETE: one row per sample, nothing dropped.
         index_path = store.write_index(
             self.index_rows(
                 max_per_bucket=max_per_bucket, shuffle=shuffle, seed=seed
             )
         )
+        # The balanced view lives beside it as weights, never as deletions.
+        store.write_balanced_index(self.balanced_index_rows(alpha=balance_alpha))
 
         if write_metadata and metadata is not None:
             payload = {
@@ -876,7 +1083,13 @@ class DatasetBucketSystem:
                 "run_dir": str(store.run_dir.resolve()),
                 "index_path": str(index_path.resolve()),
                 "episode_schema_version": EPISODE_SCHEMA_VERSION,
+                "dataset_summary_schema_version": DATASET_SUMMARY_SCHEMA_VERSION,
                 "bucket_capacity": self.bucket_capacity,
+                "randomization_groups": sorted(
+                    {m.randomization_group_id for m in self.episodes.values()}
+                ),
+                "class_balance_alpha": float(balance_alpha),
+                "class_weights": self.class_weights(balance_alpha),
                 "foot_order": list(FOOT_ORDER),
                 "saved_at": self._summary_timestamp(),
                 "n_samples": self.total_samples_stored,
@@ -1100,11 +1313,15 @@ class DatasetBucketSystem:
 
         perturbation_samples = 0
         rare_samples = 0
+        split_by_episode = {
+            row["episode_id"]: row.get("split_assigned", "train")
+            for row in episode_rows
+        }
         for row in index_rows:
             contact_counts[row["contact_state"]] += 1
             terrain_counts[row["terrain"]] += 1
             gait_counts[row["gait"]] += 1
-            split_counts[row["split"]] += 1
+            split_counts[split_by_episode.get(row["episode_id"], "train")] += 1
             perturbation_samples += int(bool(row["perturbation_active"]))
             rare_samples += int(bool(row["rare_contact"]))
             grouped[row["bucket_key"]].append(row)
@@ -1121,11 +1338,7 @@ class DatasetBucketSystem:
                 {
                     "bucket_key": bucket_key,
                     "contact_state": first["contact_state"],
-                    "contact_bits": (
-                        CONTACT_STATE_BITS.get(first["contact_state"])
-                        if first["contact_state"] != RARE_CONTACT_STATE
-                        else None
-                    ),
+                    "contact_bits": CONTACT_STATE_BITS.get(first["contact_state"]),
                     "perturbation_active": bool(first["perturbation_active"]),
                     "terrain": first["terrain"],
                     "gait": first["gait"],
@@ -1181,7 +1394,9 @@ class DatasetBucketSystem:
                     "payload_kg": episode.get("payload_kg"),
                     "terminate_by": episode.get("terminate_by"),
                     "terminate_reason": episode.get("terminate_reason"),
-                    "split": episode.get("split"),
+                    "split_assigned": episode.get("split_assigned"),
+                    "randomization_group_id": episode.get("randomization_group_id"),
+                    "seed": episode.get("seed"),
                 }
                 for episode in episode_rows
             ],
@@ -1531,9 +1746,7 @@ if __name__ == "__main__":
 
         contacts = bucket_sys.derive_contacts(grf)
         arrays["contact"][:] = contacts
-        arrays["rare_contact"][:] = [
-            contact_state_name(bits) == RARE_CONTACT_STATE for bits in contacts
-        ]
+        arrays["rare_contact"][:] = [is_rare_contact(bits) for bits in contacts]
         arrays["dt_since_transition"][:] = dt_since_transition(contacts, 1.0 / CONTROL_HZ)
 
         metadata = EpisodeMetadata(

@@ -14,6 +14,7 @@ from mpx.utils.dataset_collection.dataset_bucket_system import (
     GaitType,
     TerrainType,
 )
+from mpx.utils.dataset_collection.dataset_schema import EPISODE_COLUMNS
 from mpx.utils.dataset_collection.episode_recorder import (
     EpisodeRecorder,
     EpisodeRecorderConfig,
@@ -42,21 +43,20 @@ def _make_recorder(bucket: DatasetBucketSystem | None = None) -> EpisodeRecorder
 
 
 def _feed_full_contact(recorder: EpisodeRecorder, n_steps: int = 3) -> None:
-    """Push ``n_steps`` four-foot-stance rows into the recorder's buffer."""
-    grf = np.zeros((4, 3), dtype=np.float32)
-    grf[:, 2] = 20.0
-    for _ in range(n_steps):
-        for name in recorder.SAMPLED_COLUMNS:
-            if name == "grf_world":
-                value = grf.reshape(-1).copy()
-            elif name == "external_force":
-                value = np.zeros(3, dtype=np.float32)
-            elif name in ("joint_pos", "joint_vel", "joint_torque"):
-                value = np.zeros(12, dtype=np.float32)
-            elif name in ("foot_pos_base", "foot_vel_base"):
-                value = np.zeros(12, dtype=np.float32)
-            else:
-                value = np.zeros(3, dtype=np.float32)
+    """Push ``n_steps`` four-foot-stance rows covering every v4 column."""
+    for step in range(n_steps):
+        row = {c.name: np.zeros(c.shape, dtype=c.dtype) for c in EPISODE_COLUMNS}
+        row["contact"] = np.ones(4, dtype=np.uint8)
+        row["contact_raw"] = np.ones(4, dtype=np.uint8)
+        grf = np.zeros((4, 3), dtype=np.float32)
+        grf[:, 2] = 20.0
+        row["grf_world"] = grf.reshape(-1)
+        row["grf_mean_n"] = np.full(4, 20.0, dtype=np.float32)
+        row["base_quat"] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        row["base_height_terrain"] = np.float32(0.30)
+        row["t"] = np.int32(step)
+        row["time_s"] = np.float32(step / 50.0)
+        for name, value in row.items():
             recorder._buffer[name].append(value)
         recorder._control_step += 1
 

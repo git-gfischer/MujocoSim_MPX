@@ -44,6 +44,7 @@ import mpx.utils.simulation_utils.sim_utils as sim_utils
 from mpx.utils.math_utils.quad_math import yaw_from_quat, _quat_to_axes, quat_normalize_wxyz, quat_mul_wxyz
 
 from mpx.utils.dataset_collection.episode_recorder import (
+    ControlSample,
     read_episode_conditions,
     setup_sim_collection,
 )
@@ -112,7 +113,9 @@ def main(
 
     #print_contact_friction(model, config.contact_frame, "floor")
     data = mujoco.MjData(model)
-    sim_frequency = 200.0
+    # 500 Hz by default; see config_dataset_bucket.SimRateConfig. Control and
+    # logging stay at 50 Hz and the contact label is reduced from the substeps.
+    sim_frequency = float(dataset_collection_config.rates.sim_hz)
     model.opt.timestep = 1 / sim_frequency
 
     contact_ids = sim_utils.geom_ids(model, config.contact_frame)
@@ -165,6 +168,8 @@ def main(
     )
     base_weight = BaseWeightForce.from_config(cfg=base_weight_config)
     reset_randomizer = ResetRandomizer.from_config(balance_reset_randomization_config)
+    # Incremented once per episode; recorded so a run is reproducible.
+    episode_seed = 0
     #------------------------------------------------
 
     # region desired pose sampler configuration---------------------------------------
@@ -174,6 +179,36 @@ def main(
     desired_quat   = np.asarray(config.quat0, dtype=np.float64)
     #endregion
     #------------------------------------------------
+
+    # region per-episode domain randomization -------------------------------
+    def _randomize_episode():
+        """Resample every reset knob and stamp it on the episode about to start.
+
+        Called at every episode boundary, not only at a respawn: the balance gate
+        closes an episode when the pose is lost without respawning, and v3 then
+        reused one parameter set across many episodes, which made near-duplicate
+        episodes land in different splits.
+        """
+        nonlocal mpc_data, episode_seed
+        episode_seed += 1
+        sample, mpc_data = reset_randomizer.sample_and_apply(
+            ResetTargets(
+                model=model,
+                foot_geom_ids=contact_ids,
+                base_weight=base_weight,
+                navigator=None,
+                mpc_data=mpc_data,
+            )
+        )
+        meta = sample.to_metadata()
+        collect_hooks.set_episode_conditions(
+            randomization=meta,
+            seed=episode_seed,
+            mode="stand_4leg",
+            **read_episode_conditions(model, contact_ids, base_weight),
+        )
+        return meta
+    # endregion
 
     # region respawn helper -------------------------------------
     def _respawn(*, manual: bool = False, crashed: bool = False):
@@ -207,20 +242,7 @@ def main(
         base_force_pert.reset()
         pi.reset()
 
-        sample, mpc_data = reset_randomizer.sample_and_apply(
-            ResetTargets(
-                model=model,
-                foot_geom_ids=contact_ids,
-                base_weight=base_weight,
-                navigator=None,
-                mpc_data=mpc_data,
-            )
-        )
-        meta = sample.to_metadata()
-        collect_hooks.set_episode_conditions(
-            randomization=meta,
-            **read_episode_conditions(model, contact_ids, base_weight),
-        )
+        meta = _randomize_episode()
         extra = ""
         if meta:
             extra = "  " + "  ".join(
@@ -346,9 +368,18 @@ def main(
 
         # Record only while the robot holds the sampled pose; losing it closes the
         # episode, so each stored episode is one continuous "on target" stretch.
-        collect_hooks.set_recording(_holds_desired_pose(), reason="pose_lost")
+        # Losing the pose ends the episode but does not respawn, so resample the
+        # domain randomization here or the next episode reuses these knobs and
+        # becomes a near-duplicate of the one just stored.
+        if collect_hooks.set_recording(_holds_desired_pose(), reason="pose_lost"):
+            _randomize_episode()
         collect_hooks.after_physics_step(
             model, data, np.asarray(tau), contact_ids, base_force_pert, config.n_joints,
+            control=ControlSample(
+                tau_cmd=np.asarray(tau),
+                leg_phase=np.asarray(mpc_data.contact_time),
+                duty_factor=float(mpc_data.duty_factor),
+            ),
         )
 
         # Lin_acc / Ang_vel are stored in physical units; LieImage.get_image

@@ -532,6 +532,8 @@ class RobotMapSpawner:
         """
         # SpawnConfig path — has XY + yaw from manual_region_* and region_yaw
         if hasattr(cfg, 'spawn_region'):
+            if "robot_root_body_name" not in kwargs and hasattr(cfg, "robot_root_body_name"):
+                kwargs["robot_root_body_name"] = cfg.robot_root_body_name
             return cls(
                 region=cfg.spawn_region(),
                 foot_geom_names=foot_geom_names,

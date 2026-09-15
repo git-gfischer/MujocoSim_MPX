@@ -184,5 +184,12 @@ def test_default_profiles_knob_flags():
     assert loco_reset_randomization_config.max_speed.enabled is True
     assert loco_reset_randomization_config.solref_timeconst.log_uniform is True
     assert loco_reset_randomization_config.friction.enabled is True
-    assert loco_reset_randomization_config.friction.low == 0.20
-    assert loco_reset_randomization_config.friction.high == 1.00
+    # Nominal folders keep the foot at or above the XML value of 1.2; slippery
+    # conditions get a dedicated folder rather than a 38% fall rate mixed into
+    # normal locomotion (DATASET_FIX_TASKS_R2 Task R2-8 item 3).
+    assert loco_reset_randomization_config.friction.low == 1.20
+    assert loco_reset_randomization_config.friction.high == 2.00
+    # v4 clamped the contact time constant: the v3 upper end of 0.035 s was
+    # 6.6 sim steps at 200 Hz and caused the one-frame contact dropouts.
+    assert loco_reset_randomization_config.solref_timeconst.low == 0.010
+    assert loco_reset_randomization_config.solref_timeconst.high == 0.014

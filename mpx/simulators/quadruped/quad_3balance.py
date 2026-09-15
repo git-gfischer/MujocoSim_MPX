@@ -58,6 +58,7 @@ from mpx.utils.simulation_utils.live_plotter import ProprioceptivePlotter
 from mpx.config.sim_config.config_live_plotter import live_plotter_config
 
 from mpx.utils.dataset_collection.episode_recorder import (
+    ControlSample,
     read_episode_conditions,
     setup_sim_collection,
 )
@@ -115,7 +116,9 @@ def main(
     swing_leg_idx = int(np.where(np.array(config.balance_fixed_contact_mask) < 0.5)[0][0])
 
     data = mujoco.MjData(model)
-    sim_frequency = 200.0
+    # 500 Hz by default; see config_dataset_bucket.SimRateConfig. Control and
+    # logging stay at 50 Hz and the contact label is reduced from the substeps.
+    sim_frequency = float(dataset_collection_config.rates.sim_hz)
     model.opt.timestep = 1 / sim_frequency
 
     contact_ids = sim_utils.geom_ids(model, config.contact_frame)
@@ -184,6 +187,8 @@ def main(
     )
     base_weight = BaseWeightForce.from_config(cfg=base_weight_config)
     reset_randomizer = ResetRandomizer.from_config(balance_reset_randomization_config)
+    # Incremented once per episode; recorded so a run is reproducible.
+    episode_seed = 0
     #------------------------------------------------
 
     # region desired pose sampler configuration---------------------------------------
@@ -279,8 +284,12 @@ def main(
             )
         )
         meta = sample.to_metadata()
+        nonlocal episode_seed
+        episode_seed += 1
         collect_hooks.set_episode_conditions(
             randomization=meta,
+            seed=episode_seed,
+            mode=f"stand_3leg_{config.contact_frame[swing_leg_idx]}",
             **read_episode_conditions(model, contact_ids, base_weight),
         )
         extra = ""
@@ -393,6 +402,11 @@ def main(
 
         collect_hooks.after_physics_step(
             model, data, np.asarray(tau), contact_ids, base_force_pert, config.n_joints,
+            control=ControlSample(
+                tau_cmd=np.asarray(tau),
+                leg_phase=np.asarray(mpc_data.contact_time),
+                duty_factor=float(mpc_data.duty_factor),
+            ),
         )
 
         if _is_crashed():

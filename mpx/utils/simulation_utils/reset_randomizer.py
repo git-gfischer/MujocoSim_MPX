@@ -30,6 +30,7 @@ class ResetSample:
     duty_factor: float | None = None
     solref_timeconst: float | None = None
     friction: float | None = None
+    base_height: float | None = None
 
     def to_metadata(self) -> dict[str, float]:
         """JSON-friendly dict of sampled knobs only."""
@@ -43,6 +44,7 @@ class ResetSample:
                 ("duty_factor", self.duty_factor),
                 ("solref_timeconst", self.solref_timeconst),
                 ("friction", self.friction),
+                ("base_height", self.base_height),
             )
             if value is not None
         }
@@ -89,6 +91,7 @@ class ResetRandomizer:
             duty_factor=self._draw(self.cfg.duty_factor),
             solref_timeconst=self._draw(self.cfg.solref_timeconst),
             friction=self._draw(self.cfg.friction),
+            base_height=self._draw(self.cfg.base_height),
         )
 
     def apply(self, sample: ResetSample, targets: ResetTargets) -> Any:
@@ -102,6 +105,8 @@ class ResetRandomizer:
                 targets.navigator.max_speed = float(sample.max_speed)
             if sample.max_yaw_rate is not None:
                 targets.navigator.max_yaw_rate = float(sample.max_yaw_rate)
+            if sample.base_height is not None and hasattr(targets.navigator, "robot_height"):
+                targets.navigator.robot_height = float(sample.base_height)
         if mpc_data is not None:
             replace_kwargs = {}
             if sample.step_freq is not None:

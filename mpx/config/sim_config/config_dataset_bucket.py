@@ -33,6 +33,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from mpx.utils.dataset_collection.contact_labeling import ContactLabelConfig
+
 
 def default_dataset_output_root() -> str:
     """Return ``<repo_root>/datasets``, sibling to the ``mpx`` package folder."""
@@ -89,10 +91,28 @@ class DatasetBucketConfig:
 
 
 @dataclass
+class SimRateConfig:
+    """Physics and control rates for a collection run."""
+
+    # Physics rate [Hz]. 500 Hz (2 ms) keeps the contact solver's 10 ms time
+    # constant at 5 substeps, which is what stops the one-frame contact dropouts;
+    # at 200 Hz the same time constant is only 2 substeps and the foot bounces.
+    sim_hz: float = 500.0
+
+    # Control and logging rate [Hz]. Unchanged — the labels are reduced from the
+    # substeps between two control steps, not sampled at one instant.
+    control_hz: float = 50.0
+
+    @property
+    def substeps_per_control(self) -> int:
+        return max(1, int(round(self.sim_hz / self.control_hz)))
+
+
+@dataclass
 class EpisodeCollectionConfig:
     """On-the-fly episode buffering before routing into buckets."""
 
-    # Control / label sample rate [Hz] (decimated from sim rate, e.g. 200 Hz → 50 Hz).
+    # Control / label sample rate [Hz] (decimated from sim rate, e.g. 500 Hz → 50 Hz).
     control_hz: float = 50.0
 
     # How episode boundaries are decided:
@@ -119,6 +139,24 @@ class EpisodeCollectionConfig:
     # The steps leading into a failure are where contact/GRF estimates break down,
     # so they are collected by default. A manual respawn is never stored.
     store_failed_episodes: bool = True
+
+    # Close an episode when the navigator reaches its goal. Off during data
+    # collection: goal_reached truncated v3 episodes to a 9 s median, far short
+    # of the 30 s of steady state a temporal representation needs. With this
+    # False the navigator resamples a goal and the episode continues.
+    end_episode_on_goal: bool = False
+
+    # Resample every domain-randomization knob at each episode boundary, not only
+    # at a respawn. v3 reused one parameter set across up to 12 consecutive
+    # episodes, which made near-duplicate episodes land in different splits.
+    randomize_per_episode: bool = True
+
+    # Drive collection from a segmented velocity command instead of goal
+    # following. Goal following never commands a yaw rate and never reverses:
+    # the audited v4 run had commanded yaw identically zero for all 23,994 rows,
+    # so yaw-invariance could not be tested at all. See
+    # mpx/utils/simulation_utils/velocity_command.py.
+    segmented_commands: bool = True
 
 
 @dataclass
@@ -147,6 +185,8 @@ class DatasetCollectionConfig:
     # Set True to collect without passing ``--collect`` on the CLI.
     enabled: bool = False
 
+    rates: SimRateConfig = field(default_factory=SimRateConfig)
+    contact_labeling: ContactLabelConfig = field(default_factory=ContactLabelConfig)
     bucket: DatasetBucketConfig = field(default_factory=DatasetBucketConfig)
     episode: EpisodeCollectionConfig = field(default_factory=EpisodeCollectionConfig)
     export: DatasetExportConfig = field(default_factory=DatasetExportConfig)

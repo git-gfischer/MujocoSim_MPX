@@ -1,5 +1,6 @@
 # Usage: python quad_locomotion.py --headless --steps 2000 --scene flat --robot go2 --nav random --n-env 8 
 # dataset_collection: python quad_locomotion.py --collect --scene flat --robot go2 --nav random
+# Spot: python quad_locomotion.py --scene flat --robot spot
 import argparse
 import os
 import sys
@@ -49,11 +50,19 @@ from mpx.navigation.pointNav import PointNavigator
 
 from mpx.utils.simulation_utils.live_plotter import ProprioceptivePlotter
 from mpx.config.sim_config.config_live_plotter import live_plotter_config
+from mpx.utils.simulation_utils.velocity_command import (
+    VelocityCommandSampler,
+    command_from_mpc_input,
+)
 from mpx.utils.dataset_collection.episode_recorder import (
+    ControlSample,
     read_episode_conditions,
     setup_sim_collection,
 )
-from mpx.utils.dataset_collection.dataset_bucket_system import GaitType
+from mpx.utils.dataset_collection.dataset_bucket_system import (
+    GaitType,
+    gait_from_phase_offsets,
+)
 from mpx.config.sim_config.config_dataset_bucket import dataset_collection_config
 
 from mpx.estimators.quad_contact_estimation import estimate_contacts, estimate_foot_grf
@@ -62,15 +71,30 @@ from mpx.estimators.quad_contact_estimation import estimate_contacts, estimate_f
 # gpu_device = jax.devices('gpu')[0]
 # jax.default_device(gpu_device)
 
+_ROBOT_DATA_DIR = {
+    "go2": "go2",
+    "aliengo": "aliengo",
+    "spot": "boston_dynamics_spot",
+}
+
+
 #region ================Helper functions================
 def robot_config(robot):
-    if(robot == "go2"):
-        from mpx.config.robot_config.config_go2 import go2_config, Go2Mode, BalanceStance
-        GO2_CONTROLLER_MODE = Go2Mode.LOCOMOTION
-        config = go2_config(GO2_CONTROLLER_MODE)
-    elif(robot == "aliengo"):
+    if robot == "go2":
+        from mpx.config.robot_config.config_go2 import go2_config, Go2Mode
+        return go2_config(Go2Mode.LOCOMOTION)
+    if robot == "spot":
+        from mpx.config.robot_config.config_spot import spot_config, SpotMode
+        return spot_config(SpotMode.LOCOMOTION)
+    if robot == "aliengo":
         import mpx.config.robot_config.config_aliengo as config
-    return config
+        return config
+    raise ValueError(f"Unknown robot {robot!r}; expected one of {sorted(_ROBOT_DATA_DIR)}")
+
+
+def _scene_xml_path(robot: str, scene: str) -> str:
+    folder = _ROBOT_DATA_DIR.get(robot, robot)
+    return os.path.abspath(os.path.join(dir_path, "..", "..", "data", folder, f"scene_{scene}.xml"))
 #------------------------------------------------
 def _build_solve_fn(mpc):
     @jax.jit
@@ -96,15 +120,16 @@ def main(
     collect_out=None,
     episode_duration_s=None,
 ):
-    model = mujoco.MjModel.from_xml_path(
-        dir_path + f"/../../data/{robot}/scene_{scene}.xml"
-    )
+    model = mujoco.MjModel.from_xml_path(_scene_xml_path(robot, scene))
 
     # robot configuration
     config = robot_config(robot)
 
     data = mujoco.MjData(model)
-    sim_frequency = 200.0
+    # 500 Hz by default: the contact solver's 10 ms time constant then spans 5
+    # substeps, which is what stops the one-frame contact dropouts. Control and
+    # logging stay at 50 Hz; the labels are reduced from the substeps between.
+    sim_frequency = float(dataset_collection_config.rates.sim_hz)
     model.opt.timestep = 1 / sim_frequency
 
     contact_ids = sim_utils.geom_ids(model, config.contact_frame)
@@ -117,6 +142,14 @@ def main(
         robot_height=config.robot_height,
         auto_resample=(nav == "random"),
     )
+    # Segmented velocity command for data collection. Goal-following never
+    # commands a yaw rate directly and never reverses, so a collected dataset
+    # built on it cannot test yaw-invariance or a backward gait.
+    command_sampler = VelocityCommandSampler(
+        dt=1.0 / dataset_collection_config.episode.control_hz
+    )
+    use_command_sampler = collect and dataset_collection_config.episode.segmented_commands
+
     solve_mpc = _build_solve_fn(mpc)
     reset_mpc = jax.jit(mpc.reset)
 
@@ -127,7 +160,10 @@ def main(
     )
     collect_hooks = setup_sim_collection(
         collect,
-        gait_type=GaitType.TROT,
+        # Read the gait off the controller's phase offsets rather than
+        # hardcoding it: config_go2.timer_t decides what the robot walks,
+        # and a hardcoded label put "trot" on a crawling robot.
+        gait_type=gait_from_phase_offsets(config.timer_t),
         scene=scene,
         sim_hz=sim_frequency,
         robot=robot,
@@ -141,6 +177,9 @@ def main(
         cfg=spawn_config,
         foot_geom_names=config.contact_frame,
         check_collisions=True,     # set True for rough/stairs/ramp
+        robot_root_body_name=getattr(
+            config, "base_body_name", spawn_config.robot_root_body_name
+        ),
     )
     RESPAWN_KEYCODES = spawn_config.respawn_keycodes
     #endregion------------------------------------------------
@@ -175,6 +214,22 @@ def main(
         command_handle.reset()
         if nav == "random":
             navigator.reset(np.asarray(data.qpos))
+        _randomize_episode(label="respawn")
+    # endregion
+
+    # region per-episode domain randomization -------------------------------
+    episode_seed = 0
+
+    def _randomize_episode(*, label: str = "episode"):
+        """Resample every reset knob and stamp it on the episode about to start.
+
+        Called at every episode boundary, not only at a respawn. v3 only
+        randomized in ``_respawn``, and an episode that ended without a fall did
+        not respawn — so one parameter set covered up to 12 consecutive episodes
+        and near-duplicate episodes landed in different splits.
+        """
+        nonlocal mpc_data, episode_seed
+        episode_seed += 1
         sample, mpc_data = reset_randomizer.sample_and_apply(
             ResetTargets(
                 model=model,
@@ -187,6 +242,8 @@ def main(
         meta = sample.to_metadata()
         collect_hooks.set_episode_conditions(
             randomization=meta,
+            seed=episode_seed,
+            mode="locomotion",
             **read_episode_conditions(model, contact_ids, base_weight),
         )
         if meta:
@@ -194,16 +251,33 @@ def main(
                 f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
                 for k, v in meta.items()
             )
-            print(f"[respawn] randomized {bits}", flush=True)
+            print(f"[{label}] randomized {bits}", flush=True)
         else:
-            print("[respawn] new random yaw spawn", flush=True)
+            print(f"[{label}] new random yaw spawn", flush=True)
     # endregion
     #------------------------------------------------
 
     # region robot crash reset-----------------------
-    CRASH_HEIGHT_THRESHOLD = config.robot_height * 0.5  # [m]
-    CRASH_TILT_DEG = 60.0                               # [deg]
+    CRASH_HEIGHT_THRESHOLD = config.robot_height * 0.5   # [m] hard floor
+    CRASH_TILT_DEG = 60.0                                # [deg]
+    # A robot that folds onto its belly sits just ABOVE the hard floor, level,
+    # and stays there. Detect it by a sustained low stance instead of an
+    # instantaneous one: below this height for longer than the dwell means the
+    # robot is down, not squatting.
+    COLLAPSE_HEIGHT_THRESHOLD = config.robot_height * 0.65   # [m]
+    COLLAPSE_DWELL_STEPS = int(0.5 * sim_frequency)          # 0.5 s
+    collapse_counter = 0
+
     def _is_crashed() -> bool:
+        nonlocal collapse_counter
+        # Sustained-collapse check: the robot is resting on something that is
+        # not its feet.
+        if float(data.qpos[2]) < COLLAPSE_HEIGHT_THRESHOLD:
+            collapse_counter += 1
+        else:
+            collapse_counter = 0
+        if collapse_counter >= COLLAPSE_DWELL_STEPS:
+            return True
         # Height check
         if float(data.qpos[2]) < CRASH_HEIGHT_THRESHOLD:
             return True
@@ -241,8 +315,10 @@ def main(
     tau = jnp.zeros(config.n_joints)
     q_ref = config.q0.copy()
 
+    command = None
+
     def step_controller():
-        nonlocal counter, tau, q_ref, mpc_data # nonlocal variables are used to modify the variables in the outer scope
+        nonlocal counter, tau, q_ref, mpc_data, command # nonlocal variables are used to modify the variables in the outer scope
 
         qpos = data.qpos.copy()
         qvel = data.qvel.copy()
@@ -250,7 +326,9 @@ def main(
         if counter % period == 0:
             foot = jnp.asarray(sim_utils.geom_positions(data, contact_ids))
            
-            if use_navigation:
+            if use_command_sampler:
+                command = jnp.asarray(command_sampler.mpc_input(config.robot_height))
+            elif use_navigation:
                 command = jnp.asarray(navigator.mpc_input(qpos, config.robot_height))
             else:
                 command = jnp.asarray(command_handle.mpc_input(config.robot_height))
@@ -278,6 +356,9 @@ def main(
             if not collect_hooks.enabled:
                 print(f"MPC time: {1e3 * (stop - start):.2f} ms")
 
+        if use_command_sampler:
+            command_sampler.step()
+
         data.ctrl = np.asarray(tau)
 
         base_force_pert.tick_and_apply(data) # apply random base force perturbation
@@ -286,14 +367,40 @@ def main(
         mujoco.mj_step(model, data)
         counter += 1
 
-        collect_hooks.after_physics_step(
+        closed = collect_hooks.after_physics_step(
             model, data, np.asarray(tau), contact_ids, base_force_pert, config.n_joints,
+            control=ControlSample(
+                tau_cmd=np.asarray(tau),
+                # The MPC's own gait timer: phase per leg, and the contact pattern
+                # it planned. Logged as privileged so the leak the commanded
+                # torques carry is auditable instead of hidden.
+                leg_phase=np.asarray(mpc_data.contact_time),
+                duty_factor=float(mpc_data.duty_factor),
+                # command_from_mpc_input, not command[:3]: the MPC vector is
+                # [vx, vy, 0, 0, 0, yaw_rate, height], so slicing the first three
+                # logged a structural zero for yaw across the whole of the
+                # audited v4 run.
+                cmd_base_vel=(
+                    command_from_mpc_input(np.asarray(command))
+                    if command is not None
+                    else None
+                ),
+                cmd_segment_id=command_sampler.segment_id if use_command_sampler else 0,
+            ),
         )
 
-        # One episode = one traverse to the goal. Checked here (not in the render
-        # loop) so headless collection runs get the same episode boundaries.
+        # The duration cap closed an episode: the next one gets fresh knobs.
+        if closed:
+            _randomize_episode()
+
+        # Reaching the goal is a task success. During collection it does NOT end
+        # the episode by default: v3 closed on every goal and left a 9 s median
+        # episode, far short of the 30 s of steady state a temporal
+        # representation needs. The navigator just gets a new goal instead.
         if use_navigation and navigator.reached(data.qpos):
-            collect_hooks.end_episode(reason="goal_reached")
+            if dataset_collection_config.episode.end_episode_on_goal:
+                collect_hooks.end_episode(reason="goal_reached")
+                _randomize_episode()
             if navigator.auto_resample:
                 navigator.sample_goal(np.asarray(data.qpos))
 
@@ -330,7 +437,9 @@ def main(
         viewer.sync()
         while viewer.is_running():
             overlay_text = command_handle.consume_overlay_text()
-            sim_utils.setup_tracking_camera(viewer, model, body_name="base")
+            sim_utils.setup_tracking_camera(
+                viewer, model, body_name=getattr(config, "base_body_name", "base")
+            )
             tic = timer()
             if overlay_text is not None:
                 viewer.set_texts((None, None, *overlay_text))
@@ -422,7 +531,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="flat")
-    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal"], default="go2")
+    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal", "spot"], default="go2")
     parser.add_argument(
         "--nav",
         type=str,

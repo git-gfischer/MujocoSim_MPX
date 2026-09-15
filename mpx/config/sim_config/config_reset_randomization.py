@@ -51,10 +51,26 @@ class ResetRandomizationConfig:
     # falls were what pushed joints past their limits. 0.80 keeps the coverage
     # Task 9d asks for while leaving the controller able to track the command.
     max_speed: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.20, high=0.80)
-    max_yaw_rate: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.40, high=1.50)
+    # Yaw rate cap handed to the navigator [rad/s]. Was [0.40, 1.50]; 1.50 rad/s
+    # is ~86 deg/s and the navigator saturates it the instant a new goal appears
+    # (kp_yaw * yaw_error saturates for any error past ~0.5 rad), while the
+    # heading gain holds vx near zero until the robot faces the goal. That is a
+    # spin-in-place from standstill at the cap, and it was putting the robot on
+    # the floor. 0.80 is the navigator's own tuned default and stays inside what
+    # this MPC tracks; PointNavigator now also slews toward the cap rather than
+    # stepping to it (``yaw_accel_rps2``).
+    max_yaw_rate: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.30, high=0.80)
 
-    step_freq: FloatRangeSpec = FloatRangeSpec(enabled=True, low=1.00, high=1.70)
-    duty_factor: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.55, high=0.80)
+    # Gait timing is OFF. duty_factor and step_freq are no longer independent
+    # knobs: they belong to a gait, and config_go2.GO2_GAITS holds a matched set
+    # per gait (trot / pace / crawl / bound). Sampling them independently drew
+    # combinations no gait was tuned for — duty 0.80 at 1.00 Hz is a near-static
+    # crawl on trot phase offsets, which collapses stride length and reads as the
+    # robot struggling to go forward. To vary gait timing, pick a different gait
+    # or edit its GaitParams entry; re-enable these only for a deliberate
+    # timing-robustness study, and narrow the ranges around the chosen gait.
+    step_freq: FloatRangeSpec = FloatRangeSpec(enabled=False, low=1.00, high=1.70)
+    duty_factor: FloatRangeSpec = FloatRangeSpec(enabled=False, low=0.55, high=0.80)
 
     # Contact time constant [s]. Clamped well below the v3 [0.012, 0.035]: the
     # upper end there was 6.6 sim steps at 200 Hz and made the foot bouncy, which
@@ -79,11 +95,24 @@ class ResetRandomizationConfig:
     # locomotion (DATASET_FIX_TASKS_R2, Task R2-8 item 3).
     friction: FloatRangeSpec = FloatRangeSpec(enabled=True, low=1.2, high=2.00)
 
-    # Commanded base height [m]. The v3 crouch of ~0.21 m left about 5 cm of swing
-    # clearance and contributed to the micro-bouncing. Kept close to the 0.27 m
-    # nominal: commanding 0.32 m against a 0.27 m spawn is a 5 cm step the MPC
-    # must absorb at episode start, and it cost episodes to falls.
-    base_height: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.26, high=0.30)
+    # Commanded base height [m]. OFF, and note this knob was never actually in
+    # effect: the randomizer writes the sample to ``navigator.robot_height``, but
+    # every call site passes ``config.robot_height`` explicitly as the second
+    # argument to ``mpc_input``, and the explicit argument wins. So the commanded
+    # height has always been the constant 0.27 m from config_go2, and the value
+    # recorded in episode metadata was a height the robot was never asked to hold.
+    #
+    # Leaving it disabled rather than repairing the wiring is deliberate: turning
+    # it on would ADD a height step at episode start that is not there today
+    # (commanding 0.30 m against a 0.27 m spawn is a 3 cm step the MPC has to
+    # absorb in the first tick). Re-enable it only together with fixing the
+    # ``mpc_input`` call sites, and ramp the height rather than stepping it.
+    #
+    # If the robot is dropping onto the ground at spawn, the height variation to
+    # look at is the spawner's foot vertical relief, not this: it lifts the base
+    # to the lowest collision-free z, which measures +0.010 m on flat but up to
+    # the +0.100 m cap on rough. See SpawnConfig.foot_relief_max.
+    base_height: FloatRangeSpec = FloatRangeSpec(enabled=False, low=0.26, high=0.30)
 
 
 # Loco profile follows the dataclass master switch. Balance stays off until enabled here.

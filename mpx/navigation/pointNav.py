@@ -73,6 +73,8 @@ class PointNavigator:
         max_yaw_rate: float = 0.8,
         kp_yaw: float = 1.5,
         slowdown_radius: float = 0.8,
+        yaw_accel_rps2: float = 2.0,
+        control_dt: float = 0.02,
         auto_resample: bool = True,
         ground_z: float = 0.0,
         seed: int | None = None,
@@ -86,12 +88,22 @@ class PointNavigator:
         self.max_yaw_rate = float(max_yaw_rate)
         self.kp_yaw = float(kp_yaw)
         self.slowdown_radius = max(float(slowdown_radius), 1e-3)
+        # Slew limit on the commanded yaw rate [rad/s^2]. A fresh goal can sit up
+        # to pi behind the robot, and kp_yaw * pi saturates max_yaw_rate outright,
+        # so without this the command steps from 0 to full turn in a single MPC
+        # tick while the heading gain holds vx at zero — the robot spins in place
+        # from standstill, which is what drops it on the floor. Set <= 0 to
+        # disable and get the old stepped command back.
+        self.yaw_accel_rps2 = float(yaw_accel_rps2)
+        self.control_dt = float(control_dt)
         self.auto_resample = bool(auto_resample)
         self.ground_z = float(ground_z)
 
         self._rng = np.random.default_rng(seed)
         self.goal_xy = np.zeros(2, dtype=np.float64)
         self._has_goal = False
+        # Last commanded yaw rate, carried across calls for the slew limit.
+        self._wz = 0.0
 
         # Viewer rendering state.
         self._goal_geom_id = -1
@@ -129,8 +141,15 @@ class PointNavigator:
         self.set_goal(np.asarray(lookat, dtype=np.float64)[:2])
 
     def reset(self, qpos: np.ndarray) -> None:
-        """Sample a fresh random goal relative to the current robot pose."""
+        """Sample a fresh random goal relative to the current robot pose.
 
+        Also zeroes the yaw-rate memory, so an episode starts from a standstill
+        command instead of inheriting the turn the previous one ended on. A goal
+        resampled mid-episode deliberately does *not* reset it — there the ramp
+        is what keeps the transition smooth.
+        """
+
+        self._wz = 0.0
         self.sample_goal(qpos)
 
     def distance_to_goal(self, qpos: np.ndarray) -> float:
@@ -140,11 +159,23 @@ class PointNavigator:
         return self._has_goal and self.distance_to_goal(qpos) <= self.goal_tolerance
 
     # ---------------------------------------------------------------- command
+    def _slew_yaw(self, wz_target: float) -> float:
+        """Rate-limit the yaw command toward ``wz_target``.
+
+        ``yaw_accel_rps2 <= 0`` disables the limit and passes the target through.
+        """
+        if self.yaw_accel_rps2 <= 0.0:
+            return float(wz_target)
+        step = self.yaw_accel_rps2 * self.control_dt
+        delta = float(wz_target) - self._wz
+        return self._wz + float(np.clip(delta, -step, step))
+
     def planar_command(self, qpos: np.ndarray) -> np.ndarray:
         """Return the body-frame ``[vx, vy, wz]`` command toward the goal."""
 
         if not self._has_goal:
-            return np.zeros(3, dtype=np.float64)
+            self._wz = self._slew_yaw(0.0)
+            return np.array([0.0, 0.0, self._wz], dtype=np.float64)
 
         robot_xy = self._robot_xy(qpos)
         yaw = _yaw_from_quat(qpos[3:7])
@@ -152,12 +183,15 @@ class PointNavigator:
         to_goal = self.goal_xy - robot_xy
         distance = float(np.linalg.norm(to_goal))
         if distance <= self.goal_tolerance:
-            return np.zeros(3, dtype=np.float64)
+            self._wz = self._slew_yaw(0.0)
+            return np.array([0.0, 0.0, self._wz], dtype=np.float64)
 
         # Yaw control: rotate to face the goal.
         desired_yaw = float(np.arctan2(to_goal[1], to_goal[0]))
         yaw_error = _wrap_to_pi(desired_yaw - yaw)
         wz = float(np.clip(self.kp_yaw * yaw_error, -self.max_yaw_rate, self.max_yaw_rate))
+        wz = self._slew_yaw(wz)
+        self._wz = wz
 
         # Linear control: project the world direction into the body frame and
         # damp it as the robot approaches the goal or faces away from it.

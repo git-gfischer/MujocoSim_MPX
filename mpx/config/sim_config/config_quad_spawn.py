@@ -62,6 +62,25 @@ class SpawnConfig:
     foot_relief_step: float = 0.005  # [m]
     foot_relief_max: float = 0.10  # [m]
 
+    # Settle the robot on its feet before the episode starts.
+    #
+    # Foot vertical relief spawns the base at the lowest collision-free z, which
+    # measures +0.010 m above nominal on flat but up to the +0.100 m cap on rough
+    # (relief fired on 40/40 spawns in every scene tested). Without a settle the
+    # robot free-falls that distance while the MPC is being handed its first
+    # command, which reads as the robot crashing into the ground at episode start.
+    #
+    # The settle runs a joint-space PD to ``config.q0`` under gravity with the
+    # physics stepping, then the MPC is initialised from the resulting pose. These
+    # steps are NOT recorded: the episode begins after the robot is at rest.
+    settle_after_spawn: bool = True
+    settle_duration_s: float = 0.3   # [s] of simulated time, not wall-clock
+    settle_kp: float = 100.0         # matches the joint PD gains in config_srbd
+    settle_kd: float = 5.0
+    # Give up early once the robot is essentially at rest, so flat spawns (which
+    # need ~1 cm of settling) do not pay the full duration.
+    settle_qvel_tol: float = 0.05    # [rad/s], max joint speed to call it settled
+
     # Base-pose randomization applied before spawn/reset in balance mode.
     # base_pose: BasePoseRandomizationConfig = field(
     # default_factory=BasePoseRandomizationConfig)

@@ -12,6 +12,7 @@ Pick a behaviour (same attribute layout ``MPCControllerWrapper`` expects)::
     #   • ``Go2Gait.BOUND`` — front pair / hind pair (experimental)
     cfg = go2_config(Go2Mode.LOCOMOTION, gait=Go2Gait.CRAWL)
     cfg = go2_config(Go2Mode.LOCOMOTION, mpc_model=Go2MpcModel.INVERSE_DYNAMICS)
+    cfg = go2_config(Go2Mode.LOCOMOTION, mpc_model=Go2MpcModel.SRBD)
 
     # Balance: pass ``balance_stance`` to set nominal MPC contact support:
     #   • ``BalanceStance.FOUR`` — all four feet in stance
@@ -62,10 +63,11 @@ class Go2Mode:
 
 
 class Go2MpcModel:
-    """Whole-body (default) vs inverse-dynamics transcription."""
+    """Whole-body (default) vs inverse-dynamics vs centroidal SRBD transcription."""
 
     WHOLE_BODY = "whole_body"
     INVERSE_DYNAMICS = "inverse_dynamics"
+    SRBD = "srbd"
 
 
 class Go2Gait:
@@ -260,22 +262,44 @@ GO2_GAITS: dict[str, GaitParams] = {
         ),
         description="One leg at a time; three feet always down. Statically stable, slow.",
     ),
-    # Front pair / hind pair. Pitch is the failure axis and a real bound wants a
-    # flight phase this stance-force MPC cannot produce, so duty stays above 0.5
-    # to keep at least one pair down. Still the least reliable of the four.
+    # Front pair / hind pair. Pitch is the failure axis: in a two-pair gait the
+    # support during swing is two feet on a single lateral line, and a
+    # stance-force QP cannot generate a pitch moment about that line — the trunk
+    # pitches and the base drops. Because both pairs move together, the
+    # single-pair support interval *is* the swing time, (1 - duty) / step_freq,
+    # so duty and step_freq are the only knobs that shorten it.
+    #
+    # Measured on flat, 4000 steps, no randomization and no trunk force, against
+    # a commanded 0.27 m (min height / 5th pct / peak |pitch|):
+    #   duty 0.60 @ 1.80 Hz, 12 cm step  -> 0.134 / 0.154 / 7.8 deg   (falls)
+    #   duty 0.75 @ 1.60 Hz,  8 cm step  -> 0.247 / 0.250 / 3.0 deg
+    #   duty 0.78 @ 1.55 Hz,  8 cm step  -> 0.261 / 0.263 / 2.6 deg   (chosen)
+    #   duty 0.80 @ 1.50 Hz,  7 cm step  -> 0.268 / 0.271 / 2.3 deg   (tracks +5 mm high)
+    # The original 0.60 spent 80% of the cycle on one pair, 222 ms at a time, and
+    # sagged to 0.134 m — below the 0.135 m crash threshold. 0.78 puts 56% of the
+    # cycle on all four feet, cuts the single-pair interval to 142 ms, and holds
+    # mean height at 0.269 m against the 0.270 m command. Heavier z and pitch
+    # weights do the rest.
+    #
+    # Honest caveat: at 56% four-support this is a conservative bound, not a
+    # ballistic one. A real bound needs a flight phase and angular-momentum
+    # control that this stance-force MPC cannot produce. Swing is 142 ms, close
+    # to the ~120 ms floor below which foothold tracking degrades, so raising
+    # duty further trades pitch stability for missed footholds.
     Go2Gait.BOUND: GaitParams(
         name=Go2Gait.BOUND,
         phase_offsets=(0.5, 0.5, 0.0, 0.0),
-        duty_factor=0.60,
-        step_freq=1.80,
-        step_height=0.12,
+        duty_factor=0.78,
+        step_freq=1.55,
+        step_height=0.08,
         clearance_speed=0.3,
         weights=LocomotionWeights(
-            rot=(1000.0, 3000.0, 0.0),   # pitch is the failure axis here
+            pos=(0.0, 0.0, 2e4),         # hold height harder: this is what sagged
+            rot=(1000.0, 4500.0, 0.0),   # pitch is the failure axis here
             ang_vel=3e2,
             lin_vel=4e3,
         ),
-        description="Front pair / hind pair. Pitch-unstable; experimental.",
+        description="Front pair / hind pair. Pitch-unstable; conservative duty.",
     ),
 }
 
@@ -523,6 +547,88 @@ class Go2InverseLocomotion(Go2Locomotion):
         return f"Go2InverseLocomotion({self.gait.summary()})"
 #endregion
 #===========================================================
+# region Go2SrbdLocomotion
+def _go2_srbd_weights(n_contact: int) -> jnp.ndarray:
+    """SRBD cost layout: ``[p(3), rot(3), dp(3), omega(3), grf(3 n_contact)]``."""
+    Qp = jnp.diag(jnp.array([0.0, 0.0, 1e4]))
+    Qrot = jnp.diag(jnp.array([1e3, 1e3, 0.0]))
+    Qdp = jnp.diag(jnp.ones(3)) * 1e3
+    Qomega = jnp.diag(jnp.ones(3)) * 1e1
+    Qgrf = jnp.diag(jnp.ones(3 * n_contact)) * 1e-2
+    return jax.scipy.linalg.block_diag(Qp, Qrot, Qdp, Qomega, Qgrf)
+
+
+class Go2SrbdLocomotion(Go2Locomotion):
+    """Go2 locomotion gait with centroidal SRBD MPC (GRFs → joint torque)."""
+
+    mpc_model: str = Go2MpcModel.SRBD
+    solver_mode = "primal_dual"
+    use_terrain_estimation: bool = False
+    whole_body_frequency: int = 500
+
+    # Full-robot mass from ``go2_mjx.xml`` (trunk + four legs). Inertia is a
+    # standing-pose diagonal estimate, not Aliengo's composite tensor.
+    mass: float = 15.206
+    inertia = jnp.diag(jnp.array([0.15, 0.35, 0.38]))
+    Kp = jnp.diag(jnp.tile(jnp.array([100.0, 100.0, 100.0]), 4))
+    Kd = jnp.diag(jnp.tile(jnp.array([5.0, 5.0, 5.0]), 4))
+
+    def __init__(self, gait: str | GaitParams | None = None) -> None:
+        super().__init__(gait)
+        self.u_ref = jnp.zeros(3 * self.n_contact)
+        self._srbd_W = _go2_srbd_weights(self.n_contact)
+
+    @property
+    def use_terrain_estimator(self) -> bool:
+        return bool(self.use_terrain_estimation)
+
+    @property
+    def n(self) -> int:
+        return 13
+
+    @property
+    def m(self) -> int:
+        return 3 * self.n_contact
+
+    @property
+    def initial_state(self) -> jnp.ndarray:
+        return jnp.concatenate([self.p0, self.quat0, jnp.zeros(6)])
+
+    @property
+    def W(self) -> jnp.ndarray:
+        return self._srbd_W
+
+    @property
+    def cost(self):
+        return partial(mpc_objectives.quadruped_srbd_obj, self.n_contact, self.N)
+
+    @property
+    def hessian_approx(self):
+        return partial(mpc_objectives.quadruped_srbd_hessian_gn, self.n_contact)
+
+    @property
+    def dynamics(self):
+        mass = float(self.mass)
+        inertia = self.inertia
+        inertia_inv = jnp.linalg.inv(inertia)
+        dt = self.dt
+
+        def _factory(model, mjx_model, contact_id, body_id):
+            del model, mjx_model, contact_id, body_id
+            return partial(
+                mpc_dyn_model.quadruped_srbd_dynamics,
+                mass,
+                inertia,
+                inertia_inv,
+                dt,
+            )
+
+        return _factory
+
+    def __repr__(self) -> str:
+        return f"Go2SrbdLocomotion({self.gait.summary()})"
+#endregion
+#===========================================================
 # region Go2Balance
 
 # Balance is not a gait: the timer is bypassed and support comes from
@@ -691,24 +797,27 @@ def go2_config(
     balance_stance
         Balance mode only. Nominal MPC contact mask.
     mpc_model
-        Locomotion only. ``Go2MpcModel.WHOLE_BODY`` (default) or
-        ``Go2MpcModel.INVERSE_DYNAMICS``.
+        Locomotion only. ``Go2MpcModel.WHOLE_BODY`` (default),
+        ``Go2MpcModel.INVERSE_DYNAMICS``, or ``Go2MpcModel.SRBD``.
     """
     key = mode.lower().strip()
     model_key = str(mpc_model).lower().strip().replace("-", "_")
     if key == Go2Mode.LOCOMOTION:
         if model_key == Go2MpcModel.INVERSE_DYNAMICS:
             return Go2InverseLocomotion(gait)
+        if model_key == Go2MpcModel.SRBD:
+            return Go2SrbdLocomotion(gait)
         if model_key != Go2MpcModel.WHOLE_BODY:
             raise ValueError(
                 f"Unknown Go2 mpc_model {mpc_model!r}; expected "
-                f"{Go2MpcModel.WHOLE_BODY!r} or {Go2MpcModel.INVERSE_DYNAMICS!r}."
+                f"{Go2MpcModel.WHOLE_BODY!r}, {Go2MpcModel.INVERSE_DYNAMICS!r}, "
+                f"or {Go2MpcModel.SRBD!r}."
             )
         return Go2Locomotion(gait)
     if key == Go2Mode.BALANCE:
-        if model_key == Go2MpcModel.INVERSE_DYNAMICS:
+        if model_key in (Go2MpcModel.INVERSE_DYNAMICS, Go2MpcModel.SRBD):
             raise ValueError(
-                "Inverse-dynamics MPC is only implemented for locomotion, "
+                f"{mpc_model!r} MPC is only implemented for locomotion, "
                 "not balance."
             )
         return Go2Balance(balance_stance=balance_stance)

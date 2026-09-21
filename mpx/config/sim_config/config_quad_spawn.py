@@ -74,11 +74,19 @@ class SpawnConfig:
     # physics stepping, then the MPC is initialised from the resulting pose. These
     # steps are NOT recorded: the episode begins after the robot is at rest.
     settle_after_spawn: bool = True
-    settle_duration_s: float = 0.3   # [s] of simulated time, not wall-clock
+    # Upper bound on simulated settle time, not a fixed cost: the loop exits as
+    # soon as ``settle_qvel_tol`` is met. Measured over 25 spawns per scene, the
+    # realised cost is ~274 ms on flat and ~359 ms on rough. 0.3 s was tried
+    # first and was not enough — 16 of 25 rough spawns hit the budget still
+    # moving at 1.0 rad/s, i.e. handed the MPC a robot that was still falling.
+    # At 0.8 s every spawn in every scene reaches the tolerance.
+    settle_duration_s: float = 0.8   # [s] of simulated time, not wall-clock
     settle_kp: float = 100.0         # matches the joint PD gains in config_srbd
+    # kd=8 was tried and is overdamped: it slowed flat spawns down without
+    # improving rough ones.
     settle_kd: float = 5.0
-    # Give up early once the robot is essentially at rest, so flat spawns (which
-    # need ~1 cm of settling) do not pay the full duration.
+    # Exit early once the robot is essentially at rest, so a flat spawn (which
+    # settles ~6 mm) does not pay for the rough-terrain budget.
     settle_qvel_tol: float = 0.05    # [rad/s], max joint speed to call it settled
 
     # Base-pose randomization applied before spawn/reset in balance mode.

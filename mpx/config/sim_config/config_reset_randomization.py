@@ -42,7 +42,7 @@ class ResetRandomizationConfig:
     enabled: bool = True
     rng_seed: int | None = None
 
-    payload: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.0, high=3.0)
+    payload: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.0, high=5.0)
 
     # Realised median base speed in v3 was only 0.26 m/s against a [0.25, 0.70]
     # range. Widened, and the sign is handled by the navigator so reverse and
@@ -112,7 +112,7 @@ class ResetRandomizationConfig:
     # look at is the spawner's foot vertical relief, not this: it lifts the base
     # to the lowest collision-free z, which measures +0.010 m on flat but up to
     # the +0.100 m cap on rough. See SpawnConfig.foot_relief_max.
-    base_height: FloatRangeSpec = FloatRangeSpec(enabled=False, low=0.26, high=0.30)
+    base_height: FloatRangeSpec = FloatRangeSpec(enabled=False, low=0.21, high=0.30)
 
 
 # Loco profile follows the dataclass master switch. Balance stays off until enabled here.

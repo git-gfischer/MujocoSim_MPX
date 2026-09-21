@@ -45,6 +45,38 @@ def estimate_contacts(
     return contact_state
 
 
+def non_foot_contact_force(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    foot_geom_ids: Sequence[int],
+) -> float:
+    """Total normal force [N] on geoms that are not feet, at this instant.
+
+    This is the direct signal for "the belly is on the ground", and it needs no
+    threshold tuning: a healthy quadruped has exactly zero. MuJoCo already has
+    it — iterate ``data.contact``, skip pairs where either geom is a foot, and
+    sum ``mj_contactForce``.
+
+    Contacts between two non-foot geoms of the robot (a thigh brushing a calf)
+    count too: that is still the robot touching something it should not be.
+    Only the normal component is summed, since the tangential part says how hard
+    it is sliding rather than how hard it is pressing.
+
+    Accumulate this per substep, like the GRF, so a one-substep graze does not
+    register as a body strike.
+    """
+    feet = {int(g) for g in np.asarray(foot_geom_ids, dtype=np.int32).reshape(-1)}
+    wrench = np.zeros(6, dtype=np.float64)
+    total = 0.0
+    for k in range(data.ncon):
+        contact = data.contact[k]
+        if int(contact.geom1) in feet or int(contact.geom2) in feet:
+            continue
+        mujoco.mj_contactForce(model, data, k, wrench)
+        total += abs(float(wrench[0]))
+    return total
+
+
 def estimate_foot_grf(
     model: mujoco.MjModel,
     data: mujoco.MjData,

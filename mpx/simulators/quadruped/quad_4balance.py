@@ -69,12 +69,15 @@ DEFAULT_PI_CONFIG = os.path.join(_PI_ADDON, "config", "main_config.yaml")
 
 #region ================Helper functions================
 def robot_config(robot):
-    if(robot == "go2"):
-        GO2_CONTROLLER_MODE = Go2Mode.BALANCE
-        config = go2_config(GO2_CONTROLLER_MODE,balance_stance=BalanceStance.FOUR)
-    elif(robot == "aliengo"):
+    if robot == "go2":
+        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.FOUR)
+    if robot == "b2":
+        from mpx.config.robot_config.config_b2 import b2_config, B2Mode
+        return b2_config(B2Mode.BALANCE, balance_stance=BalanceStance.FOUR)
+    if robot == "aliengo":
         import mpx.config.robot_config.config_aliengo as config
-    return config
+        return config
+    raise ValueError(f"Unknown robot {robot!r}.")
 #------------------------------------------------
 def _build_solve_fn(mpc):
     @jax.jit
@@ -507,7 +510,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="rough")
-    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal"], default="go2")
+    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal", "b2"], default="go2")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
         "--collect",

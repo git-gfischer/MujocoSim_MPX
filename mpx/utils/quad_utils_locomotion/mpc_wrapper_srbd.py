@@ -1,176 +1,234 @@
+"""Single-rigid-body (SRBD) locomotion MPC with the same public API as ``MPCWrapper``."""
+
+from functools import partial
+
 import jax
 import jax.numpy as jnp
-from functools import partial
-import mpx.utils.simulation_utils.sim_utils as sim_utils
-from mpx.utils.quad_utils_locomotion.reference_generator_locomotion import reference_generator_srbd, whole_body_interface
-import mpx.utils.quadruped_dyn_models.models as mpc_dyn_model
-import mpx.utils.quadruped_dyn_models.objectives as mpc_objectives
-import mujoco 
+import mujoco
 from mujoco import mjx
-import mpx.jax_ocp_solvers.optimizers as optimizers
-from jax import dlpack as jax_dlpack
-from timeit import default_timer as timer
-# Try to import torch for dlpack conversion, but continue if torch is not available
-try:
-    from torch.utils import dlpack as torch_dlpack
-except ImportError:
-    torch_dlpack = None
-    print("Warning: torch not installed. torch_run functionality will not be available.")
 
-class BatchedMPCControllerWrapper:
-    def __init__(self, config, n_env):
-        """
-        Initializes the MPC controller wrapper.
-        
-        Args:
-            config: Configuration object containing MPC and gait parameters.
-            mpc_frequency: Frequency (Hz) at which MPC updates occur.
-        """
-        jax.config.update("jax_compilation_cache_dir", "./jax_cache")
-        jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-        jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+from mpx.utils.mpc_wrapper import MPCData
+from mpx.utils.quad_utils_locomotion.mpc_wrapper_locomotion import build_solver_step
+from mpx.utils.quad_utils_locomotion.reference_generator_locomotion import (
+    reference_generator_srbd,
+    whole_body_interface,
+)
+from mpx.utils.simulation_utils.sim_utils import timer_run
 
-        self.n_env = n_env
-        model = mujoco.MjModel.from_xml_path(config.model_path)
-        mjx_model = mjx.put_model(model)
+
+@partial(jax.jit, static_argnums=(0, 1))
+def _update_warm_start(horizon, shift, u_ref, x0, X_prev, U_prev, X, U, V):
+    """Shift the SRBD (centroidal) solution; no joint slice."""
+
+    def shift_trajectory(trajectory):
+        tail = jnp.repeat(trajectory[-1:], shift, axis=0)
+        return jnp.concatenate([trajectory[shift:], tail], axis=0)
+
+    def safe_update():
+        return shift_trajectory(U), shift_trajectory(X), shift_trajectory(V)
+
+    def unsafe_update():
+        return (
+            jnp.tile(u_ref, (horizon, 1)),
+            jnp.tile(x0, (horizon + 1, 1)),
+            jnp.zeros_like(X_prev),
+        )
+
+    valid_solution = jnp.logical_not(jnp.isnan(U[0, 0]))
+    return jax.lax.cond(valid_solution, safe_update, unsafe_update)
+
+
+class SrbdMPCWrapper:
+    """Centroidal SRBD QP plus Cartesian whole-body torque mapping.
+
+    Public flow matches locomotion ``MPCWrapper``::
+
+        data = wrapper.make_data()
+        data, tau = wrapper.run(data, x0, command, contact)
+    """
+
+    def __init__(self, config, limited_memory=False):
         self.config = config
         self.mpc_frequency = config.mpc_frequency
-        self.shift = int(1 / (config.dt * config.mpc_frequency))
-        
-        # Timer and liftoff states for the reference generator.
-        self.foot0 = config.p_legs0.copy()  # Initial foot positions (could be adjusted if needed)
-        self.q0 = config.q0.copy()          # Initial joint configuration
-        
-        self.initial_state = jnp.concatenate([config.p0, config.quat0,jnp.zeros(6)])
-        # Get contact and body IDs from configuration
-        contact_id = []
-        for name in config.contact_frame:
-            contact_id.append(mjx.name2id(mjx_model,mujoco.mjtObj.mjOBJ_GEOM,name))
-        body_id = []
-        for name in config.body_name:
-            body_id.append(mjx.name2id(mjx_model,mujoco.mjtObj.mjOBJ_BODY,name))
-        # Trajectory warm-start variables (used between MPC calls)
-        U0 = jnp.tile(config.u_ref, (config.N, 1))
-        X0 = jnp.tile(self.initial_state, (config.N + 1, 1))
-        V0 = jnp.zeros((config.N + 1, config.n))
-        
-        self.batch_U0 = jnp.tile(U0, (n_env, 1, 1))
-        self.batch_X0 = jnp.tile(X0, (n_env, 1, 1))
-        self.batch_V0 = jnp.tile(V0, (n_env, 1, 1))
-        
-        # Define cost, hessian approximation, and dynamics functions for MPC.
-        cost = partial(mpc_objectives.quadruped_srbd_obj,
-                            config.n_contact, config.N)
-        hessian_approx = partial(mpc_objectives.quadruped_srbd_hessian_gn,
-                                    config.n_contact)
-        dynamics = partial(mpc_dyn_model.quadruped_srbd_dynamics,
-                                config.mass, config.inertia, jnp.linalg.inv(config.inertia), config.dt)
-
-        work = partial(optimizers.mpc, cost, dynamics, hessian_approx, False)
-        
-        reference_generator = partial(reference_generator_srbd,
-            config.use_terrain_estimator ,config.N, config.dt, config.n_contact , mass = config.mass, clearence_speed = config.clearence_speed, duty_factor = config.duty_factor,  step_freq= config.step_freq ,step_height=config.step_height,foot0 = config.p_legs0)
-        
-        whole_body_control = partial(whole_body_interface, model, mjx_model, contact_id, body_id,config.whole_body_frequency,config.Kp,config.Kd)
-
-        timer_t = partial(sim_utils.timer_run, duty_factor=config.duty_factor, step_freq=config.step_freq)
-
-        self._solve = jax.jit(jax.vmap(work))
-        self._ref_gen = jax.jit(jax.vmap(reference_generator))
-        self._timer_run = jax.jit(jax.vmap(sim_utils.timer_run, in_axes=(None,None,0, None)))
-        self._whole_body_interface = jax.jit(jax.vmap(whole_body_control))
-
-        self.contact_time = jnp.tile(config.timer_t, (n_env, 1))
-        self.liftoff = jnp.zeros((n_env, 3*config.n_contact))
-
-        self.foot_ref = jnp.zeros((n_env, 3*config.n_contact))
-        self.foot_ref_dot = jnp.zeros((n_env, 3*config.n_contact))
-
-        self.grf = jnp.zeros((n_env, 3*config.n_contact))
-        
-        
-    def run(self, x0, input, foot_op,contact):
-        """
-        Runs one MPC update using the current state, input, and foot positions.
-        
-        Args:
-            x0: Current system state vector.
-            input: Input 
-            foot_op: Flattened current foot positions vector.
-        
-        Returns:
-            A tuple (X, U, V) representing the computed state trajectory, control sequence,
-            and auxiliary variable trajectory.
-        """
-        # Update the timer state for the gait reference.
-        
-        self.contact , self.contact_time = self._timer_run(self.config.duty_factor,self.config.step_freq,self.contact_time,1/self.mpc_frequency)
-       
-        # Generate reference trajectory and additional MPC parameters.
-        
-        reference, parameter, self.liftoff, foot_ref_dot = self._ref_gen(
-            t_timer = self.contact_time.copy(),
-            x = x0,
-            foot = foot_op,
-            input = input,
-            contact = contact,
-            liftoff = self.liftoff
+        self.shift = max(1, int(1 / (config.dt * config.mpc_frequency)))
+        self.default_contact = jnp.zeros(config.n_contact)
+        self.qpos_slice = slice(0, 7 + config.n_joints)
+        self.qvel_slice = slice(
+            self.qpos_slice.stop, self.qpos_slice.stop + 6 + config.n_joints
         )
-        
-        self.foot_ref = parameter[:,0,4:]
-        self.foot_ref_dot = foot_ref_dot[:,0,:]
-        
-        # Execute the MPC optimization (work function).
-       
+        self.foot_slice = slice(
+            self.qvel_slice.stop,
+            self.qvel_slice.stop + 3 * config.n_contact,
+        )
+
+        self.model = mujoco.MjModel.from_xml_path(config.model_path)
+        self.data = mujoco.MjData(self.model)
+        self.mjx_model = mjx.put_model(self.model)
+
+        self.contact_id = [
+            mjx.name2id(self.mjx_model, mujoco.mjtObj.mjOBJ_GEOM, name)
+            for name in config.contact_frame
+        ]
+        self.body_id = [
+            mjx.name2id(self.mjx_model, mujoco.mjtObj.mjOBJ_BODY, name)
+            for name in config.body_name
+        ]
+
+        self.initial_state = jnp.asarray(config.initial_state)
+        self.initial_X0 = jnp.tile(self.initial_state, (config.N + 1, 1))
+        self.initial_U0 = jnp.tile(config.u_ref, (config.N, 1))
+        self.initial_V0 = jnp.zeros((config.N + 1, config.n))
+        self.initial_liftoff = jnp.zeros(3 * config.n_contact)
+
+        dynamics = config.dynamics(
+            model=self.model,
+            mjx_model=self.mjx_model,
+            contact_id=self.contact_id,
+            body_id=self.body_id,
+        )
+        _, solve = build_solver_step(
+            config,
+            config.cost,
+            dynamics,
+            config.hessian_approx,
+            limited_memory,
+        )
+        self._solve = jax.jit(solve)
+
+        use_terrain = bool(
+            getattr(
+                config,
+                "use_terrain_estimator",
+                getattr(config, "use_terrain_estimation", False),
+            )
+        )
+        clearance_speed = getattr(
+            config, "clearance_speed", getattr(config, "clearence_speed", 0.2)
+        )
+        self._ref_gen = jax.jit(
+            partial(
+                reference_generator_srbd,
+                use_terrain,
+                config.N,
+                config.dt,
+                config.n_contact,
+                mass=config.mass,
+                foot0=config.p_legs0,
+                clearence_speed=clearance_speed,
+            )
+        )
+        self._timer_run = jax.jit(timer_run)
+        self._update_warm_start = partial(
+            _update_warm_start,
+            config.N,
+            self.shift,
+            config.u_ref,
+        )
+
+        sim_frequency = getattr(config, "whole_body_frequency", 500)
+        self._whole_body_interface = jax.jit(
+            partial(
+                whole_body_interface,
+                self.model,
+                self.mjx_model,
+                self.contact_id,
+                self.body_id,
+                sim_frequency,
+                config.Kp,
+                config.Kd,
+            )
+        )
+
+    def pack_state(self, qpos, qvel, foot):
+        return jnp.concatenate(
+            [jnp.ravel(qpos), jnp.ravel(qvel), jnp.ravel(foot)]
+        )
+
+    def make_data(self):
+        return MPCData(
+            dt=self.config.dt,
+            duty_factor=self.config.duty_factor,
+            step_freq=self.config.step_freq,
+            step_height=self.config.step_height,
+            contact_time=self.config.timer_t,
+            liftoff=self.initial_liftoff,
+            X0=self.initial_X0,
+            U0=self.initial_U0,
+            V0=self.initial_V0,
+            W=self.config.W,
+        )
+
+    def _centroidal(self, x0):
+        qpos = x0[self.qpos_slice]
+        qvel = x0[self.qvel_slice]
+        foot = x0[self.foot_slice]
+        x_srbd = jnp.concatenate([qpos[:7], qvel[:6]])
+        return qpos, qvel, foot, x_srbd
+
+    def _run_impl(self, data, x0, input, contact):
+        qpos, qvel, foot, x_srbd = self._centroidal(x0)
+        planned_contact, contact_time = self._timer_run(
+            data.duty_factor,
+            data.step_freq,
+            data.contact_time,
+            1 / self.mpc_frequency,
+        )
+        reference, parameter, liftoff, foot_ref_dot = self._ref_gen(
+            t_timer=data.contact_time,
+            x=x_srbd,
+            foot=foot,
+            input=input,
+            duty_factor=data.duty_factor,
+            step_freq=data.step_freq,
+            step_height=data.step_height,
+            liftoff=data.liftoff,
+            contact=contact,
+        )
         X, U, V = self._solve(
             reference,
             parameter,
-            jnp.tile(self.config.W, (self.n_env, 1, 1)),
-            x0,
-            self.batch_X0,
-            self.batch_U0,
-            self.batch_V0
-            )
-        
-        # Warm-start for the next call: shift trajectories forward.
-        self.batch_X0 = jnp.concatenate([X[:,self.shift:,:], jnp.tile(X[:,-1:,:], (self.shift, 1))],axis = 1)
-        self.batch_U0 = jnp.concatenate([U[:,self.shift:,:], jnp.tile(U[:,-1:,:], (self.shift, 1))],axis = 1)
-        self.batch_V0 = jnp.concatenate([V[:,self.shift:,:], jnp.tile(V[:,-1:,:], (self.shift, 1))],axis = 1)
-        
-        self.grf = U[:,0,:]
-        
-        return 0
+            data.W,
+            x_srbd,
+            data.X0,
+            data.U0,
+            data.V0,
+        )
+        valid_solution = jnp.logical_not(jnp.isnan(U[0, 0]))
+        grf = jnp.where(valid_solution, U[0], data.U0[0])
+        foot_ref = parameter[0, 4:]
+        foot_dot = foot_ref_dot[0]
+        tau, _ = self._whole_body_interface(
+            qpos, qvel, grf, foot_ref, foot_dot, planned_contact
+        )
+        U0, X0, V0 = self._update_warm_start(
+            x_srbd,
+            data.X0,
+            data.U0,
+            X,
+            U,
+            V,
+        )
+        data = data.replace(
+            X0=X0,
+            U0=U0,
+            V0=V0,
+            contact_time=contact_time,
+            liftoff=liftoff,
+        )
+        return data, tau
 
-    def torch_run(self, x0_torch, input_torch, foot_op_torch):
-        #Runs one MPC update using the current state, input, and foot positions.
-        x0 = jax_dlpack.from_dlpack(x0_torch)
-        input = jax_dlpack.from_dlpack(input_torch)
-        foot_op = jax_dlpack.from_dlpack(foot_op_torch)
+    def run(self, data, x0, input, contact=None):
+        contact = self.default_contact if contact is None else jnp.asarray(contact)
+        return self._run_impl(data, x0, input, contact)
 
-        self.run(x0, input, foot_op)
-
-        return 0
-    
-    def whole_body_run(self,qpos,qvel):
-        return self._whole_body_interface(qpos,qvel,self.grf,self.foot_ref,self.foot_ref_dot,self.contact)
-    
-    def torch_whole_body_run(self,qpos,qvel):
-        qpos = jax_dlpack.from_dlpack(qpos)
-        qvel = jax_dlpack.from_dlpack(qvel)
-        tau = self.whole_body_run(qpos,qvel)
-        return torch_dlpack.from_dlpack(tau) 
-    
-    def reset(self):
-        """
-        Resets the MPC controller state."
-        """
-        self.contact_time = jnp.tile(self.config.timer_t, (self.n_env, 1))
-        self.liftoff = jnp.zeros((self.n_env, 3*self.config.n_contact))
-        U0 = jnp.tile(self.config.u_ref, (self.config.N, 1))
-        X0 = jnp.tile(self.initial_state, (self.config.N + 1, 1))
-        V0 = jnp.zeros((self.config.N + 1, self.config.n))
-        self.batch_U0 = jnp.tile(U0, (self.n_env, 1, 1))
-        self.batch_X0 = jnp.tile(X0, (self.n_env, 1, 1))
-        self.batch_V0 = jnp.tile(V0, (self.n_env, 1, 1))
-        print("MPC Controller Reset")
-        return
+    def reset(self, data, qpos, qvel, foot):
+        qpos = jnp.ravel(qpos)
+        qvel = jnp.ravel(qvel)
+        x_srbd = jnp.concatenate([qpos[:7], qvel[:6]])
+        return data.replace(
+            U0=self.initial_U0,
+            X0=jnp.tile(x_srbd, (self.config.N + 1, 1)),
+            V0=self.initial_V0,
+            contact_time=self.config.timer_t,
+            liftoff=jnp.ravel(foot),
+        )

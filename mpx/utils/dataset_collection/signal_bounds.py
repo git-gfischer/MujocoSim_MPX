@@ -99,16 +99,41 @@ def assert_same_bounds(run_metadata: Sequence[Mapping[str, Any]]) -> str:
     return hashes.pop()
 
 
+def _inner_order(inner: Mapping[str, Any]) -> Sequence[str]:
+    """Whether a per-leg block is keyed by joint or by axis."""
+    if set(inner) >= set(JOINT_ORDER):
+        return JOINT_ORDER
+    if set(inner) >= set(_AXES):
+        return _AXES
+    raise ValueError(f"Unrecognised per-leg keys {list(inner)}")
+
+
 def _per_element_bounds(signal: Mapping[str, Any], width: int) -> np.ndarray:
     """
     Expand a signal's bounds dict into a ``(width, 2)`` low/high array.
 
-    Per-joint bounds (``HAA``/``HFE``/``KFE``) tile across the four legs; per-axis
-    bounds (``x``/``y``/``z``) tile across the four feet for the 12-vectors and
-    apply once for the 3-vectors.
+    Three layouts, distinguished by the keys:
+
+    * **per leg** — ``{"FL": {"x": [...], ...}, "FR": {...}, ...}``. Each leg
+      carries its own values and they are laid out in :data:`FOOT_ORDER`. This is
+      the layout the reconciled YAML uses, and it matters: ``foot_pos.FL.x`` and
+      ``foot_pos.RL.x`` are genuinely different envelopes (front feet reach
+      forward, hind feet reach back), and collapsing them to a union throws away
+      exactly the contrast the Proprioceptive Image needs.
+    * **per joint** — ``{"HAA": [...], "HFE": [...], "KFE": [...]}``, tiled
+      across the four legs.
+    * **per axis** — ``{"x": [...], "y": [...], "z": [...]}``, tiled across the
+      four feet for a 12-vector, applied once for a 3-vector.
     """
     bounds = signal["bounds"]
     keys = list(bounds)
+
+    if set(keys) >= set(FOOT_ORDER):
+        inner = _inner_order(bounds[FOOT_ORDER[0]])
+        return np.asarray(
+            [bounds[leg][key] for leg in FOOT_ORDER for key in inner],
+            dtype=np.float64,
+        )
 
     if set(keys) >= set(JOINT_ORDER):
         per_leg = np.asarray([bounds[j] for j in JOINT_ORDER], dtype=np.float64)
@@ -128,6 +153,12 @@ def _per_element_stance(signal: Mapping[str, Any], width: int) -> np.ndarray:
     if not stance:
         return np.zeros(width, dtype=np.float64)
     keys = list(stance)
+    if set(keys) >= set(FOOT_ORDER):
+        inner = _inner_order(stance[FOOT_ORDER[0]])
+        return np.asarray(
+            [stance[leg][key] for leg in FOOT_ORDER for key in inner],
+            dtype=np.float64,
+        )
     if set(keys) >= set(JOINT_ORDER):
         per_leg = np.asarray([stance[j] for j in JOINT_ORDER], dtype=np.float64)
         return np.tile(per_leg, width // len(JOINT_ORDER))
@@ -171,12 +202,27 @@ CLIPPING_DEFINITION = (
 CLIPPING_LIMIT = 0.001
 
 
+NOMINAL_SCOPE = "operating_regime == 'nominal'"
+
+
 def clipping_audit(
     arrays: Mapping[str, np.ndarray],
     bounds: Mapping[str, Any] | None = None,
+    mask: np.ndarray | None = None,
+    scope: str = "all rows",
 ) -> Dict[str, Any]:
     """
-    Per-channel clipping, counted two ways over **every** row given.
+    Per-channel clipping, counted two ways over the rows selected by ``mask``.
+
+    **Scope matters more than the arithmetic here.** On the audited run
+    ``foot_pos_base`` clipped 733 rows (0.218% of elements, failing the 0.1%
+    gate) and **83.1% of those rows were in crash episodes**, which are 9.9% of
+    the data. The audit was measuring a fallen robot. The natural response —
+    widening the bound — would waste PI dynamic range for the 90% of frames that
+    are ordinary walking. The bound should cover the data you train on, so the
+    gate is scoped to ``operating_regime == "nominal"`` and the non-nominal rate
+    is reported separately as a diagnostic. Restricted that way the same data
+    gives ~0.04% on ``foot_pos_base``, comfortably inside the gate.
 
     The v4.0 audit reported a single fraction whose denominator was ambiguous —
     ``joint_pos`` came out at 2.05% and reconciled with neither definition,
@@ -197,12 +243,15 @@ def clipping_audit(
     per_element: Dict[str, float] = {}
     per_row_any: Dict[str, float] = {}
     counts: Dict[str, Dict[str, int]] = {}
+    selector = None if mask is None else np.asarray(mask, dtype=bool).reshape(-1)
 
     for name, signal in payload["signals"].items():
         if name not in arrays:
             continue
         values = np.asarray(arrays[name], dtype=np.float64)
         values = values.reshape(values.shape[0], -1)
+        if selector is not None:
+            values = values[selector[: values.shape[0]]]
         if values.size == 0:
             per_element[name] = 0.0
             per_row_any[name] = 0.0
@@ -222,6 +271,7 @@ def clipping_audit(
 
     return {
         "definition": CLIPPING_DEFINITION,
+        "scope": scope,
         "limit": CLIPPING_LIMIT,
         "per_element": per_element,
         "per_row_any": per_row_any,
@@ -229,7 +279,10 @@ def clipping_audit(
     }
 
 
-def merge_clipping_audits(audits: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+def merge_clipping_audits(
+    audits: Sequence[Mapping[str, Any]],
+    scope: str = "all rows",
+) -> Dict[str, Any]:
     """
     Combine per-episode audits into one run-level audit.
 
@@ -256,6 +309,7 @@ def merge_clipping_audits(audits: Sequence[Mapping[str, Any]]) -> Dict[str, Any]
     }
     return {
         "definition": CLIPPING_DEFINITION,
+        "scope": scope,
         "limit": CLIPPING_LIMIT,
         "per_element": per_element,
         "per_row_any": per_row_any,
@@ -276,13 +330,24 @@ def describe_bounds(bounds: Mapping[str, Any] | None = None) -> str:
     """One line per signal, printed at the start of a collection run."""
     payload = bounds if bounds is not None else load_signal_bounds()
     lines = [
-        f"signal bounds v{payload.get('schema_version')} "
-        f"({payload.get('robot')}) — global, not fitted per run"
+        f"signal bounds v{payload.get('signal_bounds_version')} "
+        f"({payload.get('robot')}) — from {payload.get('source', 'the robot')}"
     ]
     for name, signal in payload["signals"].items():
-        pairs = "  ".join(
-            f"{key}=[{low:g},{high:g}]" for key, (low, high) in signal["bounds"].items()
-        )
+        bounds = signal["bounds"]
+        if set(bounds) >= set(FOOT_ORDER):
+            # Per-leg: print one leg in full and say the others differ, rather
+            # than 12 rails per line.
+            first = FOOT_ORDER[0]
+            pairs = "  ".join(
+                f"{first}.{key}=[{low:g},{high:g}]"
+                for key, (low, high) in bounds[first].items()
+            )
+            pairs += "  (per leg)"
+        else:
+            pairs = "  ".join(
+                f"{key}=[{low:g},{high:g}]" for key, (low, high) in bounds.items()
+            )
         lines.append(f"  {name:<22} {signal.get('unit',''):<8} {pairs}")
     lines.append(f"  feet={list(FOOT_ORDER)} joints={list(JOINT_ORDER)} n_feet={N_FEET}")
     return "\n".join(lines)

@@ -181,7 +181,8 @@ def _audit_arrays(n_rows: int, out_of_range_rows: int):
     arrays = {"joint_pos": np.tile(row, (n_rows, 1)).astype(np.float32)}
 
     # Push one element of the first ``out_of_range_rows`` rows past its bound.
-    high_haa = bounds["signals"]["joint_pos"]["bounds"]["HAA"][1]
+    # Bounds are per leg since v5; FL is the first three elements of the vector.
+    high_haa = bounds["signals"]["joint_pos"]["bounds"]["FL"]["HAA"][1]
     arrays["joint_pos"][:out_of_range_rows, 0] = high_haa + 1.0
     return arrays, bounds
 
@@ -223,16 +224,25 @@ def test_joint_pos_bounds_carry_a_noise_margin():
     The MJCF range is +-1.0472; the normalisation bound has to sit outside it.
     """
     bounds = load_signal_bounds()
-    haa = bounds["signals"]["joint_pos"]["bounds"]["HAA"]
-    assert haa[0] < -1.0472 and haa[1] > 1.0472
-    assert signal_bounds_version(bounds) >= 2
+    for leg in ("FL", "FR", "RL", "RR"):
+        haa = bounds["signals"]["joint_pos"]["bounds"][leg]["HAA"]
+        assert haa[0] < -1.0472 and haa[1] > 1.0472, leg
+    assert signal_bounds_version(bounds) >= 5
 
 
 def test_knee_velocity_bound_covers_the_observed_motion():
-    """Go2 actuator speed is 30.1 rad/s; observed 22.61 rad/s must sit inside it."""
+    """
+    The knee-speed rail must cover what the simulator actually reaches.
+
+    v5 replaced the actuator-capability number (30.1 rad/s, which the robot never
+    approaches and which left the channel occupying 43 of 256 grey levels) with
+    the reconciled operating envelope. The bound that matters is the measured
+    one: p0.1 -8.76, max 13.69 rad/s on the reconciliation run.
+    """
     bounds = load_signal_bounds()
-    kfe = bounds["signals"]["joint_vel"]["bounds"]["KFE"]
-    assert kfe[1] >= 30.1
+    for leg in ("FL", "FR", "RL", "RR"):
+        kfe = bounds["signals"]["joint_vel"]["bounds"][leg]["KFE"]
+        assert kfe[1] >= 13.7 and kfe[0] <= -8.8, leg
 
 
 # ── R2-7: clearance columns ──────────────────────────────────────────────────
@@ -242,3 +252,73 @@ def test_clearance_and_height_label_columns_exist():
     assert COLUMNS_BY_NAME["contact_from_height"].role == "context"
     # The site-measured height must say so, or someone will threshold it.
     assert "site" in COLUMNS_BY_NAME["foot_height_terrain"].doc.lower()
+
+
+# ── per-episode command envelope ─────────────────────────────────────────────
+
+def test_scale_ranges_applies_the_episode_speed_knob():
+    """
+    The per-episode ``max_speed`` must actually bound the sampled command.
+
+    Before this, the randomizer stamped ``max_speed`` into the episode metadata
+    while the sampler kept its fixed range — an episode labelled 0.497 commanded
+    0.747, so the metadata claimed a condition that was never applied.
+    """
+    sampler = VelocityCommandSampler(dt=0.02, rng=np.random.default_rng(0))
+    sampler.scale_ranges(max_speed=0.4, max_yaw_rate=0.5)
+    sampler.reset()
+    commands = np.stack([sampler.step() for _ in range(4000)])
+
+    assert np.abs(commands[:, 0]).max() <= 0.4 + 1e-9
+    assert np.abs(commands[:, 2]).max() <= 0.5 + 1e-9
+
+
+def test_scale_ranges_always_starts_from_the_nominal_envelope():
+    """Repeated rescaling must not compound: 3 episodes at 0.5x is not 0.125x."""
+    sampler = VelocityCommandSampler(dt=0.02, rng=np.random.default_rng(1))
+    nominal = max(abs(v) for v in sampler.config.vx_mps)
+
+    for _ in range(3):
+        sampler.scale_ranges(max_speed=0.5 * nominal)
+    assert max(abs(v) for v in sampler.config.vx_mps) == pytest.approx(0.5 * nominal)
+
+    sampler.scale_ranges(max_speed=nominal)
+    assert max(abs(v) for v in sampler.config.vx_mps) == pytest.approx(nominal)
+
+
+def test_scale_ranges_keeps_the_lateral_to_forward_ratio():
+    """A slower episode is slower in every direction, not differently shaped."""
+    sampler = VelocityCommandSampler(dt=0.02)
+    before = (
+        max(abs(v) for v in sampler.config.vy_mps)
+        / max(abs(v) for v in sampler.config.vx_mps)
+    )
+    sampler.scale_ranges(max_speed=0.3)
+    after = (
+        max(abs(v) for v in sampler.config.vy_mps)
+        / max(abs(v) for v in sampler.config.vx_mps)
+    )
+    assert after == pytest.approx(before)
+
+
+def test_scale_ranges_scales_the_minimum_speed_floor():
+    """Otherwise a slow episode rejects almost every draw and stalls."""
+    sampler = VelocityCommandSampler(dt=0.02)
+    nominal_floor = sampler.config.min_speed_mps
+    sampler.scale_ranges(max_speed=0.25)
+    assert sampler.config.min_speed_mps < nominal_floor
+
+
+def test_reset_randomizer_drives_the_command_sampler():
+    """The knob must reach the sampler through ResetTargets, not only the navigator."""
+    from mpx.config.sim_config.config_reset_randomization import (
+        ResetRandomizationConfig,
+    )
+    from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
+
+    sampler = VelocityCommandSampler(dt=0.02)
+    randomizer = ResetRandomizer(ResetRandomizationConfig(enabled=True, rng_seed=7))
+    sample, _ = randomizer.sample_and_apply(ResetTargets(command_sampler=sampler))
+
+    assert sample.max_speed is not None
+    assert max(abs(v) for v in sampler.config.vx_mps) == pytest.approx(sample.max_speed)

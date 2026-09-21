@@ -66,6 +66,15 @@ from mpx.utils.math_utils.quad_math import (
 )
 
 
+def _robot_config(robot: str):
+    if robot == "go2":
+        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.TRIPOD_SWING_FL)
+    if robot == "b2":
+        from mpx.config.robot_config.config_b2 import b2_config, B2Mode
+        return b2_config(B2Mode.BALANCE, balance_stance=BalanceStance.TRIPOD_SWING_FL)
+    raise ValueError(f"Unsupported robot: {robot}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Crash detection (batch)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,7 +106,7 @@ def main(
     n_env: int = 8,
 ):
     # ── Config ──────────────────────────────────────────────────────────────
-    config = go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.TRIPOD_SWING_FL)
+    config = _robot_config(robot)
 
     # Swing leg = the entry in balance_fixed_contact_mask that is 0.
     swing_leg_idx = int(np.where(np.array(config.balance_fixed_contact_mask) < 0.5)[0][0])
@@ -519,7 +528,7 @@ if __name__ == "__main__":
     parser.add_argument("--scene", type=str,
                         choices=["flat", "rough", "perlin", "stairs", "ramp", "slippery"],
                         default="flat")
-    parser.add_argument("--robot", type=str, choices=["go2"], default="go2")
+    parser.add_argument("--robot", type=str, choices=["go2", "b2"], default="go2")
     parser.add_argument("--n-env", type=int, default=8,
                         help="Number of parallel environments.")
     parser.add_argument("--headless", action="store_true")

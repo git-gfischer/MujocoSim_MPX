@@ -311,8 +311,13 @@ class InverseDynamicsMPCWrapper:
 
 def make_locomotion_mpc(config, limited_memory=True):
     """Build the locomotion MPC wrapper for ``config.mpc_model``."""
-    if getattr(config, "mpc_model", "whole_body") == "inverse_dynamics":
+    mpc_model = getattr(config, "mpc_model", "whole_body")
+    if mpc_model == "inverse_dynamics":
         return InverseDynamicsMPCWrapper(config, limited_memory=limited_memory)
+    if mpc_model == "srbd":
+        from mpx.utils.quad_utils_locomotion.mpc_wrapper_srbd import SrbdMPCWrapper
+
+        return SrbdMPCWrapper(config, limited_memory=limited_memory)
     from mpx.utils.quad_utils_locomotion.mpc_wrapper_locomotion import MPCWrapper
 
     return MPCWrapper(config, limited_memory=limited_memory)

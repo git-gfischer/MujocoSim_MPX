@@ -81,21 +81,36 @@ class ContactLabelConfig:
 @dataclass
 class SubstepForceAccumulator:
     """
-    Collects per-foot normal force across the substeps of one control interval.
+    Collects the per-foot GRF **vector** across the substeps of one control interval.
 
     The recorder pushes one sample per sim step and reduces once per control
-    step, so the label sees the whole interval instead of the single instant the
-    control step happens to land on.
+    step, so both the label and the regression target see the whole interval
+    instead of the single instant the control step happens to land on.
+
+    Vectors, not magnitudes: the contact label only needs ``|f|``, but the GRF
+    regression target needs the direction too, and averaging magnitudes after
+    the fact cannot recover it (DATASET_FIX_TASKS_R3, Task R3-2).
     """
 
     config: ContactLabelConfig = field(default_factory=ContactLabelConfig)
     _samples: List[np.ndarray] = field(default_factory=list)
 
-    def push(self, normal_force: np.ndarray) -> None:
-        """Record one substep's per-foot normal force ``(4,)`` in newtons."""
-        self._samples.append(
-            np.asarray(normal_force, dtype=np.float64).reshape(N_FEET).copy()
-        )
+    def push(self, grf_world: np.ndarray) -> None:
+        """
+        Record one substep's per-foot GRF.
+
+        Accepts the ``(4, 3)`` world-frame force vectors, or a ``(4,)`` vector of
+        magnitudes for callers that only have those (the magnitudes are then
+        placed on +Z, which is correct on flat ground and is only ever used for
+        the scalar statistics).
+        """
+        values = np.asarray(grf_world, dtype=np.float64)
+        if values.ndim == 1:
+            vectors = np.zeros((N_FEET, 3), dtype=np.float64)
+            vectors[:, 2] = values.reshape(N_FEET)
+        else:
+            vectors = values.reshape(N_FEET, 3).copy()
+        self._samples.append(vectors)
 
     def clear(self) -> None:
         self._samples.clear()
@@ -108,10 +123,20 @@ class SubstepForceAccumulator:
         """
         Collapse the buffered substeps into one control-step row and clear.
 
-        Returns ``contact_raw`` (majority threshold, no hysteresis), plus the
-        interval's ``mean`` and ``max`` per-foot force. The mean is the honest
-        summary of what the foot carried over the interval; the instantaneous
-        value the control step happens to sample is not.
+        Returns
+        -------
+        contact_raw : (4,) uint8
+            Majority threshold over the interval's substeps, no hysteresis.
+        mean : (4,) float
+            Mean per-foot force MAGNITUDE over the interval. This is what the
+            debouncer sees, and it is the mean of ``|f|``, not ``|mean f|``: a
+            foot that is loaded throughout must not read low because the contact
+            normal swung during the interval.
+        max : (4,) float
+            Largest per-foot magnitude within the interval (touchdown transient).
+        mean_vector : (4, 3) float
+            Mean per-foot force VECTOR, world frame. The regression target
+            (R3-2); it keeps the direction that ``mean`` throws away.
         """
         if not self._samples:
             zeros = np.zeros(N_FEET, dtype=np.float64)
@@ -119,16 +144,19 @@ class SubstepForceAccumulator:
                 "contact_raw": np.zeros(N_FEET, dtype=np.uint8),
                 "mean": zeros,
                 "max": zeros.copy(),
+                "mean_vector": np.zeros((N_FEET, 3), dtype=np.float64),
             }
 
-        stacked = np.stack(self._samples, axis=0)          # (substeps, 4)
-        loaded_fraction = (stacked >= self.config.on_threshold_n).mean(axis=0)
+        stacked = np.stack(self._samples, axis=0)          # (substeps, 4, 3)
+        magnitude = np.linalg.norm(stacked, axis=2)        # (substeps, 4)
+        loaded_fraction = (magnitude >= self.config.on_threshold_n).mean(axis=0)
         result = {
             "contact_raw": (
                 loaded_fraction >= self.config.substep_majority
             ).astype(np.uint8),
-            "mean": stacked.mean(axis=0),
-            "max": stacked.max(axis=0),
+            "mean": magnitude.mean(axis=0),
+            "max": magnitude.max(axis=0),
+            "mean_vector": stacked.mean(axis=0),
         }
         self.clear()
         return result

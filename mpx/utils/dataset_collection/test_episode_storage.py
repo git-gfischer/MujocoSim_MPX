@@ -54,8 +54,18 @@ def make_record(
     for foot, loaded in enumerate(stance):
         if loaded:
             grf[:, foot, 2] = 50.0
+            grf[:, foot, 0] = 5.0
+    # grf_base is what the bucket system reads; grf_world is the deprecated
+    # instantaneous twin, written so the fixture matches a real episode file.
+    arrays["grf_base"][:] = grf.reshape(n_steps, 12)
+    arrays["grf_mean_world"][:] = grf.reshape(n_steps, 12)
     arrays["grf_world"][:] = grf.reshape(n_steps, 12)
+    arrays["grf_mean_n"][:] = np.linalg.norm(grf, axis=2)
     arrays["external_force"][:, 0] = ext_force
+    # A robot that is standing up. empty_arrays leaves base_height_terrain at
+    # 0.0, which operating_regime correctly reads as lying on the floor.
+    arrays["base_height_terrain"][:] = 0.25
+    arrays["base_quat"][:] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
     contact = np.tile(np.asarray(stance, dtype=np.uint8), (n_steps, 1))
     arrays["contact"][:] = contact
@@ -74,6 +84,7 @@ def make_record(
         payload_kg=1.25,
         terminate_by=terminate_by,
         terminate_reason="goal_reached",
+        body_weight_n=176.0,
         split_assigned=split,
         reset_randomization={"step_freq": 1.4},
     )
@@ -90,6 +101,13 @@ def test_episode_round_trips_every_column(tmp_path):
     assert path.exists()
     restored = store.read_episode(path)
     for column in EPISODE_COLUMNS:
+        if np.dtype(column.dtype).kind == "U":
+            np.testing.assert_array_equal(
+                np.asarray(restored[column.name]).astype(str),
+                np.asarray(record.arrays[column.name]).astype(str),
+                err_msg=f"column {column.name} did not round-trip",
+            )
+            continue
         np.testing.assert_allclose(
             np.asarray(restored[column.name], dtype=np.float64),
             np.asarray(record.arrays[column.name], dtype=np.float64),
@@ -208,9 +226,10 @@ def test_index_rows_point_at_readable_windows(tmp_path):
 
 def test_perturbation_flag_follows_the_external_force(tmp_path):
     store = EpisodeStore(tmp_path)
+    # 17.6 N on a 176 N robot: a "small" perturbation is 10% of body weight.
     bucket = DatasetBucketSystem(
         bucket_capacity=1_000,
-        perturbation_force_threshold=5.0,
+        body_weight_n=176.0,
         dataset_summary_path=None,
         store=store,
     )

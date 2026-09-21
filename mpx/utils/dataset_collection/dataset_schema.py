@@ -37,7 +37,9 @@ Frames
                                      the base; the site is offset in translation)
 ``base_lin_vel``                     base frame
 ``foot_pos_base``/``foot_vel_base``  yaw-aligned base frame (X fwd, Y left, Z up)
-``grf_world``, ``external_force``    world frame
+``grf_base``                         base frame (the GRF regression target)
+``grf_yawbase``                      gravity-aligned base frame, TRUE attitude
+``grf_mean_world``, ``external_force``  world frame
 ``base_quat``                        world→base, **wxyz** (MuJoCo convention)
 """
 
@@ -50,6 +52,8 @@ from enum import Enum
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 import numpy as np
+
+from mpx.utils.dataset_collection.operating_regime import REGIME_DTYPE
 
 # Bumped whenever the on-disk format changes. Stamped into every parquet file
 # of a run (episodes, episode table, index) so a reader can reject data it does
@@ -141,8 +145,16 @@ EPISODE_COLUMNS: Tuple[Column, ...] = (
     Column("contact", N_FEET, np.uint8, "target", "-", "-",
            "Debounced per-foot contact FL FR RL RR (PRIMARY LABEL): per-substep "
            "majority, then Schmitt trigger, then minimum dwell"),
-    Column("grf_world", N_FEET * 3, np.float32, "target", "N", "world",
-           "Ground reaction force per foot at the control instant, FL FR RL RR x xyz"),
+    Column("grf_base", N_FEET * 3, np.float32, "target", "N", "base",
+           "PRIMARY GRF TARGET. Per-foot ground reaction force, averaged over the "
+           "substeps of the control interval and rotated into the BODY frame, "
+           "FL FR RL RR x xyz. Body frame because a world-frame vector is not "
+           "equivariant under the robot's morphological symmetry group, so a "
+           "symmetry-aware model cannot use it as a target"),
+    Column("grf_yawbase", N_FEET * 3, np.float32, "target", "N", "yaw_base",
+           "Same substep-averaged GRF, gravity-aligned with the TRUE base "
+           "attitude (yaw removed). For symmetry-equivariant models that want "
+           "gravity on -Z. FL FR RL RR x xyz"),
     Column("external_force", 3, np.float32, "target", "N", "world",
            "External perturbation force applied to the base"),
     Column("base_lin_vel", 3, np.float32, "target", "m/s", "base",
@@ -166,14 +178,39 @@ EPISODE_COLUMNS: Tuple[Column, ...] = (
            "Commanded base velocity (vx, vy, wz)"),
     Column("sensor_stale", 1, np.bool_, "context", "-", "-",
            "True when a dropped packet made this row repeat the previous sample"),
+    Column("operating_regime", 1, REGIME_DTYPE, "context", "-", "-",
+           "How degraded locomotion is at this step: nominal | degraded | "
+           "severe | failed. Worst of base height, tilt, non-foot contact and "
+           "command tracking, dwell-filtered. Degraded frames are KEPT: dragging "
+           "feet and unplanned body contact are exactly the regime a contact "
+           "estimator should be tested on. Report nominal and degraded "
+           "separately rather than pooling or discarding"),
+    Column("cmd_tracking_error", 1, np.float32, "context", "m/s", "base",
+           "|realised - commanded| planar base velocity"),
+    Column("post_failure", 1, np.bool_, "context", "-", "-",
+           "operating_regime == 'failed'. The robot is unrecoverable and every "
+           "later frame of the episode inherits it"),
+    Column("valid", 1, np.bool_, "context", "-", "-",
+           "operating_regime in (nominal, degraded): usable for training. The "
+           "index carries a copy so a sampler can filter without opening the "
+           "episode file"),
 
     # ── privileged: simulation-only, never a network input ───────────────────
     Column("base_pos", 3, np.float32, "privileged", "m", "world",
            "Base position in world"),
+    Column("grf_mean_world", N_FEET * 3, np.float32, "privileged", "N", "world",
+           "Substep-averaged per-foot GRF in the WORLD frame: the same vector as "
+           "grf_base before the rotation. FL FR RL RR x xyz"),
     Column("grf_mean_n", N_FEET, np.float32, "privileged", "N", "-",
-           "Mean per-foot normal force over the control interval"),
+           "Mean per-foot force MAGNITUDE over the control interval. This is the "
+           "signal the contact debouncer thresholds. It is mean(|f|), not "
+           "|mean f| = norm(grf_base): a foot loaded throughout an interval must "
+           "not read low because the contact normal swung during it"),
     Column("grf_max_n", N_FEET, np.float32, "privileged", "N", "-",
-           "Max per-foot normal force over the control interval"),
+           "PEAK per-foot force magnitude within the control interval. Max GRF is "
+           "3.3x body weight at touchdown against a 73.9 N stance median, so the "
+           "peak and the mean are different quantities and a loss should be told "
+           "which one it is scoring"),
     Column("joint_torque_cmd", N_JOINTS, np.float32, "privileged", "N*m", "joint",
            "MPC commanded torque before saturation; encodes the planned contact "
            "schedule, so it must not be used as an input"),
@@ -218,6 +255,14 @@ EPISODE_COLUMNS: Tuple[Column, ...] = (
            "surface touches the terrain"),
     Column("base_height_terrain", 1, np.float32, "privileged", "m", "world",
            "Base height above the terrain beneath it"),
+    Column("base_tilt_deg", 1, np.float32, "privileged", "deg", "world",
+           "Angle between the base z-axis and gravity. One number rather than "
+           "roll and pitch separately: a robot 12 deg out in each is more tilted "
+           "than either figure suggests"),
+    Column("non_foot_contact_n", 1, np.float32, "privileged", "N", "-",
+           "Substep-averaged total normal force on geoms that are NOT feet. "
+           "A healthy quadruped reads exactly 0, so this is the one degradation "
+           "signal that needs no threshold tuning"),
 
     # ── deprecated: v3 columns kept so old loaders keep working ──────────────
     Column("imu_acc", 3, np.float32, "deprecated", "m/s^2", "world",
@@ -228,6 +273,11 @@ EPISODE_COLUMNS: Tuple[Column, ...] = (
     Column("joint_torque", N_JOINTS, np.float32, "deprecated", "N*m", "joint",
            "v3 alias of joint_torque_cmd (commanded, pre-saturation). Superseded "
            "by joint_torque_measured. Do not use as input."),
+    Column("grf_world", N_FEET * 3, np.float32, "deprecated", "N", "world",
+           "v4.0 instantaneous world-frame GRF, sampled at the control instant. "
+           "ALIASED: it reads exactly 0 N on 1.9% of frames whose foot is in "
+           "contact, because the control step can land inside a micro-bounce the "
+           "50 Hz log cannot see. Superseded by grf_base. Do not use as a target."),
     Column("rare_contact", 1, np.bool_, "deprecated", "-", "-",
            "v3 flag for a contact pattern outside the 12 named gait states. "
            "Superseded by the SINGLE_<foot> contact_state names."),
@@ -303,27 +353,6 @@ def validate_arrays(arrays: Mapping[str, np.ndarray]) -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 # DERIVED PER-STEP LABELS
 # ══════════════════════════════════════════════════════════════════════════════
-
-def contact_bits_from_grf(
-    grf_world: np.ndarray,
-    contact_force_threshold: float,
-) -> np.ndarray:
-    """
-    Threshold per-foot GRF magnitude into contact binaries.
-
-    ``grf_world`` is ``(T, 4, 3)`` or ``(T, 12)`` in FL FR RL RR x xyz order.
-
-    This is the plain single-threshold rule. Collected episodes use the
-    hysteresis + dwell labeller in
-    :mod:`mpx.utils.dataset_collection.contact_labeling` instead; this function
-    remains for reading v3 data and for analysis.
-
-    Returns ``(T, 4)`` ``uint8``.
-    """
-    grf = np.asarray(grf_world, dtype=np.float64).reshape(-1, N_FEET, 3)
-    magnitude = np.linalg.norm(grf, axis=2)
-    return (magnitude > float(contact_force_threshold)).astype(np.uint8)
-
 
 def dt_since_transition(contact: np.ndarray, dt: float) -> np.ndarray:
     """
@@ -438,6 +467,15 @@ class EpisodeMetadata:
     duration_s: float = 0.0
     friction: float | None = None    # foot sliding mu in effect for this episode
     payload_kg: float | None = None  # extra base mass in effect for this episode
+    # Total weight [N] of the robot as configured for THIS episode, payload
+    # included. The perturbation axis is binned as a fraction of it, so a push
+    # means the same thing whether the robot carries 0.5 kg or 5 kg.
+    body_weight_n: float = 0.0
+    # Share of this episode's steps annotated ``operating_regime == "nominal"``.
+    # An episode-constant statistic, so it belongs here rather than being
+    # recomputed from the index: the manifest asserts on it when balancing
+    # splits, and a split of mostly-fallen episodes cannot select a model.
+    frac_nominal: float = 1.0
     terminate_by: str = EpisodeOutcome.TRUNCATED.value
     terminate_reason: str = ""
     split_assigned: str = "train"
@@ -470,6 +508,8 @@ class EpisodeMetadata:
             "duration_s": float(self.duration_s),
             "friction": None if self.friction is None else float(self.friction),
             "payload_kg": None if self.payload_kg is None else float(self.payload_kg),
+            "body_weight_n": float(self.body_weight_n),
+            "frac_nominal": float(self.frac_nominal),
             "terminate_by": self.terminate_by,
             "terminate_reason": self.terminate_reason,
             "split_assigned": self.split_assigned,

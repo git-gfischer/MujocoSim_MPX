@@ -54,6 +54,15 @@ from mpx.utils.math_utils.quad_math import (
 )
 
 
+def _robot_config(robot: str):
+    if robot == "go2":
+        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.FOUR)
+    if robot == "b2":
+        from mpx.config.robot_config.config_b2 import b2_config, B2Mode
+        return b2_config(B2Mode.BALANCE, balance_stance=BalanceStance.FOUR)
+    raise ValueError(f"Unsupported robot: {robot}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Crash detection (batch)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,7 +94,7 @@ def main(
     n_env: int = 8,
 ):
     # ── Config & CPU model ──────────────────────────────────────────────────
-    config = go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.FOUR)
+    config = _robot_config(robot)
 
     model = mujoco.MjModel.from_xml_path(
         dir_path + f"/../../data/{robot}/scene_{scene}.xml"
@@ -402,7 +411,7 @@ if __name__ == "__main__":
     parser.add_argument("--scene", type=str,
                         choices=["flat", "rough", "perlin", "stairs", "ramp", "slippery"],
                         default="flat")
-    parser.add_argument("--robot", type=str, choices=["go2"], default="go2")
+    parser.add_argument("--robot", type=str, choices=["go2", "b2"], default="go2")
     parser.add_argument("--n-env", type=int, default=8,
                         help="Number of parallel environments.")
     parser.add_argument("--headless", action="store_true")

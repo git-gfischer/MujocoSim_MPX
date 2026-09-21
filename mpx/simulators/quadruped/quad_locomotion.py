@@ -1,6 +1,8 @@
 # Usage: python quad_locomotion.py --headless --steps 2000 --scene flat --robot go2 --nav random --n-env 8 --gait trot
 # dataset_collection: python quad_locomotion.py --collect --scene flat --robot go2 --nav random
 # Note for dataset collection: python -m mpx.utils.dataset_collection.make_signal_bounds --robot go2
+# dataset_collection: python quad_locomotion.py --collect --scene flat --robot go2 --nav random
+# Note for dataset collection: python -m mpx.utils.dataset_collection.make_signal_bounds --robot go2
 
 import argparse
 import os
@@ -74,6 +76,7 @@ _ROBOT_DATA_DIR = {
     "go2": "go2",
     "aliengo": "aliengo",
     "spot": "boston_dynamics_spot",
+    "b2": "b2",
 }
 
 
@@ -81,9 +84,8 @@ _ROBOT_DATA_DIR = {
 def robot_config(robot, gait=None, mpc_model="whole_body"):
     """Locomotion config for ``robot``, optionally on a named gait.
 
-    ``gait=None`` keeps each robot's own default (``config_go2.DEFAULT_GAIT``
-    for the Go2). Only the Go2 has a gait registry today; asking for one on
-    another robot is an error rather than a silently ignored flag.
+    ``gait=None`` keeps each robot's own default gait. Go2, Spot and B2 share
+    the same gait registry layout (trot / pace / crawl / bound).
     """
     if robot == "go2":
         from mpx.config.robot_config.config_go2 import go2_config, Go2Mode
@@ -93,14 +95,17 @@ def robot_config(robot, gait=None, mpc_model="whole_body"):
             f"--mpc-model {mpc_model!r} is only supported for the go2 "
             f"(got robot {robot!r})."
         )
-    if gait is not None:
-        raise ValueError(
-            f"--gait is only supported for the go2 (got robot {robot!r}); "
-            "the other robot configs have a single hardcoded gait."
-        )
     if robot == "spot":
         from mpx.config.robot_config.config_spot import spot_config, SpotMode
-        return spot_config(SpotMode.LOCOMOTION)
+        return spot_config(SpotMode.LOCOMOTION, gait=gait)
+    if robot == "b2":
+        from mpx.config.robot_config.config_b2 import b2_config, B2Mode
+        return b2_config(B2Mode.LOCOMOTION, gait=gait)
+    if gait is not None:
+        raise ValueError(
+            f"--gait is not supported for robot {robot!r}; "
+            "expected one of go2, spot, b2."
+        )
     if robot == "aliengo":
         import mpx.config.robot_config.config_aliengo as config
         return config
@@ -159,13 +164,45 @@ def main(
         # its yaw slew limit integrates against.
         control_dt=1.0 / config.mpc_frequency,
     )
-    # Segmented velocity command for data collection. Goal-following never
-    # commands a yaw rate directly and never reverses, so a collected dataset
-    # built on it cannot test yaw-invariance or a backward gait.
+    # ── where the velocity command comes from ────────────────────────────────
+    # "segments" drives the robot with randomly sampled velocity commands rather
+    # than toward a goal. Data collection wants that: goal-following never
+    # commands a yaw rate directly and never reverses, so a dataset built on it
+    # cannot test yaw-invariance or a backward gait.
+    #
+    # The cost is that the robot deliberately does NOT go to the goal and will
+    # walk backwards, which looks like a broken controller if you were not
+    # expecting it. So the choice is explicit and announced, never silent.
     command_sampler = VelocityCommandSampler(
         dt=1.0 / dataset_collection_config.episode.control_hz
     )
-    use_command_sampler = collect and dataset_collection_config.episode.segmented_commands
+    # Asking for a nav mode always wins: --nav random --collect drives to goals.
+    # The sampler only steps in when --collect runs WITHOUT one, which is the
+    # case that has no other command source anyway (the default --nav vel needs
+    # a keyboard, and a headless collection run has none).
+    use_command_sampler = (
+        collect
+        and dataset_collection_config.episode.segmented_commands
+        and not use_navigation
+    )
+    if use_command_sampler:
+        print(
+            "[command] --collect without a nav mode: driving from random "
+            "velocity segments. The robot walks forwards, backwards, sideways "
+            "and turns, with no goal — that is what gives the dataset the "
+            "reverse and turning coverage goal-following cannot produce.",
+            flush=True,
+        )
+    elif collect and use_navigation:
+        print(
+            f"[command] --nav {nav} --collect: driving to navigation goals. "
+            f"Note the dataset will contain no commanded reverse and only the "
+            f"yaw the navigator produces turning toward a goal; drop --nav to "
+            f"collect the full command envelope instead.",
+            flush=True,
+        )
+    else:
+        print(f"[command] driving from --nav {nav}", flush=True)
 
     solve_mpc = _build_solve_fn(mpc)
     reset_mpc = jax.jit(mpc.reset)
@@ -217,11 +254,70 @@ def main(
     reset_randomizer = ResetRandomizer.from_config(loco_reset_randomization_config)
     #------------------------------------------------
 
+    # region spawn settle -------------------------------------
+    def _settle_after_spawn() -> tuple[int, float]:
+        """Step the physics with a joint PD to ``q0`` until the robot is at rest.
+
+        Foot vertical relief spawns the base at the lowest collision-free ``z``,
+        which is up to ``foot_relief_max`` (0.10 m) above nominal on rough terrain.
+        Handing the MPC its first command mid-fall is what made the robot slam
+        into the ground at episode start, so the drop is absorbed here instead,
+        before the MPC is initialised and before any recording begins.
+
+        Returns ``(steps_taken, settled_height)`` for logging.
+        """
+        if not spawn_config.settle_after_spawn:
+            return 0, float(data.qpos[2])
+
+        n_steps = int(round(spawn_config.settle_duration_s * sim_frequency))
+        if n_steps <= 0:
+            return 0, float(data.qpos[2])
+
+        n_j = config.n_joints
+        q_hold = np.asarray(config.q0, dtype=np.float64).reshape(n_j)
+        kp = float(spawn_config.settle_kp)
+        kd = float(spawn_config.settle_kd)
+        lo, hi = float(config.min_torque), float(config.max_torque)
+        tol = float(spawn_config.settle_qvel_tol)
+
+        # Perturbation and payload forces are written fresh every control step in
+        # the main loop; clear whatever the previous episode left behind so the
+        # settle is not fighting a stale load.
+        data.qfrc_applied[:] = 0.0
+
+        taken = 0
+        for step in range(n_steps):
+            q = np.asarray(data.qpos[7 : 7 + n_j], dtype=np.float64)
+            dq = np.asarray(data.qvel[6 : 6 + n_j], dtype=np.float64)
+            data.ctrl = np.clip(kp * (q_hold - q) - kd * dq, lo, hi)
+            mujoco.mj_step(model, data)
+            taken = step + 1
+            # Stop as soon as it is at rest: a flat spawn settles ~1 cm and does
+            # not need the full duration.
+            if float(np.max(np.abs(dq))) < tol and abs(float(data.qvel[2])) < tol:
+                break
+
+        data.ctrl[:] = 0.0
+        data.qfrc_applied[:] = 0.0
+        mujoco.mj_forward(model, data)
+        return taken, float(data.qpos[2])
+    # endregion
+
     # region reset helper -------------------------------------
     def _respawn(*, manual: bool = False, crashed: bool = False):
         nonlocal mpc_data, tau, q_ref, counter
         collect_hooks.on_respawn(manual=manual, crashed=crashed)
         spawner.apply_to_data(model, data, config.p0, config.quat0, config.q0)
+        z_spawned = float(data.qpos[2])
+        # Absorb the vertical-relief drop BEFORE the MPC is initialised, so it
+        # starts from a pose the robot is actually holding rather than mid-fall.
+        settle_steps, z_settled = _settle_after_spawn()
+        if settle_steps and not collect_hooks.enabled:
+            print(
+                f"[spawn] settled {z_spawned:.3f} -> {z_settled:.3f} m "
+                f"in {settle_steps / sim_frequency:.2f} s",
+                flush=True,
+            )
         foot = jnp.asarray(sim_utils.geom_positions(data, contact_ids))
         mpc_data = reset_mpc(mpc.make_data(), data.qpos.copy(), data.qvel.copy(), foot)
         tau = jnp.zeros(config.n_joints)
@@ -253,6 +349,9 @@ def main(
                 foot_geom_ids=contact_ids,
                 base_weight=base_weight,
                 navigator=navigator if use_navigation else None,
+                # The same speed/yaw knobs drive whichever command source is
+                # active, so the envelope varies per episode in both modes.
+                command_sampler=command_sampler if use_command_sampler else None,
                 mpc_data=mpc_data,
             )
         )
@@ -356,20 +455,28 @@ def main(
                 print(f"Command: {command}")
             
             start = timer()
+            mpc_contact = (
+                contact
+                if getattr(config, "mpc_model", "whole_body") == "srbd"
+                else contact * 0.0
+            )
             mpc_data, tau = solve_mpc(
                 mpc_data,
                 qpos,
                 qvel,
                 foot,
                 command,
-                contact*0.0,
+                mpc_contact,
             )
             tau.block_until_ready()
             stop = timer()
 
             # tau = jnp.clip(tau, config.min_torque, config.max_torque)
             # The shifted warm start is the next joint target used by the PD stabilizer.
-            q_ref = mpc_data.X0[0, 7 : 7 + config.n_joints]
+            if getattr(config, "mpc_model", "whole_body") == "srbd":
+                q_ref = config.q0.copy()
+            else:
+                q_ref = mpc_data.X0[0, 7 : 7 + config.n_joints]
             if not collect_hooks.enabled:
                 print(f"MPC time: {1e3 * (stop - start):.2f} ms")
 
@@ -410,12 +517,19 @@ def main(
         if closed:
             _randomize_episode()
 
-        # Reaching the goal is a task success. During collection it does NOT end
-        # the episode by default: v3 closed on every goal and left a 9 s median
-        # episode, far short of the 30 s of steady state a temporal
-        # representation needs. The navigator just gets a new goal instead.
+        # Reaching the goal is a task success, and the natural place to close an
+        # episode and advance the domain randomization: otherwise a robot that
+        # keeps reaching goals carries one friction and payload for the whole
+        # episode. But not at EVERY goal — v3 did that and left a 9 s median
+        # episode, far short of the steady state a temporal representation needs.
+        # So goals before the threshold only resample the goal; the first one
+        # after it closes the episode and redraws the knobs.
         if use_navigation and navigator.reached(data.qpos):
-            if dataset_collection_config.episode.end_episode_on_goal:
+            episode_cfg = dataset_collection_config.episode
+            long_enough = (
+                collect_hooks.episode_seconds >= episode_cfg.goal_closes_episode_after_s
+            )
+            if episode_cfg.end_episode_on_goal and long_enough:
                 collect_hooks.end_episode(reason="goal_reached")
                 _randomize_episode()
             if navigator.auto_resample:
@@ -548,7 +662,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="flat")
-    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal", "spot"], default="go2")
+    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal", "spot", "b2"], default="go2")
     parser.add_argument(
         "--nav",
         type=str,
@@ -562,18 +676,18 @@ if __name__ == "__main__":
         choices=["trot", "pace", "crawl", "bound"],
         default=None,
         help=(
-            "Locomotion gait (go2 only). Selects the matched timing / swing / "
-            "weight set from config_go2.GO2_GAITS. Default: config_go2.DEFAULT_GAIT."
+            "Locomotion gait (go2 / spot / b2). Selects the matched timing / "
+            "swing / weight set from that robot's gait registry."
         ),
     )
     parser.add_argument(
         "--mpc-model",
         type=str,
-        choices=["whole_body", "inverse_dynamics"],
+        choices=["whole_body", "inverse_dynamics", "srbd"],
         default="whole_body",
         help=(
-            "Go2 MPC transcription: whole-body dynamics (default) or "
-            "inverse-dynamics with equality constraints."
+            "Go2 MPC transcription: whole-body dynamics (default), "
+            "inverse-dynamics with equality constraints, or centroidal SRBD."
         ),
     )
     parser.add_argument("--headless", action="store_true")

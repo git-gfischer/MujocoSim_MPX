@@ -144,11 +144,28 @@ def index_arrow_schema():
             pa.field("terminate_reason", pa.string(), nullable=False),
             # True once the robot became unrecoverable in a failure episode.
             pa.field("post_failure", pa.bool_(), nullable=False),
-            # True where the realised contact differs from the pattern the
-            # controller planned: the subset where reading the plan fails.
+            # ANY foot disagrees with the plan. Dominated by touchdown/liftoff
+            # timing jitter: 88% of mismatched frames sit within two control
+            # steps of a contact transition, so this alone is not a slip subset.
             pa.field("schedule_mismatch", pa.bool_(), nullable=False),
-            # Usable for training: currently "not post_failure".
+            # Inside a run of >= 3 consecutive mismatched frames — the part that
+            # is a real disagreement rather than jitter. This is the benchmark
+            # subset; 33% of mismatched frames on the audited run.
+            pa.field("schedule_mismatch_sustained", pa.bool_(), nullable=False),
+            # Which feet disagreed, "0100"-style in FL FR RL RR order.
+            pa.field("schedule_mismatch_bits", pa.string(), nullable=False),
+            # Usable for training: operating_regime in (nominal, degraded).
             pa.field("valid", pa.bool_(), nullable=False),
+            # How degraded locomotion was: nominal | degraded | severe | failed.
+            # Copied from the episode file so a sampler can filter or stratify
+            # on it without opening one.
+            pa.field("operating_regime", pa.string(), nullable=False),
+            pa.field("base_height_terrain", pa.float32(), nullable=False),
+            pa.field("base_tilt_deg", pa.float32(), nullable=False),
+            pa.field("non_foot_contact_n", pa.float32(), nullable=False),
+            # Rows in the episode this sample belongs to. With ``t`` it decides
+            # window validity for ANY W, which window_valid_w10 cannot.
+            pa.field("episode_n_steps", pa.int32(), nullable=False),
             # A 10-step causal window ending here lies inside this episode.
             pa.field("window_valid_w10", pa.bool_(), nullable=False),
             pa.field("terrain", pa.string(), nullable=False),
@@ -157,8 +174,18 @@ def index_arrow_schema():
             pa.field("contact_bits", pa.string(), nullable=False),
             pa.field("rare_contact", pa.bool_(), nullable=False),
             pa.field("perturbation_active", pa.bool_(), nullable=False),
+            # "none" | "small" | "large", binned on |F_ext| / body weight.
+            pa.field("perturbation_level", pa.string(), nullable=False),
+            # Command regime: stopped | slow | medium | fast | reverse | turning.
+            pa.field("speed_bin", pa.string(), nullable=False),
             pa.field("bucket_key", pa.string(), nullable=False),
             pa.field("grf_total_n", pa.float32(), nullable=False),
+            # Largest single-foot share of the total load, in [0.25, 1.0].
+            # Total load is pinned near body weight by statics; the SHARE is what
+            # varies and what the GRF head has to discriminate.
+            pa.field("grf_load_share_max", pa.float32(), nullable=False),
+            # max_i |f_xy,i| / f_z,i over loaded feet: friction utilisation.
+            pa.field("grf_tangential_ratio_max", pa.float32(), nullable=False),
             pa.field("external_force_n", pa.float32(), nullable=False),
         ],
         metadata={b"mpx_schema_version": str(EPISODE_SCHEMA_VERSION).encode()},
@@ -186,6 +213,8 @@ def episode_table_arrow_schema():
             pa.field("duration_s", pa.float32()),
             pa.field("friction", pa.float32()),
             pa.field("payload_kg", pa.float32()),
+            pa.field("body_weight_n", pa.float32()),
+            pa.field("frac_nominal", pa.float32()),
             pa.field("terminate_by", pa.string()),
             pa.field("terminate_reason", pa.string()),
             # Cached from the manifest; the manifest is the authority.
@@ -287,16 +316,21 @@ class EpisodeStore:
 
     def write_balanced_index(self, rows: Iterable[Mapping[str, Any]]) -> Path:
         """
-        Write ``index_balanced.parquet``: ``(episode_id, t, weight)``.
+        Write ``index_balanced.parquet``: ``(episode_id, t, split, weight)``.
 
         The materialised class-balanced view. It carries weights, not a subset,
         so the complete index stays the ground truth for "what rows exist".
+
+        ``split`` travels with the weight because the weight is only meaningful
+        inside the weighted splits: outside them it is exactly 1.0, and a reader
+        that cannot see the split cannot tell a real weight from that default.
         """
         pa, pq = _pyarrow()
         schema = pa.schema(
             [
                 pa.field("episode_id", pa.string(), nullable=False),
                 pa.field("t", pa.int32(), nullable=False),
+                pa.field("split", pa.string(), nullable=False),
                 pa.field("weight", pa.float32(), nullable=False),
             ],
             metadata={b"mpx_schema_version": str(EPISODE_SCHEMA_VERSION).encode()},

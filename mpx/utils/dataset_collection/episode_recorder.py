@@ -53,7 +53,10 @@ from typing import TYPE_CHECKING, Any, Dict, List
 import mujoco
 import numpy as np
 
-from mpx.estimators.quad_contact_estimation import estimate_foot_grf
+from mpx.estimators.quad_contact_estimation import (
+    estimate_foot_grf,
+    non_foot_contact_force,
+)
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
 from mpx.config.sim_config.config_dataset_bucket import (
     DatasetCollectionConfig,
@@ -71,6 +74,7 @@ from mpx.utils.dataset_collection.contact_labeling import (
 )
 from mpx.utils.dataset_collection.dataset_bucket_system import (
     DATASET_SUMMARY_FILENAME,
+    DEFAULT_BODY_WEIGHT_N,
     DatasetBucketSystem,
     GaitType,
     TerrainType,
@@ -90,9 +94,17 @@ from mpx.utils.dataset_collection.dataset_schema import (
     randomization_group_id,
 )
 from mpx.utils.dataset_collection.episode_storage import EpisodeStore
+from mpx.utils.dataset_collection.operating_regime import (
+    OperatingRegimeConfig,
+    REGIME_DTYPE,
+    base_tilt_deg,
+    classify as classify_regime,
+    regime_counts,
+)
 from mpx.utils.dataset_collection.make_signal_bounds import ensure_signal_bounds_file
 from mpx.utils.dataset_collection.signal_bounds import (
     CLIPPING_LIMIT,
+    NOMINAL_SCOPE,
     clipping_audit,
     default_signal_bounds_path,
     describe_bounds,
@@ -109,16 +121,12 @@ from mpx.utils.simulation_utils.measured_kinematics import (
     TerrainProbe,
     gravity_align,
     measured_joint_torque,
+    quat_to_rotmat,
 )
 from mpx.utils.simulation_utils.sensor_noise import SensorNoise
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
-
-# Go2 body weight [N], recorded in the contact-labelling metadata block so the
-# force thresholds can be read as a fraction of it.
-DEFAULT_BODY_WEIGHT_N = 176.0
-
 
 def scene_to_terrain(scene: str) -> TerrainType:
     """Map simulator ``--scene`` name to a :class:`TerrainType`."""
@@ -156,17 +164,27 @@ def read_episode_conditions(
 
     Note that MuJoCo's contact friction is ``min(foot, floor)``; this records the
     foot side, which is the one reset randomization controls.
+
+    ``body_weight_n`` is the robot's own weight plus the payload force. The
+    perturbation axis is binned as a fraction of it, so a push has to mean the
+    same thing whether the robot carries 0.5 kg or 5 kg.
     """
     ids = np.asarray(foot_geom_ids, dtype=np.int32).reshape(-1)
+    payload_kg = (
+        float(base_weight.extra_mass_kg)
+        if base_weight is not None and getattr(base_weight, "enabled", False)
+        else 0.0
+    )
+    gravity = float(abs(np.asarray(model.opt.gravity, dtype=np.float64)[2])) or 9.81
+    robot_mass_kg = float(np.sum(np.asarray(model.body_mass, dtype=np.float64)))
     return {
         "friction": (
             float(np.mean(model.geom_friction[ids, 0])) if ids.size else None
         ),
-        "payload_kg": (
-            float(base_weight.extra_mass_kg)
-            if base_weight is not None and getattr(base_weight, "enabled", False)
-            else 0.0
-        ),
+        "payload_kg": payload_kg,
+        # The payload is applied as a force, not as extra mass on the model, so
+        # it has to be added here rather than read back off body_mass.
+        "body_weight_n": (robot_mass_kg + payload_kg) * gravity,
     }
 
 
@@ -274,15 +292,17 @@ class StepSampler:
         unlimited = np.all(limits == 0.0, axis=1)
         self.force_limit = np.where(unlimited, np.inf, limits[:, 1])[: self.n_joints]
 
-    def foot_normal_force(self, data: mujoco.MjData) -> np.ndarray:
+    def foot_grf_world(self, data: mujoco.MjData) -> np.ndarray:
         """
-        Per-foot GRF magnitude ``(n_feet,)`` [N] at one sim substep.
+        Per-foot GRF ``(n_feet, 3)`` [N], world frame, at one sim substep.
 
-        Magnitude rather than the world Z component, so the value stays correct
-        on a slope where the contact normal is not vertical.
+        The whole vector, not its magnitude: the contact label only needs
+        ``|f|``, but the regression target needs the direction too, and the
+        substep average has to be taken on the vector to keep it (R3-2).
         """
-        grf = estimate_foot_grf(self.model, data, self.contact_ids)
-        return np.linalg.norm(np.asarray(grf, dtype=np.float64), axis=1)
+        return np.asarray(
+            estimate_foot_grf(self.model, data, self.contact_ids), dtype=np.float64
+        )
 
     def row(
         self,
@@ -291,6 +311,7 @@ class StepSampler:
         base_force_pert: RandomBaseForcePerturbation,
         reduced: Dict[str, np.ndarray],
         contact: np.ndarray,
+        non_foot_contact_n: float = 0.0,
     ) -> Dict[str, Any]:
         """Pack one control step. ``reduced`` comes from the substep accumulator."""
         n_joints = self.n_joints
@@ -347,6 +368,21 @@ class StepSampler:
         foot_clearance = foot_height - self.foot_collision_radius
         contact_from_height = self.height_debouncer.step(-foot_clearance)
 
+        # ── GRF targets ──────────────────────────────────────────────────────
+        # The target is the SUBSTEP AVERAGE in the BODY frame. Both halves
+        # matter. The instantaneous sample below is aliased — it reads exactly
+        # 0 N on 1.9% of frames whose foot is in contact, and under an L2 loss
+        # those outliers dominate the gradient. And a world-frame vector is not
+        # equivariant under the robot's morphological symmetry group, so it
+        # cannot be a target for an MI-HGNN / ECNN-style model and every
+        # yaw-invariance argument breaks on it.
+        grf_mean_world = np.asarray(reduced["mean_vector"], dtype=np.float64)
+        rotation = quat_to_rotmat(imu_true["quat"])          # world <- base
+        grf_base = grf_mean_world @ rotation                 # == (R^T f) per row
+        grf_yawbase = gravity_align(grf_base, imu_true["quat"])
+
+        # Deprecated: the v4.0 instantaneous world-frame sample, kept only so an
+        # old loader keeps working.
         grf_world = np.asarray(
             estimate_foot_grf(self.model, data, self.contact_ids), dtype=np.float64
         )
@@ -365,7 +401,8 @@ class StepSampler:
             "foot_vel_yawbase": foot_vel_yaw.astype(np.float32),
             # ── targets ──────────────────────────────────────────────────────
             "contact": np.asarray(contact, dtype=np.uint8),
-            "grf_world": grf_world.reshape(-1).astype(np.float32),
+            "grf_base": grf_base.reshape(-1).astype(np.float32),
+            "grf_yawbase": np.asarray(grf_yawbase, dtype=np.float32).reshape(-1),
             "external_force": np.asarray(
                 base_force_pert.force, dtype=np.float32
             ).reshape(3),
@@ -383,9 +420,26 @@ class StepSampler:
                 else np.asarray(control.cmd_base_vel, dtype=np.float32).reshape(-1)[:3]
             ),
             "sensor_stale": np.bool_(reading.stale),
+            "cmd_tracking_error": np.float32(
+                np.linalg.norm(
+                    base_linear_velocity(data)[:2]
+                    - (
+                        np.zeros(2)
+                        if control.cmd_base_vel is None
+                        else np.asarray(
+                            control.cmd_base_vel, dtype=np.float64
+                        ).reshape(-1)[:2]
+                    )
+                )
+            ),
+            # Filled in at finalize, from the whole episode's degradation signals.
+            "operating_regime": np.asarray("nominal", dtype=REGIME_DTYPE),
+            "post_failure": np.bool_(False),
+            "valid": np.bool_(True),
             # ── privileged ───────────────────────────────────────────────────
             "base_quat": np.asarray(imu_true["quat"], dtype=np.float32),
             "base_pos": base_pos.astype(np.float32),
+            "grf_mean_world": grf_mean_world.reshape(-1).astype(np.float32),
             "grf_mean_n": reduced["mean"].astype(np.float32),
             "grf_max_n": reduced["max"].astype(np.float32),
             "joint_torque_cmd": tau_cmd.astype(np.float32),
@@ -404,23 +458,266 @@ class StepSampler:
             "foot_height_terrain": foot_height.astype(np.float32),
             "foot_clearance": foot_clearance.astype(np.float32),
             "base_height_terrain": np.float32(base_pos[2] - terrain_under_base),
+            # Degradation signals. These three plus base_height_terrain are what
+            # operating_regime is derived from at the end of the episode.
+            "base_tilt_deg": np.float32(
+                base_tilt_deg(np.asarray(imu_true["quat"]).reshape(1, 4))[0]
+            ),
+            "non_foot_contact_n": np.float32(non_foot_contact_n),
             # ── deprecated v3 aliases, kept so old loaders keep working ───────
             "imu_acc": np.asarray(data.qacc[:3], dtype=np.float32),
             "imu_gyro": np.asarray(data.qvel[3:6], dtype=np.float32),
             "joint_torque": tau_cmd.astype(np.float32),
+            "grf_world": grf_world.reshape(-1).astype(np.float32),
             "rare_contact": np.bool_(is_rare_contact(contact)),
         }
 
-    def to_metadata(self) -> Dict[str, Any]:
+    def to_metadata(self, attitude_error: Dict[str, Any] | None = None) -> Dict[str, Any]:
         return {
             "imu": self.imu.to_metadata(),
-            "attitude_estimator": self.attitude.to_metadata(),
+            "attitude_estimator": {
+                **self.attitude.to_metadata(),
+                **(
+                    {"measured_error_deg": attitude_error}
+                    if attitude_error else {}
+                ),
+            },
             "foot_collision_radius_m": float(self.foot_collision_radius),
             "height_contact_threshold_m": float(self.height_contact_threshold_m),
             "foot_sites": list(self.foot_site_names),
             "actuator_force_limit_n_m": [
                 None if not np.isfinite(v) else float(v) for v in self.force_limit
             ],
+        }
+
+
+def _roll_pitch(quat_wxyz: np.ndarray) -> "NDArray[np.float64]":
+    """Roll and pitch ``(T, 2)`` [rad] from a ``(T, 4)`` wxyz quaternion trace."""
+    q = np.asarray(quat_wxyz, dtype=np.float64).reshape(-1, 4)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = np.arcsin(np.clip(2.0 * (w * y - z * x), -1.0, 1.0))
+    return np.stack([roll, pitch], axis=1)
+
+
+class RunStatistics:
+    """
+    Run-level statistics that describe the collected data rather than gate it.
+
+    Three blocks, each answering a question that the audited run could not:
+
+    ``grf_statistics``
+        The per-foot force distribution. Max single-foot GRF is 3.3x body weight
+        at touchdown against a 73.9 N stance median, so an L2 loss is dominated
+        by transients: a loss design needs the numbers, and stance and transient
+        error have to be reported separately.
+
+    ``coverage``
+        What the commands, friction and payload actually spanned. The audited run
+        held one constant command for a whole 60 s episode, never reversed, and
+        never went below mu = 1.22. That is fine for a targeted collection and
+        fatal if a reader assumes the folder is representative — nothing in the
+        metadata said which it was. This block is recorded, never gated:
+        ``tools/make_manifest.py`` asserts coverage over the POOLED dataset,
+        which is where the claim actually has to hold.
+
+    ``attitude_estimator``
+        Measured error of the complementary filter against ``base_quat``. An
+        accelerometer-referenced gravity estimate biases while the body
+        accelerates: that is physically correct, and it means ``foot_pos_yawbase``
+        carries a velocity-correlated bias its ``_true`` twin does not.
+
+    Every trace is subsampled per episode, so memory stays flat over a long run.
+    """
+
+    MAX_PER_EPISODE = 5_000
+
+    def __init__(
+        self,
+        rng_seed: int = 0,
+        regime_config: OperatingRegimeConfig | None = None,
+    ) -> None:
+        self._rng = np.random.default_rng(rng_seed)
+        self.regime_config = (
+            regime_config if regime_config is not None else OperatingRegimeConfig()
+        )
+        self.regime_totals: Dict[str, int] = {}
+        self.degraded_non_crash_episodes: List[str] = []
+        self.stance_grf_n: List[np.ndarray] = []
+        self.cmd: List[np.ndarray] = []
+        self.realised_speed: List[np.ndarray] = []
+        self.attitude_error_deg: List[np.ndarray] = []
+        self.friction: List[float] = []
+        self.payload_kg: List[float] = []
+        self.segments_per_episode: List[int] = []
+        self.terminate_reasons: Dict[str, int] = {}
+        self.contact_bits_seen: set[str] = set()
+
+    def _thin(self, values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values)
+        if len(values) <= self.MAX_PER_EPISODE:
+            return values
+        keep = self._rng.choice(len(values), self.MAX_PER_EPISODE, replace=False)
+        return values[np.sort(keep)]
+
+    def add_episode(self, record: EpisodeRecord) -> None:
+        arrays = record.arrays
+        metadata = record.metadata
+
+        grf = np.asarray(arrays["grf_base"], dtype=np.float64).reshape(-1, 4, 3)
+        magnitude = np.linalg.norm(grf, axis=2)
+        contact = np.asarray(arrays["contact"], dtype=bool).reshape(-1, 4)
+        loaded = magnitude[contact]
+        if loaded.size:
+            self.stance_grf_n.append(self._thin(loaded))
+
+        self.cmd.append(
+            self._thin(np.asarray(arrays["cmd_base_vel"], dtype=np.float64))
+        )
+        velocity = np.asarray(arrays["base_lin_vel"], dtype=np.float64).reshape(-1, 3)
+        self.realised_speed.append(
+            self._thin(np.linalg.norm(velocity[:, :2], axis=1))
+        )
+
+        error = _roll_pitch(arrays["base_quat_est"]) - _roll_pitch(arrays["base_quat"])
+        self.attitude_error_deg.append(self._thin(np.degrees(error)))
+
+        if metadata.friction is not None:
+            self.friction.append(float(metadata.friction))
+        if metadata.payload_kg is not None:
+            self.payload_kg.append(float(metadata.payload_kg))
+        self.segments_per_episode.append(
+            int(np.unique(np.asarray(arrays["cmd_segment_id"])).size)
+        )
+        reason = str(metadata.terminate_reason or "unknown")
+        self.terminate_reasons[reason] = self.terminate_reasons.get(reason, 0) + 1
+
+        regime = np.asarray(arrays["operating_regime"]).astype(str)
+        for name, count in regime_counts(regime).items():
+            self.regime_totals[name] = self.regime_totals.get(name, 0) + count
+        # An episode that ended cleanly but spent time degraded is the case the
+        # crash predicate could never see: episode 00023 of the audited run
+        # terminated `goal_reached` with 76.2% of frames below 0.20 m.
+        if metadata.terminate_by != "failure" and (regime != "nominal").mean() > 0.10:
+            self.degraded_non_crash_episodes.append(metadata.episode_id)
+        for bits in np.unique(contact.astype(np.uint8), axis=0):
+            self.contact_bits_seen.add("".join(str(int(b)) for b in bits))
+
+    # ── reports ──────────────────────────────────────────────────────────────
+
+    def grf_statistics(self) -> Dict[str, Any]:
+        if not self.stance_grf_n:
+            return {}
+        values = np.concatenate(self.stance_grf_n)
+        return {
+            "per_foot_norm_median_stance_n": float(np.median(values)),
+            "per_foot_norm_p99_n": float(np.percentile(values, 99)),
+            "per_foot_norm_max_n": float(values.max()),
+            "samples": int(values.size),
+            "note": (
+                "Single-foot GRF peaks at several times body weight on touchdown "
+                "against a much lower stance median. Consider a Huber loss or a "
+                "log-magnitude target, and report stance vs transient error "
+                "separately."
+            ),
+        }
+
+    def coverage(self) -> Dict[str, Any]:
+        if not self.cmd:
+            return {}
+        cmd = np.concatenate(self.cmd, axis=0).reshape(-1, 3)
+        speed = np.concatenate(self.realised_speed)
+        warnings_out: List[str] = []
+        if (cmd[:, 0] < -0.1).mean() < 0.05:
+            warnings_out.append("no (or almost no) reverse commands")
+        if (np.abs(cmd[:, 2]) > 0.3).mean() < 0.10:
+            warnings_out.append("turning under-sampled")
+        if self.segments_per_episode and float(
+            np.mean(self.segments_per_episode)
+        ) < 2.0:
+            warnings_out.append("single command segment per episode")
+        if self.friction and min(self.friction) >= 1.0:
+            warnings_out.append("friction >= 1.0, no slip conditions present")
+        if len(self.contact_bits_seen) < 16:
+            warnings_out.append(
+                f"{len(self.contact_bits_seen)} of 16 contact patterns present"
+            )
+        return {
+            "cmd_vx": {
+                "min": float(cmd[:, 0].min()),
+                "max": float(cmd[:, 0].max()),
+                "frac_negative": float((cmd[:, 0] < -0.1).mean()),
+            },
+            "cmd_vy": {"min": float(cmd[:, 1].min()), "max": float(cmd[:, 1].max())},
+            "cmd_yaw": {
+                "min": float(cmd[:, 2].min()),
+                "max": float(cmd[:, 2].max()),
+                "frac_abs_gt_0p3": float((np.abs(cmd[:, 2]) > 0.3).mean()),
+            },
+            "realised_speed": {
+                "p50": float(np.percentile(speed, 50)),
+                "p95": float(np.percentile(speed, 95)),
+            },
+            "cmd_segments_per_episode_mean": (
+                float(np.mean(self.segments_per_episode))
+                if self.segments_per_episode else 0.0
+            ),
+            "friction": (
+                {"min": min(self.friction), "max": max(self.friction)}
+                if self.friction else {}
+            ),
+            "payload_kg": (
+                {"min": min(self.payload_kg), "max": max(self.payload_kg)}
+                if self.payload_kg else {}
+            ),
+            "terminate_reason": dict(sorted(self.terminate_reasons.items())),
+            "contact_bits_present": len(self.contact_bits_seen),
+            "warnings": warnings_out,
+            "note": (
+                "Recorded, not gated. A narrow folder is legitimate; a narrow "
+                "POOLED dataset is not, and that is what make_manifest.py "
+                "asserts."
+            ),
+        }
+
+    def operating_regime(self) -> Dict[str, Any]:
+        """The regime census, and which healthy-looking episodes were degraded."""
+        if not self.regime_totals:
+            return {}
+        total = max(sum(self.regime_totals.values()), 1)
+        return {
+            "config": self.regime_config.to_metadata(),
+            "counts": dict(self.regime_totals),
+            "fractions": {
+                name: count / total for name, count in self.regime_totals.items()
+            },
+            "non_crash_episodes_with_degraded_frames": list(
+                self.degraded_non_crash_episodes
+            ),
+            "note": (
+                "Degraded frames are kept, not discarded: dragging feet and "
+                "unplanned body contact are exactly the regime a contact "
+                "estimator should be tested on. Report nominal and degraded "
+                "accuracy separately."
+            ),
+        }
+
+    def attitude_error(self) -> Dict[str, Any]:
+        if not self.attitude_error_deg:
+            return {}
+        error = np.concatenate(self.attitude_error_deg, axis=0).reshape(-1, 2)
+        return {
+            "roll_rms": float(np.sqrt(np.mean(error[:, 0] ** 2))),
+            "pitch_rms": float(np.sqrt(np.mean(error[:, 1] ** 2))),
+            "roll_median_bias": float(np.median(error[:, 0])),
+            "pitch_median_bias": float(np.median(error[:, 1])),
+            "note": (
+                "Accelerometer-referenced gravity estimate biases with body "
+                "acceleration. Expected and realistic; foot_pos_yawbase inherits "
+                "it, foot_pos_yawbase_true does not. Report base vs yawbase as an "
+                "explicit ablation (manifest input_sets) rather than choosing "
+                "silently."
+            ),
         }
 
 
@@ -440,6 +737,9 @@ class EpisodeRecorderConfig:
     test_ratio: float = 0.10
     split_seed: int = 0
     contact_labeling: ContactLabelConfig = field(default_factory=ContactLabelConfig)
+    operating_regime: OperatingRegimeConfig = field(
+        default_factory=OperatingRegimeConfig
+    )
 
 
 class EpisodeRecorder:
@@ -500,6 +800,9 @@ class EpisodeRecorder:
         self._sampler: StepSampler | None = None
         self._accumulator = SubstepForceAccumulator(config=self.config.contact_labeling)
         self._debouncer = ContactDebouncer(self.config.contact_labeling)
+        # Non-foot contact force is averaged over the same substeps as the GRF,
+        # so a one-substep graze does not register as a body strike.
+        self._non_foot_forces: List[float] = []
         self._control: ControlSample | None = None
 
         self._episode_index = 0
@@ -515,11 +818,16 @@ class EpisodeRecorder:
         # Physical conditions in effect for the episode being buffered.
         self._friction: float | None = None
         self._payload_kg: float | None = None
+        self._body_weight_n: float = DEFAULT_BODY_WEIGHT_N
         self._seed: int | None = None
         self._episode_randomization: dict | None = None
         self.episode_randomization: Dict[str, dict] = {}
         self.clipping_audits: List[Dict[str, float]] = []
+        self.clipping_audits_non_nominal: List[Dict[str, float]] = []
         self.contact_statistics: List[Dict[str, float]] = []
+        self.run_statistics = RunStatistics(
+            regime_config=self.config.operating_regime
+        )
         ensure_signal_bounds_file(robot=self.robot or "go2")
         self._bounds = load_signal_bounds(robot=self.robot or "go2")
 
@@ -563,6 +871,7 @@ class EpisodeRecorder:
         for values in self._buffer.values():
             values.clear()
         self._accumulator.clear()
+        self._non_foot_forces.clear()
         self._debouncer.reset()
         if self._sampler is not None:
             self._sampler.attitude.reset()
@@ -576,6 +885,7 @@ class EpisodeRecorder:
         *,
         friction: float | None = None,
         payload_kg: float | None = None,
+        body_weight_n: float | None = None,
         randomization: dict | None = None,
         seed: int | None = None,
         mode: str | None = None,
@@ -591,6 +901,8 @@ class EpisodeRecorder:
         """
         self._friction = None if friction is None else float(friction)
         self._payload_kg = None if payload_kg is None else float(payload_kg)
+        if body_weight_n is not None:
+            self._body_weight_n = float(body_weight_n)
         self._episode_randomization = None if not randomization else dict(randomization)
         self._seed = None if seed is None else int(seed)
         if mode is not None:
@@ -682,7 +994,10 @@ class EpisodeRecorder:
         sampler = self._sampler
 
         # Every sim substep contributes to the interval's force statistics.
-        self._accumulator.push(sampler.foot_normal_force(data))
+        self._accumulator.push(sampler.foot_grf_world(data))
+        self._non_foot_forces.append(
+            non_foot_contact_force(model, data, contact_ids)
+        )
 
         self._sim_step += 1
         if self._sim_step % self._decim != 0:
@@ -695,7 +1010,14 @@ class EpisodeRecorder:
 
         reduced = self._accumulator.reduce()
         contact = self._debouncer.step(reduced["mean"])
-        row = sampler.row(data, control, base_force_pert, reduced, contact)
+        non_foot_n = (
+            float(np.mean(self._non_foot_forces)) if self._non_foot_forces else 0.0
+        )
+        self._non_foot_forces.clear()
+        row = sampler.row(
+            data, control, base_force_pert, reduced, contact,
+            non_foot_contact_n=non_foot_n,
+        )
 
         for name, value in row.items():
             self._buffer[name].append(value)
@@ -730,6 +1052,21 @@ class EpisodeRecorder:
         arrays["dt_since_transition"] = dt_since_transition(
             arrays["contact"], 1.0 / self.config.control_hz
         )
+
+        # How degraded the locomotion was, frame by frame. Derived here rather
+        # than online only because the dwell filter is cleaner over a whole
+        # trace; it is causal either way, so nothing about the column depends on
+        # the future.
+        regime = classify_regime(
+            arrays["base_height_terrain"],
+            arrays["base_tilt_deg"],
+            arrays["non_foot_contact_n"],
+            arrays["cmd_tracking_error"],
+            config=self.config.operating_regime,
+        )
+        arrays["operating_regime"] = regime.astype(REGIME_DTYPE, copy=False)
+        arrays["post_failure"] = (regime == "failed")
+        arrays["valid"] = np.isin(regime, ("nominal", "degraded"))
         return arrays
 
     def _finalize_episode(self, *, reason: str = "event") -> bool:
@@ -759,6 +1096,7 @@ class EpisodeRecorder:
             substeps_per_control=self._decim,
             friction=self._friction,
             payload_kg=self._payload_kg,
+            body_weight_n=self._body_weight_n,
             terminate_by=outcome.value,
             terminate_reason=reason,
             seed=self._seed,
@@ -775,14 +1113,32 @@ class EpisodeRecorder:
             reset_randomization=knobs,
         )
         arrays = self._build_arrays()
+        metadata.frac_nominal = float(
+            (np.asarray(arrays["operating_regime"]).astype(str) == "nominal").mean()
+        )
         record = EpisodeRecord(metadata=metadata, arrays=arrays)
 
-        # Clipping is audited over EVERY row: the gate asks how much of the
-        # encoded image saturates, and a loader that keeps crash frames encodes
-        # them too. (Chatter is different — a tumbling robot genuinely has
-        # erratic contacts, so that statistic excludes post-failure frames.)
-        usable = ~self.bucket.post_failure_mask(record)
-        self.clipping_audits.append(clipping_audit(arrays, self._bounds))
+        # Clipping is audited over NOMINAL rows, and reported separately for
+        # the rest. Over every row it measured a fallen robot: 83.1% of the
+        # clipping rows on the audited run were in crash episodes, which are
+        # 9.9% of the data, and the natural response — widening the bound —
+        # would waste PI dynamic range for the ordinary walking that the model
+        # is actually trained on.
+        regime = np.asarray(arrays["operating_regime"]).astype(str)
+        nominal = regime == "nominal"
+        self.clipping_audits.append(
+            clipping_audit(arrays, self._bounds, mask=nominal, scope=NOMINAL_SCOPE)
+        )
+        self.clipping_audits_non_nominal.append(
+            clipping_audit(
+                arrays, self._bounds, mask=~nominal,
+                scope="operating_regime != 'nominal'",
+            )
+        )
+        self.run_statistics.add_episode(record)
+        # Chatter excludes the frames where the robot was no longer walking: a
+        # tumbling robot genuinely has erratic contacts.
+        usable = np.isin(regime, ("nominal", "degraded"))
         stats = contact_run_statistics(
             arrays["contact"][usable], self.config.control_hz
         )
@@ -812,8 +1168,21 @@ class EpisodeRecorder:
     # ── run-level reporting ──────────────────────────────────────────────────
 
     def clipping_audit(self) -> Dict[str, Any]:
-        """Run-level clipping audit: counts summed, fractions recomputed."""
-        return merge_clipping_audits(self.clipping_audits)
+        """
+        Run-level clipping audit over nominal rows, with the rest as a diagnostic.
+
+        Counts summed and fractions recomputed, rather than averaged: a 61-step
+        episode must not weigh as much as a 3,000-step one.
+        """
+        audit = merge_clipping_audits(self.clipping_audits, scope=NOMINAL_SCOPE)
+        non_nominal = merge_clipping_audits(
+            self.clipping_audits_non_nominal,
+            scope="operating_regime != 'nominal'",
+        )
+        audit["non_nominal_per_element"] = non_nominal.get("per_element", {})
+        audit["non_nominal_per_row_any"] = non_nominal.get("per_row_any", {})
+        audit["non_nominal_counts"] = non_nominal.get("counts", {})
+        return audit
 
     def contact_quality(self) -> Dict[str, float]:
         """
@@ -894,6 +1263,11 @@ class SimCollectionHooks:
         """Record only while ``active``; closing the gate ends the episode."""
         return False
 
+    @property
+    def episode_seconds(self) -> float:
+        """Seconds buffered into the episode currently open (0 when disabled)."""
+        return 0.0
+
     def finish(self, default_out: str) -> None:
         """Flush buffer, print summary, write the dataset (no-op when disabled)."""
 
@@ -902,6 +1276,7 @@ class SimCollectionHooks:
         *,
         friction: float | None = None,
         payload_kg: float | None = None,
+        body_weight_n: float | None = None,
         randomization: dict | None = None,
         seed: int | None = None,
         mode: str | None = None,
@@ -938,7 +1313,18 @@ class _ActiveCollectionHooks(SimCollectionHooks):
             "episode_randomization": dict(self._recorder.episode_randomization),
             "clipping_audit": self._recorder.clipping_audit(),
             "contact_quality": self._recorder.contact_quality(),
-            **({"sampler": sampler.to_metadata()} if sampler is not None else {}),
+            "grf_statistics": self._recorder.run_statistics.grf_statistics(),
+            "coverage": self._recorder.run_statistics.coverage(),
+            "operating_regime": self._recorder.run_statistics.operating_regime(),
+            **(
+                {
+                    "sampler": sampler.to_metadata(
+                        self._recorder.run_statistics.attitude_error()
+                    )
+                }
+                if sampler is not None
+                else {}
+            ),
         }
 
     def on_ready(self) -> None:
@@ -960,6 +1346,7 @@ class _ActiveCollectionHooks(SimCollectionHooks):
         *,
         friction: float | None = None,
         payload_kg: float | None = None,
+        body_weight_n: float | None = None,
         randomization: dict | None = None,
         seed: int | None = None,
         mode: str | None = None,
@@ -967,6 +1354,7 @@ class _ActiveCollectionHooks(SimCollectionHooks):
         self._recorder.set_episode_conditions(
             friction=friction,
             payload_kg=payload_kg,
+            body_weight_n=body_weight_n,
             randomization=randomization,
             seed=seed,
             mode=mode,
@@ -974,6 +1362,12 @@ class _ActiveCollectionHooks(SimCollectionHooks):
 
     def set_control(self, control: ControlSample | None) -> None:
         self._recorder.set_control(control)
+
+    @property
+    def episode_seconds(self) -> float:
+        return (
+            self._recorder.buffer_control_steps / self._recorder.config.control_hz
+        )
 
     def after_physics_step(
         self,
@@ -1061,14 +1455,83 @@ class _ActiveCollectionHooks(SimCollectionHooks):
                 flush=True,
             )
 
+        regime = self._recorder.run_statistics.operating_regime()
+        if regime:
+            shares = "  ".join(
+                f"{name}={100 * fraction:.1f}%"
+                for name, fraction in regime["fractions"].items()
+            )
+            print(f"[collect] operating regime: {shares}", flush=True)
+            degraded = regime["non_crash_episodes_with_degraded_frames"]
+            if degraded:
+                print(
+                    f"[collect] {len(degraded)} episode(s) ended cleanly but spent "
+                    f">10% of their frames degraded: {degraded[:5]}",
+                    flush=True,
+                )
+
+        coverage = self._recorder.run_statistics.coverage()
+        for warning in coverage.get("warnings", []):
+            print(f"[collect] coverage warning: {warning}", flush=True)
+        grf = self._recorder.run_statistics.grf_statistics()
+        if grf:
+            print(
+                f"[collect] GRF per foot in stance: "
+                f"median={grf['per_foot_norm_median_stance_n']:.1f} N  "
+                f"p99={grf['per_foot_norm_p99_n']:.1f} N  "
+                f"max={grf['per_foot_norm_max_n']:.1f} N",
+                flush=True,
+            )
+
         if self._recorder.bucket.total_samples_stored > 0:
             index_path = self._write_disk()
             print(
                 f"[collect] dataset written → {index_path.parent.resolve()}",
                 flush=True,
             )
+            self._validate_and_gate()
         else:
             print("[collect] no samples stored — dataset not written", flush=True)
+
+    def _validate_and_gate(self) -> None:
+        """
+        Validate the finished run and quarantine it if it fails.
+
+        The gate has to run here, in the collection job, or it does not run at
+        all: the audited folder shipped with three channels over a limit its own
+        metadata declared.
+        """
+        output = self._profile.output
+        if not output.validate_after_run:
+            return
+        try:
+            from tools.validate_run import quarantine, run_checks  # noqa: PLC0415
+        except ImportError as exc:  # pragma: no cover - depends on cwd
+            print(
+                f"[collect] validation skipped: cannot import tools.validate_run "
+                f"({exc}). Run `python tools/validate_run.py {self._run_dir}` by hand.",
+                flush=True,
+            )
+            return
+
+        report, failed = run_checks(
+            self._run_dir, skip=output.validate_skip, verbose=False
+        )
+        if not failed:
+            print(
+                f"[collect] validation passed "
+                f"({len(report)} checks, {len(output.validate_skip)} groups skipped)",
+                flush=True,
+            )
+            return
+
+        print(f"[collect] validation FAILED — {failed} check(s):", flush=True)
+        for name, result in report.items():
+            if result.startswith("FAIL"):
+                print(f"    {name}: {result[:160]}", flush=True)
+        if output.quarantine_failed_runs:
+            moved = quarantine(self._run_dir, Path(output.output_root_dir))
+            print(f"[collect] quarantined → {moved}", flush=True)
 
 
 _NULL_HOOKS = _NullCollectionHooks()
@@ -1085,6 +1548,7 @@ def setup_sim_collection(
     collect_out: str | None = None,
     name_prefix: str = "loco",
     cfg: DatasetCollectionConfig | None = None,
+    register_atexit: bool = True,
 ) -> SimCollectionHooks:
     """Create collection hooks for a simulator, or a no-op stub when disabled."""
     profile = cfg if cfg is not None else dataset_collection_config
@@ -1194,8 +1658,104 @@ def setup_sim_collection(
             "signal_bounds_path": str(default_signal_bounds_path()),
         },
     )
-    atexit.register(hooks.finish, "")
+    if register_atexit:
+        atexit.register(hooks.finish, "")
     return hooks
+
+
+def setup_multi_env_collection(
+    enabled: bool,
+    n_env: int,
+    *,
+    gait_type: GaitType,
+    scene: str,
+    sim_hz: float,
+    robot: str,
+    episode_duration_s: float | None = None,
+    collect_out: str | None = None,
+    name_prefix: str = "loco",
+    cfg: DatasetCollectionConfig | None = None,
+) -> "MultiEnvCollectionHooks":
+    """N episode buffers, one run directory. Used by the multi-env collector."""
+    if n_env < 1:
+        raise ValueError(f"n_env must be >= 1, got {n_env}")
+    profile = cfg if cfg is not None else dataset_collection_config
+    if not (enabled or profile.enabled):
+        return MultiEnvCollectionHooks(
+            enabled=False,
+            env=tuple(_NULL_HOOKS for _ in range(n_env)),
+        )
+
+    first = setup_sim_collection(
+        True,
+        gait_type=gait_type,
+        scene=scene,
+        sim_hz=sim_hz,
+        robot=robot,
+        episode_duration_s=episode_duration_s,
+        collect_out=collect_out,
+        name_prefix=name_prefix,
+        cfg=profile,
+        register_atexit=False,
+    )
+    assert isinstance(first, _ActiveCollectionHooks)
+    rec0 = first._recorder
+    run_name = Path(first._run_dir).name
+    rec0.episode_prefix = f"{run_name}_e00"
+    env_hooks: list[SimCollectionHooks] = [first]
+    for i in range(1, n_env):
+        recorder = EpisodeRecorder(
+            rec0.bucket,
+            gait_type=rec0.gait_type,
+            terrain_type=rec0.terrain_type,
+            sim_hz=sim_hz,
+            config=rec0.config,
+            episode_prefix=f"{run_name}_e{i:02d}",
+            sensor_noise=SensorNoise.from_config(
+                dt=1.0 / rec0.config.control_hz,
+                cfg=sensor_noise_config,
+            ),
+            robot=rec0.robot,
+            scene=rec0.scene,
+            run_id=run_name,
+        )
+        env_hooks.append(
+            _ActiveCollectionHooks(
+                recorder,
+                run_dir=first._run_dir,
+                profile=profile,
+                metadata={**first._metadata, "env_index": i, "n_env": n_env},
+            )
+        )
+    first._metadata = {**first._metadata, "env_index": 0, "n_env": n_env}
+    wrapper = MultiEnvCollectionHooks(enabled=True, env=tuple(env_hooks))
+    atexit.register(wrapper.finish, "")
+    print(f"[collect] multi-env: {n_env} CPU worlds → {first._run_dir}", flush=True)
+    return wrapper
+
+
+class MultiEnvCollectionHooks:
+    """One disk run, N independent episode buffers."""
+
+    def __init__(self, *, enabled: bool, env: tuple[SimCollectionHooks, ...]):
+        self.enabled = enabled
+        self.env = env
+
+    def on_ready(self) -> None:
+        for hooks in self.env:
+            hooks.on_ready()
+
+    def finish(self, default_out: str = "") -> None:
+        if not self.enabled:
+            return
+        # Flush every buffer first; only the first hook writes/validates the
+        # shared bucket so atexit does not run N validations.
+        children = self.env[1:]
+        for hooks in children:
+            if isinstance(hooks, _ActiveCollectionHooks) and not hooks._finished:
+                hooks._recorder.flush_partial()
+                hooks._finished = True
+        self.env[0].finish(default_out)
 
 
 def create_collection_session(
@@ -1221,10 +1781,11 @@ def create_collection_session(
     x = profile.export
 
     bucket = DatasetBucketSystem(
-        bucket_capacity=bucket_capacity if bucket_capacity is not None else b.bucket_capacity,
-        contact_force_threshold=b.contact_force_threshold,
-        perturbation_force_threshold=b.perturbation_force_threshold,
-        min_perturbation_ratio=b.min_perturbation_ratio,
+        config=b,
+        bucket_capacity=bucket_capacity,
+        contact_label_config=profile.contact_labeling,
+        regime_config=profile.operating_regime,
+        signal_bounds_version=signal_bounds_version(),
         dataset_summary_path=(
             Path(profile.output.output_root_dir) / DATASET_SUMMARY_FILENAME
         ),
@@ -1252,6 +1813,7 @@ def create_collection_session(
             episode_mode=e.episode_mode,
             label_stride=e.label_stride,
             store_failed_episodes=e.store_failed_episodes,
+            operating_regime=profile.operating_regime,
             val_ratio=x.val_ratio,
             test_ratio=x.test_ratio,
             split_seed=x.split_seed,

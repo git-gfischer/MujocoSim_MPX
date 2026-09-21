@@ -5,6 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from mpx.utils.dataset_collection.contact_labeling import debounce_sequence
+
 from mpx.utils.dataset_collection.dataset_bucket_system import (
     contact_state_name,
     is_rare_contact,
@@ -18,7 +20,6 @@ from mpx.utils.dataset_collection.dataset_schema import (
     EpisodeRecord,
     assign_split,
     classify_termination,
-    contact_bits_from_grf,
     dt_since_transition,
     empty_arrays,
     flatten_inputs,
@@ -42,7 +43,27 @@ def test_every_requested_channel_has_a_column():
 
 def test_ground_truth_channels_are_targets():
     target_names = {c.name for c in TARGET_COLUMNS}
-    assert target_names == {"contact", "grf_world", "external_force", "base_lin_vel"}
+    assert target_names == {
+        "contact", "grf_base", "grf_yawbase", "external_force", "base_lin_vel",
+    }
+
+
+def test_the_grf_target_is_body_frame_and_the_world_one_is_deprecated():
+    """
+    A world-frame GRF cannot be the target of a symmetry-equivariant model.
+
+    It is not equivariant under the robot's morphological symmetry group, so
+    every yaw-invariance argument an MI-HGNN / ECNN-style method makes breaks on
+    it. The instantaneous world-frame column is also aliased (0 N on 1.9% of
+    in-contact frames), which is a separate reason not to regress against it.
+    """
+    from mpx.utils.dataset_collection.dataset_schema import COLUMNS_BY_NAME
+
+    assert COLUMNS_BY_NAME["grf_base"].role == "target"
+    assert COLUMNS_BY_NAME["grf_base"].frame == "base"
+    assert COLUMNS_BY_NAME["grf_yawbase"].frame == "yaw_base"
+    assert COLUMNS_BY_NAME["grf_world"].role == "deprecated"
+    assert COLUMNS_BY_NAME["grf_mean_world"].role == "privileged"
 
 
 def test_contact_target_is_four_binaries():
@@ -81,16 +102,27 @@ def test_validate_arrays_rejects_a_ragged_column():
 
 # ── contact derivation ───────────────────────────────────────────────────────
 
-def test_contact_bits_threshold_force_magnitude():
-    grf = np.zeros((3, 4, 3))
-    grf[0, :, 2] = 40.0          # all four feet loaded
-    grf[1, 0, 2] = 40.0          # FL only
-    grf[2, 0, 2] = 1.0           # FL below threshold
+def test_contact_labels_come_from_the_debouncer_not_a_second_threshold():
+    """
+    There is exactly one definition of contact, and it is not in this module.
 
-    bits = contact_bits_from_grf(grf, contact_force_threshold=5.0)
-    np.testing.assert_array_equal(bits[0], [1, 1, 1, 1])
-    np.testing.assert_array_equal(bits[1], [1, 0, 0, 0])
-    np.testing.assert_array_equal(bits[2], [0, 0, 0, 0])
+    ``contact_bits_from_grf`` was a plain ``|GRF| > 5 N`` rule that production
+    never used — the recorder runs the debouncer — but it stayed reachable, kept
+    a third contact threshold alive in the config, and labelled the synthetic
+    test fixtures, so those fixtures disagreed with production on 8.6% of rows.
+    """
+    import mpx.utils.dataset_collection.dataset_schema as schema
+
+    assert not hasattr(schema, "contact_bits_from_grf")
+
+    # The surviving path: substep force -> Schmitt trigger -> minimum dwell.
+    force = np.zeros((40, 4))
+    force[:, 0] = 40.0                        # FL loaded throughout
+    force[10:30, 1] = 40.0                    # FR loaded in the middle
+    bits = debounce_sequence(force)
+    assert bits.shape == (40, 4)
+    np.testing.assert_array_equal(bits[:, 0], np.ones(40, dtype=np.uint8))
+    assert bits[20, 1] == 1 and bits[39, 1] == 0
 
 
 def test_single_foot_stance_gets_its_own_name():

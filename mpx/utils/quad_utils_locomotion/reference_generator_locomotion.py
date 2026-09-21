@@ -249,8 +249,9 @@ def whole_body_interface(model, mjx_model, contact_id, body_id,sim_frequency,Kp,
     mjx_data = mjx.fwd_position(mjx_model, mjx_data)
     mjx_data = mjx.fwd_velocity(mjx_model, mjx_data)
 
-    # Extract the mass matrix and bias forces
-    M = mjx_data.qM
+    # Extract the dense mass matrix and bias forces. MJX no longer exposes
+    # ``qM``; ``full_m`` is the same dense nv×nv matrix the rest of MPX uses.
+    M = mjx.full_m(mjx_model, mjx_data)
     D = mjx_data.qfrc_bias
 
     # Get the positions of the contact points on the legs

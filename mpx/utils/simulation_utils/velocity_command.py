@@ -91,6 +91,11 @@ class VelocityCommandSampler:
     dt: float = 0.02
     rng: np.random.Generator = field(default_factory=np.random.default_rng)
 
+    # The envelope as configured, kept so per-episode rescaling always starts
+    # from the nominal ranges. Scaling the live config in place would compound:
+    # three episodes at 0.5x would leave the range at 0.125x.
+    _nominal: VelocityCommandConfig = field(default=None, init=False, repr=False)
+
     segment_id: int = field(default=-1, init=False)
     _command: np.ndarray = field(
         default_factory=lambda: np.zeros(3, dtype=np.float64), init=False, repr=False
@@ -103,6 +108,47 @@ class VelocityCommandSampler:
     )
     _elapsed: float = field(default=0.0, init=False, repr=False)
     _hold: float = field(default=0.0, init=False, repr=False)
+
+    def scale_ranges(
+        self,
+        max_speed: float | None = None,
+        max_yaw_rate: float | None = None,
+    ) -> None:
+        """
+        Rescale the command envelope for a new episode.
+
+        This is what makes the per-episode ``max_speed`` / ``max_yaw_rate`` knobs
+        mean something in segments mode. Without it the randomizer sampled them,
+        stamped them into the episode metadata, and the sampler went on using its
+        fixed range — so the metadata claimed a condition that was never applied,
+        and two episodes with identical real conditions got different
+        ``randomization_group_id`` values.
+
+        The linear ranges scale together, preserving the lateral-to-forward ratio
+        of the nominal config, so a slower episode is slower in every direction
+        rather than differently shaped.
+        """
+        import copy  # noqa: PLC0415
+
+        if self._nominal is None:
+            self._nominal = copy.deepcopy(self.config)
+        nominal = self._nominal
+
+        if max_speed is not None:
+            span = max(abs(nominal.vx_mps[0]), abs(nominal.vx_mps[1])) or 1.0
+            factor = float(max_speed) / span
+            self.config.vx_mps = tuple(v * factor for v in nominal.vx_mps)
+            self.config.vy_mps = tuple(v * factor for v in nominal.vy_mps)
+            # Scale the "is this segment worth sampling" floor with the envelope,
+            # or a slow episode would reject almost every draw.
+            self.config.min_speed_mps = nominal.min_speed_mps * factor
+
+        if max_yaw_rate is not None:
+            span = max(
+                abs(nominal.yaw_rate_rps[0]), abs(nominal.yaw_rate_rps[1])
+            ) or 1.0
+            factor = float(max_yaw_rate) / span
+            self.config.yaw_rate_rps = tuple(v * factor for v in nominal.yaw_rate_rps)
 
     def reset(self) -> None:
         """Start a new episode from standstill and draw the first segment."""

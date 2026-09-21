@@ -1,11 +1,22 @@
 """
 Build ``signal_bounds.json`` from the robot, not from a collected dataset.
 
-Joint position and torque come from the MJCF ranges (plus a sensing/limit
-margin). Joint speed is the actuator capability. Foot position and velocity
-are the kinematic envelope of those limits. IMU scales come from the robot's
-PI constraint sheet when one exists, otherwise from conservative locomotion
-envelopes. Trajectories are never fitted.
+Two classes of channel, two rules:
+
+**Sensor channels** use the physical device range. Joint position and torque come
+from the MJCF ranges plus a sensing/limit margin; the IMU uses its full scale
+(+-8 g, +-2000 deg/s). These are what a datasheet reports and what a real sensor
+saturates at, so a model normalised against them transfers to hardware.
+
+**Derived channels** (joint velocity, foot position and velocity) are the
+kinematic envelope of those limits here — a worst case, deliberately not fitted
+to any run. That worst case is far wider than the robot ever reaches: measured
+``|foot velocity|`` peaks at 1.64 m/s against a +-17.5 m/s envelope, so after
+normalisation the whole channel occupies 13 of 256 grey levels and the
+Proprioceptive Image is flat to within quantisation. ``tools/build_signal_bounds.py``
+replaces these with percentiles of a **pooled pilot** spanning every gait,
+terrain and command regime, and records which folders it used. Run it before a
+bulk collection; this module is the fallback when no pilot exists yet.
 """
 
 from __future__ import annotations
@@ -23,8 +34,20 @@ from mpx.utils.dataset_collection.dataset_schema import FOOT_ORDER, JOINT_ORDER
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GRAVITY = 9.81
-SIGNAL_BOUNDS_VERSION = 3
+# v4: IMU bounds are the physical device range rather than a locomotion
+# envelope, and the derived channels may be replaced by pilot percentiles
+# (tools/build_signal_bounds.py).
+SIGNAL_BOUNDS_VERSION = 4
 SCHEMA_VERSION = 1
+
+# Physical sensor ranges. A real IMU saturates at its full-scale setting, so
+# these are what a datasheet reports and what a model trained on them will meet
+# on hardware. The v3 bounds were a locomotion envelope (+-12 m/s^2, +-1.8 rad/s)
+# and clipped the touchdown transients — measured -66.4 to 28.0 m/s^2 on x and
+# -7.45 to 4.59 rad/s on roll rate. Those transients are not outliers: they are
+# where the contact information is.
+IMU_ACC_FULL_SCALE_M_S2 = 78.5      # +-8 g
+IMU_GYRO_FULL_SCALE_RAD_S = 34.9    # +-2000 deg/s
 
 # Extra room past a hard joint stop: MuJoCo limit softness (~0.06 rad observed)
 # plus encoder noise. Kept as a robot/sim property, not a dataset percentile.
@@ -38,15 +61,6 @@ ROBOTS: Dict[str, Dict[str, Any]] = {
         "model_path": REPO_ROOT / "mpx" / "data" / "go2" / "go2_mjx.xml",
         "joint_vel_rad_s": {"HAA": 30.1, "HFE": 30.1, "KFE": 30.1},
         "q0": (0.0, 0.9, -1.8) * 4,
-        "constraints_yaml": (
-            REPO_ROOT
-            / "mpx"
-            / "addons"
-            / "ProprioceptiveImage"
-            / "config"
-            / "robots"
-            / "go2_constrains.yaml"
-        ),
     },
     "spot": {
         "model_path": REPO_ROOT
@@ -56,7 +70,11 @@ ROBOTS: Dict[str, Dict[str, Any]] = {
         / "spot.xml",
         "joint_vel_rad_s": {"HAA": 8.72, "HFE": 12.57, "KFE": 12.57},
         "q0": (0.0, 1.04, -1.8) * 4,
-        "constraints_yaml": None,
+    },
+    "b2": {
+        "model_path": REPO_ROOT / "mpx" / "data" / "b2" / "b2.xml",
+        "joint_vel_rad_s": {"HAA": 12.5, "HFE": 12.5, "KFE": 17.6},
+        "q0": (0.0, 0.9, -1.8) * 4,
     },
 }
 
@@ -135,50 +153,32 @@ def _per_family_joint_limits(
     return families
 
 
-def _load_yaml(path: Path | None) -> Mapping[str, Any]:
-    if path is None or not path.is_file():
-        return {}
-    import yaml
+def _imu_device_bounds() -> Tuple[Dict[str, List[float]], Dict[str, List[float]]]:
+    """
+    IMU bounds from the **device full scale**, not from a locomotion envelope.
 
-    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return payload.get("Constraints", payload)
+    The constraints YAML describes what the robot is expected to do; a sensor
+    bound has to describe what the sensor can report. Using the expectation
+    clipped exactly the samples that matter — touchdown transients — at a
+    per-element rate (0.158% acc, 0.124% gyro) that badly understates the damage,
+    because the clipped samples are not spread uniformly.
 
-
-def _imu_from_constraints(constraints: Mapping[str, Any]) -> Tuple[Dict[str, List[float]], Dict[str, List[float]]]:
-    lin = constraints.get("lin_acc") or {}
-    ang = constraints.get("ang_vel_base") or {}
-    acc_xy = 15.0
-    acc_z = 15.0
-    gyro = {"x": 1.5, "y": 1.5, "z": 3.0}
-    if lin:
-        acc_xy = max(abs(float(lin.get("max_x", acc_xy))), abs(float(lin.get("min_x", acc_xy))))
-        acc_xy = max(
-            acc_xy,
-            abs(float(lin.get("max_y", acc_xy))),
-            abs(float(lin.get("min_y", acc_xy))),
-        )
-        acc_z = max(abs(float(lin.get("max_z", acc_z))), abs(float(lin.get("min_z", acc_z))))
-    if ang:
-        gyro = {
-            "x": max(abs(float(ang.get("max_x", 1.5))), abs(float(ang.get("min_x", 1.5)))),
-            "y": max(abs(float(ang.get("max_y", 1.5))), abs(float(ang.get("min_y", 1.5)))),
-            "z": max(abs(float(ang.get("max_z", 3.0))), abs(float(ang.get("min_z", 3.0)))),
-        }
-    acc_noise = 5.0 * sensor_noise_config.imu_acc_std + 5.0 * sensor_noise_config.imu_acc_bias_init_std
-    gyro_noise = 5.0 * sensor_noise_config.imu_gyro_std + 5.0 * sensor_noise_config.imu_gyro_bias_init_std
+    Full scale is also the honest choice for sim-to-real: it is what a real
+    sensor saturates at, so a model trained against it transfers.
+    """
     acc_bounds = {
-        "x": _pair(-(acc_xy + acc_noise), acc_xy + acc_noise),
-        "y": _pair(-(acc_xy + acc_noise), acc_xy + acc_noise),
-        "z": _pair(GRAVITY - (acc_z + acc_noise), GRAVITY + acc_z + acc_noise),
+        axis: _pair(-IMU_ACC_FULL_SCALE_M_S2, IMU_ACC_FULL_SCALE_M_S2)
+        for axis in ("x", "y", "z")
     }
     gyro_bounds = {
-        axis: _pair(-(limit + gyro_noise), limit + gyro_noise) for axis, limit in gyro.items()
+        axis: _pair(-IMU_GYRO_FULL_SCALE_RAD_S, IMU_GYRO_FULL_SCALE_RAD_S)
+        for axis in ("x", "y", "z")
     }
     return acc_bounds, gyro_bounds
 
 
 def _foot_targets(model: mujoco.MjModel) -> List[Tuple[str, int]]:
-    """Prefer named foot sites; Spot uses geoms ``FL``/``FR``/``HL``/``HR``."""
+    """Prefer named foot sites; else geoms ``FL``/``FR``/``RL``/``RR`` (Spot: ``HL``/``HR``)."""
     targets: List[Tuple[str, int]] = []
     geom_alias = {"RL": "HL", "RR": "HR"}
     for leg in FOOT_ORDER:
@@ -186,8 +186,11 @@ def _foot_targets(model: mujoco.MjModel) -> List[Tuple[str, int]]:
         if site >= 0:
             targets.append(("site", site))
             continue
-        geom_name = geom_alias.get(leg, leg)
-        geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+        geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, leg)
+        if geom < 0:
+            geom = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_GEOM, geom_alias.get(leg, leg)
+            )
         if geom < 0:
             raise ValueError(f"No foot site or geom for {leg}")
         targets.append(("geom", geom))
@@ -295,7 +298,7 @@ def _signal(
 
 
 def build_signal_bounds(robot: str) -> Dict[str, Any]:
-    """Return the global PI bounds dict for ``robot`` (``go2`` or ``spot``)."""
+    """Return the global PI bounds dict for ``robot`` (``go2``, ``spot``, or ``b2``)."""
     key = robot.strip().lower()
     if key not in ROBOTS:
         raise ValueError(f"Unknown robot {robot!r}; expected one of {sorted(ROBOTS)}")
@@ -330,8 +333,7 @@ def build_signal_bounds(robot: str) -> Dict[str, Any]:
             t_lo, t_hi = t_lo * tau_scale - tau_noise, t_hi * tau_scale + tau_noise
             torque_bounds[name] = _pair(t_lo, t_hi)
 
-    constraints = _load_yaml(spec.get("constraints_yaml"))
-    acc_bounds, gyro_bounds = _imu_from_constraints(constraints)
+    acc_bounds, gyro_bounds = _imu_device_bounds()
     foot_pos_bounds, foot_vel_bounds = _foot_envelope(
         model, q0, pos_low, pos_high, dq_max
     )
@@ -342,6 +344,9 @@ def build_signal_bounds(robot: str) -> Dict[str, Any]:
         "signal_bounds_version": SIGNAL_BOUNDS_VERSION,
         "robot": key,
         "source": "robot_mjcf_and_actuator_capability",
+        "imu_source": "device_full_scale",
+        "derived_source": "kinematic_envelope",
+        "pilot_coverage": [],
         "model_path": str(Path(spec["model_path"]).relative_to(REPO_ROOT)),
         "stance_posture_rad": stance_posture,
         "signals": {
@@ -378,11 +383,48 @@ def write_signal_bounds(path: str | Path, payload: Mapping[str, Any]) -> Path:
 def ensure_signal_bounds_file(
     path: str | Path | None = None,
     robot: str = "go2",
+    *,
+    force: bool = False,
 ) -> Path:
-    """Write ``datasets/signal_bounds.json`` from the named robot."""
+    """
+    Make sure ``datasets/signal_bounds.json`` exists. Do not overwrite it.
+
+    "Ensure", not "write". This used to regenerate the file at the start of every
+    collection run, which silently undid a frozen pilot-derived file: the derived
+    channels (``foot_vel_base``, ``joint_vel``, …) come from a pooled pilot via
+    ``tools/build_signal_bounds.py``, and the MJCF generator cannot reproduce
+    them. Regenerating also changes the SHA-256 that every earlier run recorded,
+    so two folders collected a day apart would refuse to be mixed.
+
+    Pass ``force=True`` (or ``--force`` on the CLI) to deliberately rebuild.
+    """
     from mpx.utils.dataset_collection.signal_bounds import default_signal_bounds_path
 
     out = Path(path) if path is not None else default_signal_bounds_path()
+    if out.is_file() and not force:
+        return out
+
+    # The YAML operating envelope is the source of truth where one exists; this
+    # module's kinematic envelope is the fallback for a robot that has no
+    # reconciled YAML yet. Regenerating a missing file from the MJCF would
+    # otherwise silently hand collection a v4 file that the validator rejects.
+    try:
+        import sys  # noqa: PLC0415
+
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from tools.build_signal_bounds import (  # noqa: PLC0415
+            DEFAULT_CONSTRAINTS,
+            DEFAULT_STANCE,
+            build as build_from_yaml,
+        )
+
+        if (robot or "go2") == "go2" and DEFAULT_CONSTRAINTS.is_file():
+            return write_signal_bounds(
+                out, build_from_yaml(DEFAULT_CONSTRAINTS, DEFAULT_STANCE, "go2")
+            )
+    except ImportError:
+        pass
     return write_signal_bounds(out, build_signal_bounds(robot or "go2"))
 
 
@@ -396,8 +438,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=str(REPO_ROOT / "datasets" / "signal_bounds.json"),
         help="Output JSON path",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing bounds file (it is frozen by default)",
+    )
     args = parser.parse_args(argv)
-    path = ensure_signal_bounds_file(args.out, args.robot)
+    path = ensure_signal_bounds_file(args.out, args.robot, force=args.force)
     print(f"wrote {path} for robot={args.robot}")
     return 0
 

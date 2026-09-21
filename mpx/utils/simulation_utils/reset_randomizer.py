@@ -58,6 +58,10 @@ class ResetTargets:
     foot_geom_ids: Any = None
     base_weight: Any = None
     navigator: Any = None
+    # Segmented velocity command source, used when collecting without a nav
+    # mode. It takes the same max_speed / max_yaw_rate knobs as the navigator,
+    # so the envelope varies per episode in both modes rather than only one.
+    command_sampler: Any = None
     mpc_data: Any = None
 
 
@@ -100,6 +104,11 @@ class ResetRandomizer:
         if sample.payload_kg is not None and targets.base_weight is not None:
             targets.base_weight.enabled = True
             targets.base_weight.extra_mass_kg = float(sample.payload_kg)
+        if targets.command_sampler is not None:
+            targets.command_sampler.scale_ranges(
+                max_speed=sample.max_speed,
+                max_yaw_rate=sample.max_yaw_rate,
+            )
         if targets.navigator is not None:
             if sample.max_speed is not None:
                 targets.navigator.max_speed = float(sample.max_speed)

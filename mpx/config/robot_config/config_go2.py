@@ -99,7 +99,9 @@ class LocomotionWeights:
     joint_pos: float = 1e-1
     # Base linear velocity — this is what tracks the vx/vy command.
     lin_vel: float = 5e3
-    ang_vel: float = 1e2
+    # Base angular velocity [roll, pitch, yaw]. Pace keeps yaw small: it cannot
+    # yaw hard without rolling onto the swing side.
+    ang_vel: tuple[float, float, float] = (1e2, 1e2, 1e2)
     joint_vel: float = 1e-1
     torque: float = 1e-1
     grf: float = 1e-2
@@ -112,7 +114,7 @@ class LocomotionWeights:
         Qrot = jnp.diag(jnp.array(self.rot, dtype=jnp.float32))
         Qq = jnp.diag(jnp.ones(n_joints)) * self.joint_pos
         Qdp = jnp.diag(jnp.ones(3)) * self.lin_vel
-        Qomega = jnp.diag(jnp.ones(3)) * self.ang_vel
+        Qomega = jnp.diag(jnp.array(self.ang_vel, dtype=jnp.float32))
         Qdq = jnp.diag(jnp.ones(n_joints)) * self.joint_vel
         Qleg = jnp.diag(jnp.tile(jnp.array(self.foot, dtype=jnp.float32), n_contact))
         Qtau = jnp.diag(jnp.ones(n_joints)) * self.torque
@@ -145,6 +147,10 @@ class GaitParams:
     clearance_speed: float = 0.2   # [m/s], vertical liftoff bias in the swing spline
     robot_height: float = 0.27     # [m], commanded nominal base height
     weights: LocomotionWeights = field(default_factory=LocomotionWeights)
+    # Lateral foot targets [FL, FR, RL, RR], metres. None keeps the nominal
+    # ±0.142 m stance. A pace has to step under the body: while one side is in
+    # the air the support line is those two feet, and a wide stance rolls.
+    stance_y: tuple[float, float, float, float] | None = None
     description: str = ""
 
     def __post_init__(self) -> None:
@@ -226,8 +232,8 @@ GO2_GAITS: dict[str, GaitParams] = {
         name=Go2Gait.TROT,
         phase_offsets=(0.5, 0.0, 0.0, 0.5),
         duty_factor=0.65,
-        step_freq=1.35,
-        step_height=0.10,
+        step_freq=1.4,
+        step_height=0.065,
         description="Diagonal pairs (FL+RR / FR+RL). Default; most robust.",
     ),
     # Lateral pairs. Both feet on one side leave the ground together, so the
@@ -236,56 +242,38 @@ GO2_GAITS: dict[str, GaitParams] = {
     Go2Gait.PACE: GaitParams(
         name=Go2Gait.PACE,
         phase_offsets=(0.5, 0.0, 0.5, 0.0),
-        duty_factor=0.70,
+        # Same cycle as the bound that holds nav-random: swing stays near 140 ms
+        # so the foot still lands, and four-foot overlap covers most of the cycle.
+        # Roll weight is higher than bound because a pace has no lateral moment
+        # arm while one side is in the air.
+        duty_factor=0.78,
         step_freq=1.55,
-        step_height=0.07,
-        clearance_speed=0.2,
+        step_height=0.06,
+        stance_y=(0.07, -0.07, 0.07, -0.07),
         weights=LocomotionWeights(
-            rot=(2200.0, 1000.0, 0.0),   # roll is the failure axis here
-            ang_vel=2e2,
+            pos=(0.0, 0.0, 2e4),
+            rot=(5000.0, 1200.0, 0.0),
+            ang_vel=(400.0, 100.0, 15.0),
         ),
-        description="Lateral pairs (FL+RL / FR+RR). Roll-unstable; low, quick steps.",
+        description="Lateral pairs (FL+RL / FR+RR). Feet step under the body; yaw tracking stays light.",
     ),
-    # One leg at a time, evenly spaced a quarter cycle apart. duty >= 0.75 is
-    # what keeps three feet down at all times and makes this statically stable;
-    # 0.80 leaves margin so an early touchdown never drops support to two.
-    # Slow on purpose — this is the gait to use on rough terrain, not for speed.
+    # One leg at a time. duty 0.80 keeps three feet down. Swing has to stay
+    # near 125 ms: at 2.5 Hz / duty 0.90 it was 40 ms and the foot never landed.
     Go2Gait.CRAWL: GaitParams(
         name=Go2Gait.CRAWL,
         phase_offsets=(0.25, 0.75, 0.0, 0.5),
         duty_factor=0.80,
-        step_freq=1.00,
-        step_height=0.09,
+        step_freq=1.6,
+        step_height=0.06,
         weights=LocomotionWeights(
             rot=(1500.0, 1500.0, 0.0),   # tripod support: hold attitude tightly
             foot=(2e4, 2e4, 1e5),        # one swing leg at a time, so track it well
         ),
         description="One leg at a time; three feet always down. Statically stable, slow.",
     ),
-    # Front pair / hind pair. Pitch is the failure axis: in a two-pair gait the
-    # support during swing is two feet on a single lateral line, and a
-    # stance-force QP cannot generate a pitch moment about that line — the trunk
-    # pitches and the base drops. Because both pairs move together, the
-    # single-pair support interval *is* the swing time, (1 - duty) / step_freq,
-    # so duty and step_freq are the only knobs that shorten it.
-    #
-    # Measured on flat, 4000 steps, no randomization and no trunk force, against
-    # a commanded 0.27 m (min height / 5th pct / peak |pitch|):
-    #   duty 0.60 @ 1.80 Hz, 12 cm step  -> 0.134 / 0.154 / 7.8 deg   (falls)
-    #   duty 0.75 @ 1.60 Hz,  8 cm step  -> 0.247 / 0.250 / 3.0 deg
-    #   duty 0.78 @ 1.55 Hz,  8 cm step  -> 0.261 / 0.263 / 2.6 deg   (chosen)
-    #   duty 0.80 @ 1.50 Hz,  7 cm step  -> 0.268 / 0.271 / 2.3 deg   (tracks +5 mm high)
-    # The original 0.60 spent 80% of the cycle on one pair, 222 ms at a time, and
-    # sagged to 0.134 m — below the 0.135 m crash threshold. 0.78 puts 56% of the
-    # cycle on all four feet, cuts the single-pair interval to 142 ms, and holds
-    # mean height at 0.269 m against the 0.270 m command. Heavier z and pitch
-    # weights do the rest.
-    #
-    # Honest caveat: at 56% four-support this is a conservative bound, not a
-    # ballistic one. A real bound needs a flight phase and angular-momentum
-    # control that this stance-force MPC cannot produce. Swing is 142 ms, close
-    # to the ~120 ms floor below which foothold tracking degrades, so raising
-    # duty further trades pitch stability for missed footholds.
+    # Front / hind pairs. Duty 0.78 at 1.55 Hz leaves a 142 ms single-pair
+    # interval. On nav-random the falls are rolls, so roll is weighted above
+    # pitch. This stance-force MPC still cannot do a flight-phase bound.
     Go2Gait.BOUND: GaitParams(
         name=Go2Gait.BOUND,
         phase_offsets=(0.5, 0.5, 0.0, 0.0),
@@ -294,12 +282,10 @@ GO2_GAITS: dict[str, GaitParams] = {
         step_height=0.08,
         clearance_speed=0.3,
         weights=LocomotionWeights(
-            pos=(0.0, 0.0, 2e4),         # hold height harder: this is what sagged
-            rot=(1000.0, 4500.0, 0.0),   # pitch is the failure axis here
-            ang_vel=3e2,
-            lin_vel=4e3,
+            pos=(0.0, 0.0, 2e4),
+            rot=(4000.0, 2500.0, 0.0),
         ),
-        description="Front pair / hind pair. Pitch-unstable; conservative duty.",
+        description="Front pair / hind pair. Conservative duty; roll and height held.",
     ),
 }
 
@@ -457,6 +443,10 @@ class Go2Locomotion(_Go2Common):
         self.step_height: float = params.step_height
         self.clearance_speed: float = params.clearance_speed
         self.weights: LocomotionWeights = params.weights
+        if params.stance_y is not None:
+            self.p_legs0 = self.p_legs0.at[1::3].set(
+                jnp.asarray(params.stance_y, dtype=jnp.float32)
+            )
 
         self.robot_height: float = params.robot_height
         self.initial_height: float = params.robot_height
@@ -639,7 +629,7 @@ BALANCE_WEIGHTS = LocomotionWeights(
     rot=(2200.0, 2200.0, 2200.0), # yaw is held as well, there is no yaw command
     joint_pos=1e2,
     lin_vel=8e3,
-    ang_vel=3e2,
+    ang_vel=(3e2, 3e2, 3e2),
     joint_vel=1e0,
     torque=1e-1,
     grf=1e-2,

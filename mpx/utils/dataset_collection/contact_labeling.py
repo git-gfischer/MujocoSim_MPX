@@ -18,7 +18,9 @@ Three stages fix it, in this order:
    flips the frame.
 2. **Schmitt trigger.** Touchdown needs ON_THRESHOLD_N, release needs the force
    to fall below the lower OFF_THRESHOLD_N. A force hovering near one threshold
-   cannot oscillate.
+   cannot oscillate. The trigger sees a 20 ms mean, not one physics sample:
+   at 500 Hz a single 2 ms zero is a contact-solver dropout, and treating it
+   as liftoff makes the 60 ms dwell hold a false swing.
 3. **Minimum dwell.** A state must hold for MIN_DWELL_STEPS before it may change
    again, which bounds the transition rate no matter what the force does.
 
@@ -28,6 +30,7 @@ labels remain reproducible online and no future information leaks backwards.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -49,6 +52,12 @@ class ContactLabelConfig:
     # Minimum steps a state must hold before it may change again (3 = 60 ms @ 50 Hz).
     min_dwell_steps: int = 3
 
+    # Samples averaged before the Schmitt comparison. Defined at 50 Hz, where
+    # each sample is already the 20 ms control-interval mean, so 1 leaves that
+    # path unchanged. ``create_collection_session`` scales it with the log rate
+    # (10 samples = 20 ms at 500 Hz).
+    schmitt_average_steps: int = 1
+
     # Fraction of a control interval's substeps that must exceed ``on_threshold_n``
     # for the raw label to read "loaded".
     substep_majority: float = 0.5
@@ -62,6 +71,8 @@ class ContactLabelConfig:
             )
         if self.min_dwell_steps < 1:
             raise ValueError("min_dwell_steps must be >= 1")
+        if self.schmitt_average_steps < 1:
+            raise ValueError("schmitt_average_steps must be >= 1")
         if not 0.0 < self.substep_majority <= 1.0:
             raise ValueError("substep_majority must be in (0, 1]")
 
@@ -72,6 +83,7 @@ class ContactLabelConfig:
             "on_threshold_n": float(self.on_threshold_n),
             "off_threshold_n": float(self.off_threshold_n),
             "min_dwell_steps": int(self.min_dwell_steps),
+            "schmitt_average_steps": int(self.schmitt_average_steps),
             "substep_majority": float(self.substep_majority),
             "substeps_per_control": int(substeps_per_control),
             "body_weight_n": float(body_weight_n),
@@ -185,18 +197,21 @@ class ContactDebouncer:
         """
         self.state = np.full(self.n_feet, int(initial_contact), dtype=np.uint8)
         self.dwell = np.full(self.n_feet, self.config.min_dwell_steps, dtype=np.int32)
+        self._force_window: deque = deque(maxlen=self.config.schmitt_average_steps)
 
     def step(self, force_n: np.ndarray) -> np.ndarray:
         """Advance one control step with per-foot force ``(4,)`` [N]."""
         force = np.asarray(force_n, dtype=np.float64).reshape(self.n_feet)
+        self._force_window.append(force.copy())
+        smoothed = np.mean(self._force_window, axis=0)
         on, off = self.config.on_threshold_n, self.config.off_threshold_n
         min_dwell = self.config.min_dwell_steps
 
         for i in range(self.n_feet):
             want = self.state[i]
-            if self.state[i] == 0 and force[i] >= on:
+            if self.state[i] == 0 and smoothed[i] >= on:
                 want = 1
-            elif self.state[i] == 1 and force[i] < off:
+            elif self.state[i] == 1 and smoothed[i] < off:
                 want = 0
 
             if want != self.state[i] and self.dwell[i] >= min_dwell:

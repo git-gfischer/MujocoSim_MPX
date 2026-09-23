@@ -59,7 +59,7 @@ class ResetRandomizationConfig:
     # the floor. 0.80 is the navigator's own tuned default and stays inside what
     # this MPC tracks; PointNavigator now also slews toward the cap rather than
     # stepping to it (``yaw_accel_rps2``).
-    max_yaw_rate: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.30, high=0.80)
+    max_yaw_rate: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.30, high=1.50)
 
     # Gait timing is OFF. duty_factor and step_freq are no longer independent
     # knobs: they belong to a gait, and config_go2.GO2_GAITS holds a matched set
@@ -83,7 +83,7 @@ class ResetRandomizationConfig:
     # the v3 [0.012, 0.035], and the contact-quality margin (0.75% one-step runs
     # against a 2% limit) covers the small loss of stiffness.
     solref_timeconst: FloatRangeSpec = FloatRangeSpec(
-        enabled=True, low=0.010, high=0.014, log_uniform=True
+        enabled=False, low=0.010, high=0.014, log_uniform=True
     )
 
     # Sliding friction μ on foot geoms (geom_friction[:, 0]). Torsional/rolling stay as in XML.

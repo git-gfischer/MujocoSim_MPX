@@ -1,7 +1,7 @@
 """
 Per-timestep record layout for collected quadruped episodes (schema v4).
 
-One collected episode is a table with **one row per control step**, not a stack
+One collected episode is a table with **one row per physics step**, not a stack
 of pre-cut windows. Windows are assembled at sampling time from
 ``(episode_id, t)``, so the same timestep is stored once no matter how many
 windows overlap it.
@@ -590,7 +590,7 @@ def assign_split(
 def describe_schema() -> str:
     """Human-readable column table, printed at the start of a collection run."""
     lines = [
-        f"episode schema v{EPISODE_SCHEMA_VERSION} — one row per control step",
+        f"episode schema v{EPISODE_SCHEMA_VERSION} — one row per physics step",
         f"  {'column':<26} {'w':>3}  {'role':<11} {'unit':<10} {'frame':<9} dtype",
     ]
     for column in EPISODE_COLUMNS:

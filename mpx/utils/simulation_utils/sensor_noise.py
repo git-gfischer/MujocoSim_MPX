@@ -40,6 +40,20 @@ from mpx.config.sim_config.config_sensor_noise import (
 )
 
 
+def _latency_steps_for_dt(cfg: SensorNoiseConfig, dt: float) -> LatencyConfig:
+    """Keep transport delay in seconds when the log ``dt`` is not ``cfg.dt``.
+
+    ``LatencyConfig`` counts steps at the config's reference period (50 Hz /
+    20 ms by default). One joint step is 20 ms at 50 Hz and 10 steps at 500 Hz.
+    """
+    ref_dt = float(cfg.dt)
+    scale = ref_dt / float(dt) if dt else 1.0
+    return LatencyConfig(
+        joint=max(0, int(round(cfg.latency_steps.joint * scale))),
+        imu=max(0, int(round(cfg.latency_steps.imu * scale))),
+    )
+
+
 def _butter_lowpass(cutoff_hz: float, dt: float, order: int):
     """
     Butterworth low-pass coefficients, or ``None`` when SciPy is unavailable.
@@ -135,7 +149,7 @@ class SensorNoise:
             imu_gyro_bias_rw_std=float(cfg.imu_gyro_bias_rw_std),
             imu_acc_bias_init_std=float(cfg.imu_acc_bias_init_std),
             imu_gyro_bias_init_std=float(cfg.imu_gyro_bias_init_std),
-            latency_steps=cfg.latency_steps,
+            latency_steps=_latency_steps_for_dt(cfg, dt),
             dropout_prob=float(cfg.dropout_prob),
         )
         noise.reset()

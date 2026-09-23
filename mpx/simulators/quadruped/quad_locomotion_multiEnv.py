@@ -14,7 +14,7 @@ Usage::
     python -m mpx.simulators.quadruped.quad_locomotion_multiEnv --n-env 8
     python -m mpx.simulators.quadruped.quad_locomotion_multiEnv --n-env 16 --nav random
     python -m mpx.simulators.quadruped.quad_locomotion_multiEnv --headless --n-env 64
-    python -m mpx.simulators.quadruped.quad_locomotion_multiEnv --collect --n-env 8 --nav random --headless --steps 50000
+    python -m mpx.simulators.quadruped.quad_locomotion_multiEnv --collect --n-env 8 --nav random --headless
 """
 
 import argparse
@@ -107,6 +107,41 @@ def _is_crashed_batch(qpos_batch: jnp.ndarray, height_threshold: float, tilt_rad
 def _tree_set_index(tree, index, value):
     """Replace row ``index`` of a batched pytree with a single-env pytree."""
     return jax.tree.map(lambda batch, leaf: batch.at[index].set(leaf), tree, value)
+
+
+def _env_scalar(value, i: int) -> float:
+    """Batched ``array[i]``, or a shared mjx PyTreeNode metadata scalar."""
+    arr = np.asarray(value)
+    return float(arr[i] if arr.ndim else arr)
+
+
+def _collect_command_source(nav: str, segmented_commands: bool) -> tuple[bool, bool]:
+    """``--nav random`` always follows goals; segments fill in when there is no nav."""
+    use_navigation = nav in ("random", "pointuser")
+    use_command_sampler = bool(segmented_commands) and not use_navigation
+    return use_navigation, use_command_sampler
+
+
+def _tick_navigators(navigators, qpos_batch, viewer=None) -> None:
+    """Resample random goals on arrival. Viewer is optional (headless-safe)."""
+    qpos_np = np.asarray(qpos_batch)
+    for i, nav_i in enumerate(navigators):
+        nav_i.update(qpos_np[i], viewer=viewer)
+
+
+def _resolve_headless_steps(
+    *,
+    collect: bool,
+    steps: int | None,
+    episode_duration_s: float,
+    sim_hz: float,
+) -> int:
+    """Default live runs stay short; collection must outlive the 30 s gate."""
+    if steps is not None:
+        return int(steps)
+    if collect:
+        return int(round(float(episode_duration_s) * float(sim_hz)))
+    return 2000
 
 
 def _scene_xml_path(robot: str, scene: str) -> str:
@@ -208,9 +243,8 @@ def _main_collect(
         cfg=dataset_collection_config,
     )
 
-    use_navigation = nav in ("random", "pointuser")
-    use_command_sampler = (
-        dataset_collection_config.episode.segmented_commands and not use_navigation
+    use_navigation, use_command_sampler = _collect_command_source(
+        nav, dataset_collection_config.episode.segmented_commands
     )
     command_handle = KeyboardVelocityCommand()
     navigators = [
@@ -392,7 +426,7 @@ def _main_collect(
                 control=ControlSample(
                     tau_cmd=tau_np[i],
                     leg_phase=np.asarray(batch_mpc.contact_time[i]),
-                    duty_factor=float(np.asarray(batch_mpc.duty_factor)[i]),
+                    duty_factor=_env_scalar(batch_mpc.duty_factor, i),
                     cmd_base_vel=(
                         command_from_mpc_input(np.asarray(commands[i]))
                         if commands[i] is not None
@@ -475,7 +509,7 @@ def _main_collect(
 
 def main(
     headless: bool = False,
-    steps: int = 2000,
+    steps: int | None = None,
     scene: str = "flat",
     robot: str = "go2",
     nav: str = "random",
@@ -486,7 +520,25 @@ def main(
     episode_duration_s=None,
     gait=None,
 ):
+    duration_s = (
+        episode_duration_s
+        if episode_duration_s is not None
+        else dataset_collection_config.episode.episode_duration_s
+    )
+    steps = _resolve_headless_steps(
+        collect=collect,
+        steps=steps,
+        episode_duration_s=duration_s,
+        sim_hz=dataset_collection_config.rates.sim_hz,
+    )
     if collect:
+        sim_s = steps / dataset_collection_config.rates.sim_hz
+        if sim_s < 30.0:
+            print(
+                f"[collect] warning: --steps {steps} is only {sim_s:.1f}s of sim "
+                f"(want >=30s median episode). Pass a larger --steps or omit it.",
+                flush=True,
+            )
         return _main_collect(
             headless=headless,
             steps=steps,
@@ -672,6 +724,9 @@ def main(
                 bx, bf = build_x0_batch(batch_data)
                 batch_mpc_data = batched_reset(batch_mpc_data, batch_data.qpos, batch_data.qvel, bf)
 
+            if use_navigation:
+                _tick_navigators(navigators, batch_data.qpos)
+
             counter += 1
         return
 
@@ -736,9 +791,7 @@ def main(
 
             # ── Navigator update (auto-resample on goal arrival) ─────────────
             if use_navigation:
-                qpos_np = np.array(batch_data.qpos)
-                for i, nav_i in enumerate(navigators):
-                    nav_i.update(qpos_np[i], viewer=None)   # no lookat needed (random mode)
+                _tick_navigators(navigators, batch_data.qpos)
 
             # ── Render all robots as ghost overlays ──────────────────────────
             qpos_np = np.array(batch_data.qpos)
@@ -782,8 +835,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Multi-environment Go2 locomotion with individual navigation goals."
     )
-    parser.add_argument("--steps", type=int, default=2000,
-                        help="Number of simulation steps (headless only).")
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help=(
+            "Simulation steps (headless). Default 2000 for live runs; "
+            "for --collect, one episode_duration at sim rate "
+            f"(currently {int(dataset_collection_config.episode.episode_duration_s * dataset_collection_config.rates.sim_hz)})."
+        ),
+    )
     parser.add_argument("--scene", type=str,
                         choices=["flat", "rough", "perlin", "stairs", "ramp", "slippery"],
                         default="flat")
@@ -791,8 +852,9 @@ if __name__ == "__main__":
                         choices=["go2", "b2"], default="go2")
     parser.add_argument("--nav", type=str,
                         choices=["random", "vel"], default="random",
-                        help="random: each robot gets its own random goal; "
-                             "vel: keyboard command broadcast to all robots.")
+                        help="random: each robot gets its own random goal "
+                             "(works headless); vel: keyboard command broadcast "
+                             "to all robots.")
     parser.add_argument("--n-env", type=int, default=8,
                         help="Number of parallel environments.")
     parser.add_argument("--headless", action="store_true")

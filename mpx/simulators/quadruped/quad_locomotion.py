@@ -449,7 +449,7 @@ def main(
             else:
                 command = jnp.asarray(command_handle.mpc_input(config.robot_height))
             contact = jnp.asarray(estimate_contacts(data, contact_ids))
-            if not collect_hooks.enabled:
+            if not collect_hooks.enabled and not headless:
                 print(f"Contact: {contact}")
                 print(foot)
                 print(f"Command: {command}")
@@ -477,7 +477,7 @@ def main(
                 q_ref = config.q0.copy()
             else:
                 q_ref = mpc_data.X0[0, 7 : 7 + config.n_joints]
-            if not collect_hooks.enabled:
+            if not headless and not collect_hooks.enabled:
                 print(f"MPC time: {1e3 * (stop - start):.2f} ms")
 
         if use_command_sampler:
@@ -537,7 +537,6 @@ def main(
 
         if _is_crashed():
             _respawn(crashed=True)
-         
 
     if headless:
         for _ in range(steps):

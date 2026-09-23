@@ -196,8 +196,8 @@ class SimRateConfig:
     # at 200 Hz the same time constant is only 2 substeps and the foot bounces.
     sim_hz: float = 500.0
 
-    # Control and logging rate [Hz]. Unchanged — the labels are reduced from the
-    # substeps between two control steps, not sampled at one instant.
+    # Control / command-sampler rate [Hz]. Logging is at sim_hz (one row per
+    # physics step). Labels keep wall-clock filters (60 ms dwell), not this rate.
     control_hz: float = 50.0
 
     @property
@@ -209,7 +209,8 @@ class SimRateConfig:
 class EpisodeCollectionConfig:
     """On-the-fly episode buffering before routing into buckets."""
 
-    # Control / label sample rate [Hz] (decimated from sim rate, e.g. 500 Hz → 50 Hz).
+    # Control / command-sampler rate [Hz]. Logging is at sim_hz; this is only
+    # the MPC-side period used by VelocityCommandSampler.
     control_hz: float = 50.0
 
     # How episode boundaries are decided:

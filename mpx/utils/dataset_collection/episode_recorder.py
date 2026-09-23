@@ -1,9 +1,10 @@
 """
 Episode buffer and routing into :class:`DatasetBucketSystem` (schema v4).
 
-Records proprioception + ground truth at a fixed control rate (default 50 Hz)
-while the simulator runs at a higher rate (default 500 Hz). One row is buffered
-per control step; the finished episode is written once as a parquet table, whole
+Records proprioception + ground truth at the physics rate (default 500 Hz).
+The MPC and command sampler stay at 50 Hz; their outputs are held across the
+logged rows between ticks. One row is buffered per MuJoCo step; the finished
+episode is written once as a parquet table, whole
 and untrimmed, and each of its labelled timesteps is registered as an
 ``(episode_id, t)`` reference in the buckets. No window length is involved —
 that is the training-time dataset's choice.
@@ -46,7 +47,7 @@ so it always discards the buffer.
 from __future__ import annotations
 
 import atexit
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List
 
@@ -725,7 +726,8 @@ class RunStatistics:
 class EpisodeRecorderConfig:
     """Timing and naming defaults for on-the-fly dataset collection."""
 
-    control_hz: float = 50.0
+    # Stored row rate. ``create_collection_session`` sets this to ``sim_hz``.
+    control_hz: float = 50.0  # stored row rate; create_collection_session sets this to sim_hz
     sim_hz: float = 500.0
     # Event mode: safety cap. Fixed-duration mode: exact episode length.
     episode_duration_s: float = 60.0
@@ -1505,7 +1507,7 @@ class _ActiveCollectionHooks(SimCollectionHooks):
         if not output.validate_after_run:
             return
         try:
-            from tools.validate_run import quarantine, run_checks  # noqa: PLC0415
+            from tools.validate_run import check_severity, quarantine, run_checks  # noqa: PLC0415
         except ImportError as exc:  # pragma: no cover - depends on cwd
             print(
                 f"[collect] validation skipped: cannot import tools.validate_run "
@@ -1517,18 +1519,29 @@ class _ActiveCollectionHooks(SimCollectionHooks):
         report, failed = run_checks(
             self._run_dir, skip=output.validate_skip, verbose=False
         )
+        integrity_fails = [
+            (name, result) for name, result in report.items()
+            if result.startswith("FAIL") and check_severity(name) == "integrity"
+        ]
+        coverage_fails = [
+            (name, result) for name, result in report.items()
+            if result.startswith("FAIL") and check_severity(name) == "coverage"
+        ]
         if not failed:
             print(
-                f"[collect] validation passed "
+                f"[collect] validation passed for training "
                 f"({len(report)} checks, {len(output.validate_skip)} groups skipped)",
                 flush=True,
             )
+            for name, result in coverage_fails:
+                print(f"    coverage {name}: {result[:160]}", flush=True)
             return
 
-        print(f"[collect] validation FAILED — {failed} check(s):", flush=True)
-        for name, result in report.items():
-            if result.startswith("FAIL"):
-                print(f"    {name}: {result[:160]}", flush=True)
+        print(f"[collect] validation FAILED — {failed} integrity check(s):", flush=True)
+        for name, result in integrity_fails:
+            print(f"    {name}: {result[:160]}", flush=True)
+        for name, result in coverage_fails:
+            print(f"    coverage {name}: {result[:160]}", flush=True)
         if output.quarantine_failed_runs:
             moved = quarantine(self._run_dir, Path(output.output_root_dir))
             print(f"[collect] quarantined → {moved}", flush=True)
@@ -1600,10 +1613,12 @@ def setup_sim_collection(
         f"min episode {recorder.min_control_steps / ctrl_hz:.1f}s",
         flush=True,
     )
-    labels = profile.contact_labeling
+    labels = recorder.config.contact_labeling
     print(
         f"[collect] contact labels: substep majority >= {labels.substep_majority:.0%}, "
-        f"Schmitt on={labels.on_threshold_n:.1f} N off={labels.off_threshold_n:.1f} N, "
+        f"Schmitt on={labels.on_threshold_n:.1f} N off={labels.off_threshold_n:.1f} N "
+        f"over {labels.schmitt_average_steps} samples "
+        f"({labels.schmitt_average_steps / ctrl_hz * 1e3:.0f} ms), "
         f"min dwell {labels.min_dwell_steps} steps "
         f"({labels.min_dwell_steps / ctrl_hz * 1e3:.0f} ms)",
         flush=True,
@@ -1649,7 +1664,7 @@ def setup_sim_collection(
             "substeps_per_control": recorder.substeps_per_control,
             "episode_duration_s": ep_duration,
             "sensor_noise": recorder.sensor_noise.to_metadata(),
-            "contact_labeling": profile.contact_labeling.to_metadata(
+            "contact_labeling": recorder.config.contact_labeling.to_metadata(
                 recorder.substeps_per_control, DEFAULT_BODY_WEIGHT_N
             ),
             "signal_bounds_sha256": signal_bounds_sha256(),
@@ -1758,6 +1773,11 @@ class MultiEnvCollectionHooks:
         self.env[0].finish(default_out)
 
 
+def _scale_steps(steps: int, hz: float, *, ref_hz: float = 50.0) -> int:
+    """Convert a step count defined at ``ref_hz`` to the same wall-clock at ``hz``."""
+    return max(1, int(round(int(steps) * float(hz) / float(ref_hz))))
+
+
 def create_collection_session(
     *,
     gait_type: GaitType,
@@ -1774,17 +1794,42 @@ def create_collection_session(
     control_hz: float | None = None,
     sensor_noise_cfg: SensorNoiseConfig | None = None,
 ) -> EpisodeRecorder:
-    """Build a recorder wired to a new :class:`DatasetBucketSystem`."""
+    """Build a recorder wired to a new :class:`DatasetBucketSystem`.
+
+    The stored row rate is ``sim_hz`` (one parquet row per physics step).
+    ``episode.control_hz`` stays the command-sampler rate and is not used here.
+    Step-counted filters (contact dwell, regime dwell, mismatch radii) are
+    scaled from their 50 Hz defaults so wall-clock duration is unchanged.
+    """
     profile = cfg if cfg is not None else dataset_collection_config
     b = profile.bucket
     e = profile.episode
     x = profile.export
 
+    # Override is the stored row rate. Default is physics rate, not command rate.
+    ctrl_hz = control_hz if control_hz is not None else sim_hz
+    contact = replace(
+        profile.contact_labeling,
+        min_dwell_steps=_scale_steps(profile.contact_labeling.min_dwell_steps, ctrl_hz),
+        schmitt_average_steps=_scale_steps(
+            profile.contact_labeling.schmitt_average_steps, ctrl_hz
+        ),
+    )
+    regime = replace(
+        profile.operating_regime,
+        dwell_steps=_scale_steps(profile.operating_regime.dwell_steps, ctrl_hz),
+    )
+    bucket_cfg = replace(
+        b,
+        mismatch_edge_radius=_scale_steps(b.mismatch_edge_radius, ctrl_hz),
+        mismatch_sustained_min_run=_scale_steps(b.mismatch_sustained_min_run, ctrl_hz),
+    )
+
     bucket = DatasetBucketSystem(
-        config=b,
+        config=bucket_cfg,
         bucket_capacity=bucket_capacity,
-        contact_label_config=profile.contact_labeling,
-        regime_config=profile.operating_regime,
+        contact_label_config=contact,
+        regime_config=regime,
         signal_bounds_version=signal_bounds_version(),
         dataset_summary_path=(
             Path(profile.output.output_root_dir) / DATASET_SUMMARY_FILENAME
@@ -1797,8 +1842,8 @@ def create_collection_session(
             )
         ),
     )
+    bucket.collapse_dwell_steps = _scale_steps(bucket.collapse_dwell_steps, ctrl_hz)
     ep_duration = episode_duration_s if episode_duration_s is not None else e.episode_duration_s
-    ctrl_hz = control_hz if control_hz is not None else e.control_hz
     noise_cfg = sensor_noise_cfg if sensor_noise_cfg is not None else sensor_noise_config
     return EpisodeRecorder(
         bucket,
@@ -1813,11 +1858,11 @@ def create_collection_session(
             episode_mode=e.episode_mode,
             label_stride=e.label_stride,
             store_failed_episodes=e.store_failed_episodes,
-            operating_regime=profile.operating_regime,
+            operating_regime=regime,
             val_ratio=x.val_ratio,
             test_ratio=x.test_ratio,
             split_seed=x.split_seed,
-            contact_labeling=profile.contact_labeling,
+            contact_labeling=contact,
         ),
         episode_prefix=episode_prefix,
         sensor_noise=SensorNoise.from_config(dt=1.0 / ctrl_hz, cfg=noise_cfg),

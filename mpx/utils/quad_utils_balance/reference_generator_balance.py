@@ -32,13 +32,12 @@ def reference_generator_balance(
     use_base_quat_ref,
 ):
     """Static contact schedule + constant foot anchors (whole-body MPC balance)."""
-    _, _, _, _, _, _, _ = (
+    _, _, _, _, _, _ = (
         foot0,
         t_timer,
         duty_factor,
         step_freq,
         step_height,
-        contact,
         clearence_speed,
     )
 
@@ -94,7 +93,10 @@ def reference_generator_balance(
     foot_ref = jnp.tile(foot_track, (N + 1, 1))
     grf_ref = jnp.zeros((N + 1, 3 * n_contact))
 
-    mask = fixed_contact_mask.astype(jnp.float32).reshape((n_contact,))
+    runtime = contact.astype(jnp.float32).reshape((n_contact,))
+    fallback = fixed_contact_mask.astype(jnp.float32).reshape((n_contact,))
+    # Zeros is the wrapper default when no mask is passed; a real stance mask has support.
+    mask = jnp.where(jnp.sum(runtime) > 0.5, runtime, fallback)
     contact_sequence = jnp.tile(mask, (N + 1, 1))
     sum_m = jnp.sum(mask) + 1e-6
     grf_z_per_leg = mask * (mass * 9.81 / sum_m)

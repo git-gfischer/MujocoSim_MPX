@@ -1581,11 +1581,13 @@ class DatasetBucketSystem:
                     "split": split,
                     # Outside the weighted splits the weight is exactly 1.0: a
                     # reweighted val or test metric describes a distribution
-                    # that does not exist.
+                    # that does not exist. Invalid train rows are 0: the
+                    # normaliser counted only valid samples, and a severe frame
+                    # in a rare bucket would otherwise pull the mean above 1.
                     "weight": (
                         float(weights.get(row["bucket_key"], 0.0))
-                        if split in weighted_splits
-                        else 1.0
+                        if split in weighted_splits and row["valid"]
+                        else (0.0 if split in weighted_splits else 1.0)
                     ),
                 }
             )

@@ -77,6 +77,18 @@ def non_foot_contact_force(
     return total
 
 
+def _contact_force_world(frame: np.ndarray, force_local: np.ndarray) -> np.ndarray:
+    """Rotate a contact-frame force into the world frame.
+
+    ``mjContact.frame`` is nine numbers: the normal and two tangents, each a
+    world-frame axis. After ``reshape(3, 3)`` those axes are the rows, so the
+    world force is ``axes.T @ f``. Using ``axes @ f`` reflects the tangential
+    force through the contact yaw.
+    """
+    axes = np.asarray(frame, dtype=np.float64).reshape(3, 3)
+    return axes.T @ np.asarray(force_local, dtype=np.float64).reshape(3)
+
+
 def estimate_foot_grf(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -101,8 +113,11 @@ def estimate_foot_grf(
 
         mujoco.mj_contactForce(model, data, k, wrench)
         force_local = wrench[:3]
-        frame = np.asarray(contact.frame, dtype=np.float64).reshape(3, 3)
-        force_world = frame @ force_local
+        # contact.frame is three world-frame axes (normal, tangent, tangent),
+        # so the rows are the axes. ``frame @ f`` uses the columns and reflects
+        # the horizontal force through yaw; the body-frame rotation then cannot
+        # cancel heading.
+        force_world = _contact_force_world(contact.frame, force_local)
 
         g1 = int(contact.geom1)
         g2 = int(contact.geom2)

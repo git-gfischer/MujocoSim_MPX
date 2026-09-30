@@ -13,6 +13,7 @@ import numpy as np
 
 from mpx.simulators.quadruped.quad_locomotion_multiEnv import (
     _collect_command_source,
+    _resolve_nav,
     _env_scalar,
     _resolve_headless_steps,
     _tick_navigators,
@@ -55,6 +56,12 @@ def test_nav_random_drives_to_goals_during_collect():
     )
     assert use_nav is True
     assert use_sampler is False
+
+
+def test_omitting_nav_during_collect_uses_velocity_segments():
+    assert _resolve_nav(None, collect=True) == "vel"
+    assert _resolve_nav(None, collect=False) == "random"
+    assert _resolve_nav("random", collect=True) == "random"
 
 
 def test_nav_vel_collect_uses_velocity_segments():

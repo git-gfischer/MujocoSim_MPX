@@ -2,8 +2,8 @@
 
 N independent robots run in parallel on the GPU via JAX/MJX.  Each robot has
 its own MPC warm-start (``batch_mpc_data``) and its own ``PointNavigator`` goal.
-The viewer shows all robots simultaneously as ghost overlays on a single CPU
-``MjModel`` using ``render_ghost_robot``, arranged in a square grid.
+Robot 0 is the live viewer body, so MuJoCo contact visualization matches
+that mesh. The other robots are ghost overlays on a square grid.
 
 Navigation modes (``--nav``):
   random     — each robot gets an independent random goal; auto-resampled on arrival.
@@ -113,6 +113,17 @@ def _env_scalar(value, i: int) -> float:
     """Batched ``array[i]``, or a shared mjx PyTreeNode metadata scalar."""
     arr = np.asarray(value)
     return float(arr[i] if arr.ndim else arr)
+
+
+def _resolve_nav(nav: str | None, collect: bool) -> str:
+    """Omitting ``--nav`` during collection is the velocity-segment walk.
+
+    The flag used to default to ``random``, so a collect run that simply left
+    ``--nav`` off still drove to goals and never commanded reverse.
+    """
+    if nav is not None:
+        return nav
+    return "vel" if collect else "random"
 
 
 def _collect_command_source(nav: str, segmented_commands: bool) -> tuple[bool, bool]:
@@ -487,7 +498,8 @@ def _main_collect(
         while viewer.is_running():
             tic = timer()
             step_all()
-            for i in range(n_env):
+            # Env 0 is the live body. Contact viz ('c') reads its contacts.
+            for i in range(1, n_env):
                 qp_vis = np.asarray(datas[i].qpos).copy()
                 qp_vis[0] += offset_xy[i, 0]
                 qp_vis[1] += offset_xy[i, 1]
@@ -743,9 +755,11 @@ def main(
     with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
         viewer.sync()
 
-        # Build ghost geom caches before the loop.
-        for i in range(n_env):
-            qp = np.asarray(batch_data.qpos[i])
+        # Env 0 is the live viewer body. Cache ghosts for the other envs.
+        for i in range(1, n_env):
+            qp = np.array(batch_data.qpos[i], copy=True)
+            qp[0] += offset_xy[i, 0]
+            qp[1] += offset_xy[i, 1]
             scratch_data.qpos[:len(qpos0_single)] = qp
             mujoco.mj_forward(model, scratch_data)
             ghost_geoms[i] = sim_utils.render_ghost_robot(viewer, model, scratch_data, alpha=0.9)
@@ -793,10 +807,13 @@ def main(
             if use_navigation:
                 _tick_navigators(navigators, batch_data.qpos)
 
-            # ── Render all robots as ghost overlays ──────────────────────────
+            # Env 0 is the body the viewer uses for contact visualization.
             qpos_np = np.array(batch_data.qpos)
-            for i in range(n_env):
-                # Apply grid offset only in XY for visual separation.
+            data.qpos[:] = qpos_np[0]
+            data.qvel[:] = np.asarray(batch_data.qvel[0])
+            mujoco.mj_forward(model, data)
+
+            for i in range(1, n_env):
                 qp_vis = qpos_np[i].copy()
                 qp_vis[0] += offset_xy[i, 0]
                 qp_vis[1] += offset_xy[i, 1]
@@ -851,10 +868,13 @@ if __name__ == "__main__":
     parser.add_argument("--robot", type=str,
                         choices=["go2", "b2"], default="go2")
     parser.add_argument("--nav", type=str,
-                        choices=["random", "vel"], default="random",
-                        help="random: each robot gets its own random goal "
-                             "(works headless); vel: keyboard command broadcast "
-                             "to all robots.")
+                        choices=["random", "vel"], default=None,
+                        help="random: each robot walks to its own goal. "
+                             "vel: keyboard velocity, or random forward/back/"
+                             "sideways/turn segments when --collect is set. "
+                             "Omitting this during --collect uses those segments "
+                             "(the robot does reverse). Omitting it otherwise "
+                             "is random goals.")
     parser.add_argument("--n-env", type=int, default=8,
                         help="Number of parallel environments.")
     parser.add_argument("--headless", action="store_true")
@@ -895,7 +915,7 @@ if __name__ == "__main__":
         steps=args.steps,
         scene=args.scene,
         robot=args.robot,
-        nav=args.nav,
+        nav=_resolve_nav(args.nav, args.collect),
         n_env=args.n_env,
         mpc_model=args.mpc_model,
         collect=args.collect,

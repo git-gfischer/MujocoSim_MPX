@@ -3,6 +3,7 @@ import argparse
 import os
 import sys
 import time
+from dataclasses import replace
 from timeit import default_timer as timer
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
@@ -44,6 +45,8 @@ from mpx.utils.quad_utils_balance.foot_reference import (
     RandomSwingFootSampler,
     swing_foot_anchor_from_target,
     foot_target_foot_local_to_world,
+    swing_foot_at_goal,
+    base_yaw_offset_to_world,
 )
 from mpx.config.sim_config.config_foot_ref_config import foot_ref_config, random_swing_foot_config
 import glfw
@@ -115,8 +118,12 @@ def main(
     # robot configuration
     config = robot_config(robot)
 
-    # Swing leg: the contact mask entry that is 0 (the nominal swing leg)
-    swing_leg_idx = int(np.where(np.array(config.balance_fixed_contact_mask) < 0.5)[0][0])
+    # Swing leg is redrawn on every respawn. Mask is 0 on that foot, 1 on the stance feet.
+    swing_leg_idx = 0
+    contact_mask = np.ones(config.n_contact, dtype=np.float32)
+    contact_mask[swing_leg_idx] = 0.0
+    GOAL_HOLD_S = 3.0
+    goal_hold_s = 0.0
 
     data = mujoco.MjData(model)
     # 500 Hz by default; see config_dataset_bucket.SimRateConfig. Control and
@@ -157,10 +164,10 @@ def main(
         "  I / K         : swing foot forward / backward\n"
         "  J / L         : swing foot left / right\n"
         "  U / O         : swing foot up / down\n"
-        "  R             : randomise swing foot NOW (within bounds)\n"
+        "  R             : randomise swing target NOW (within bounds)\n"
         "  N             : toggle random-on-respawn mode ON/OFF\n"
-        f"  swing leg     : {swing_leg_idx} "
-        f"({['FL','FR','RL','RR'][swing_leg_idx]})\n"
+        "  swing leg     : random each respawn (FL / FR / RL / RR)\n"
+        f"  goal hold     : respawn after {GOAL_HOLD_S:.0f}s inside arrival tolerance\n"
         f"  scene         : {scene}   robot : {robot}\n"
         "============================================\n",
         flush=True,
@@ -205,8 +212,6 @@ def main(
 
     # region foot reference configuration---------------------------------------
     foot_ref_mgr = FootReferenceManager(foot_ref_config)
-    # Swing leg: the one with mask=0 in the config
-    swing_leg_idx = int(np.where(np.array(config.balance_fixed_contact_mask) < 0.5)[0][0])
     # World-frame foot anchor: flat (12,) [FL, FR, RL, RR] × XYZ
     foot_anchor = np.zeros(3 * config.n_contact, dtype=np.float64)  # filled in _respawn
     SWING_STEP = 0.025   # metres per key press
@@ -220,6 +225,45 @@ def main(
         f"bounds: {random_swing_sampler.bounds_summary()}",
         flush=True,
     )
+
+    def _random_swing_world(base_pos, base_quat, leg_idx):
+        """Sample inside the configured bounds, mirrored into this foot's quadrant."""
+        xyz = random_swing_sampler.sample_offset_base()
+        nom = np.asarray(config.p_legs0, dtype=np.float64).reshape(-1)
+        nom = nom[3 * leg_idx : 3 * leg_idx + 3]
+        xyz = np.array(
+            [
+                np.copysign(abs(float(xyz[0])), float(nom[0])),
+                np.copysign(abs(float(xyz[1])), float(nom[1])),
+                float(xyz[2]),
+            ],
+            dtype=np.float64,
+        )
+        return base_yaw_offset_to_world(base_pos, base_quat, xyz)
+
+    def _bounds_cfg_for_leg(leg_idx):
+        nom = np.asarray(config.p_legs0, dtype=np.float64).reshape(-1)
+        nom = nom[3 * leg_idx : 3 * leg_idx + 3]
+        cfg = random_swing_sampler.cfg
+
+        def _signed_interval(bounds, sign):
+            lo, hi = sorted((abs(float(bounds[0])), abs(float(bounds[1]))))
+            if float(bounds[0]) < 0.0 < float(bounds[1]):
+                lo = 0.0
+            if sign < 0.0:
+                return (-hi, -lo)
+            return (lo, hi)
+
+        return replace(
+            cfg,
+            x_bounds=_signed_interval(cfg.x_bounds, nom[0]),
+            y_bounds=_signed_interval(cfg.y_bounds, nom[1]),
+        )
+
+    def _swing_target_world(base_pos, base_quat, leg_idx, measured_swing):
+        if random_swing_sampler.resample_on_respawn:
+            return _random_swing_world(base_pos, base_quat, leg_idx)
+        return foot_target_foot_local_to_world(measured_swing, base_quat, SWING_INIT_OFFSET)
     #endregion
     #------------------------------------------------
 
@@ -227,8 +271,15 @@ def main(
     # region respawn helper -------------------------------------
     def _respawn(*, manual: bool = False, crashed: bool = False):
         nonlocal mpc_data, tau, q_ref, counter, desired_height, desired_quat, foot_anchor
+        nonlocal swing_leg_idx, goal_hold_s
 
         collect_hooks.on_respawn(manual=manual, crashed=crashed)
+
+        swing_leg_idx = int(np.random.randint(0, config.n_contact))
+        contact_mask[:] = 1.0
+        contact_mask[swing_leg_idx] = 0.0
+        swing_foot_cmd.swing_leg_idx = swing_leg_idx
+        goal_hold_s = 0.0
 
         # 1. Place robot at a random XY/yaw position on the map
         spawner.apply_to_data(model, data, config.p0, config.quat0, config.q0)
@@ -251,18 +302,13 @@ def main(
             dtype=np.float64,
         )
 
-        # 4. Place swing foot — random target if enabled, otherwise fixed offset
+        # 4. Place swing foot — random target in that foot's quadrant, else fixed offset
         measured_swing_world = sim_utils.geom_positions(data, contact_ids)[
             3 * swing_leg_idx : 3 * swing_leg_idx + 3
         ]
-        if random_swing_sampler.resample_on_respawn:
-            new_swing_world = random_swing_sampler.sample_swing_world(
-                data.qpos[:3], data.qpos[3:7]
-            )
-        else:
-            new_swing_world = foot_target_foot_local_to_world(
-                measured_swing_world, data.qpos[3:7], SWING_INIT_OFFSET
-            )
+        new_swing_world = _swing_target_world(
+            data.qpos[:3], data.qpos[3:7], swing_leg_idx, measured_swing_world
+        )
         foot_anchor = swing_foot_anchor_from_target(foot_anchor, swing_leg_idx, new_swing_world)
 
         # 5. Reset MPC warm-start from the new spawn state
@@ -306,7 +352,7 @@ def main(
         print(
             f"[respawn] height={desired_height:.3f}m  "
             f"spawn_yaw={np.rad2deg(yaw_from_quat(spawn_quat)):.1f}°  "
-            f"swing_leg={swing_leg_idx}  "
+            f"swing_leg={config.contact_frame[swing_leg_idx]}  "
             f"swing_target=[{swing_target[0]:.2f}, {swing_target[1]:.2f}, {swing_target[2]:.2f}]"
             f"{extra}",
             flush=True,
@@ -335,7 +381,7 @@ def main(
     
     _respawn()
     warm_command = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, desired_height])
-    warm_contact = jnp.asarray(config.balance_fixed_contact_mask, dtype=jnp.float32)
+    warm_contact = jnp.asarray(contact_mask, dtype=jnp.float32)
     mpc_data, tau = solve_mpc(
         mpc_data,
         data.qpos.copy(),
@@ -360,36 +406,17 @@ def main(
     q_ref = config.q0.copy()
 
     def step_controller():
-        nonlocal counter, tau, q_ref, mpc_data, desired_height, desired_quat, foot_anchor
+        nonlocal counter, tau, q_ref, mpc_data, desired_height, desired_quat, foot_anchor, goal_hold_s
         qpos = data.qpos.copy()
         qvel = data.qvel.copy()
 
         if counter % period == 0:
             foot = sim_utils.geom_positions(data, contact_ids)
-
-            if random_swing_sampler.resample_on_arrival:
-                measured_swing = foot[3 * swing_leg_idx : 3 * swing_leg_idx + 3]
-                foot_anchor, _, _, did_resample = random_swing_sampler.try_resample_on_arrival(
-                    foot_anchor,
-                    swing_leg_idx,
-                    measured_swing,
-                    data.qpos[:3],
-                    data.qpos[3:7],
-                    sim_dt=model.opt.timestep,
-                )
-                if did_resample:
-                    sw = foot_anchor[3 * swing_leg_idx : 3 * swing_leg_idx + 3]
-                    print(
-                        f"[random_swing] arrival → new target "
-                        f"[{sw[0]:.3f}, {sw[1]:.3f}, {sw[2]:.3f}]",
-                        flush=True,
-                    )
-
             foot    = jnp.asarray(foot)
             command = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, desired_height])
             mpc_data, tau = solve_mpc(
                 mpc_data, qpos, qvel, foot, command,
-                jnp.asarray(config.balance_fixed_contact_mask, dtype=jnp.float32),
+                jnp.asarray(contact_mask, dtype=jnp.float32),
                 jnp.asarray(desired_quat,  dtype=jnp.float32),
                 jnp.array(True),                                # use_base_quat_ref
                 jnp.asarray(foot_anchor,   dtype=jnp.float32), # foot_ref_anchor
@@ -412,8 +439,20 @@ def main(
             ),
         )
 
+        measured_feet = np.asarray(sim_utils.geom_positions(data, contact_ids), dtype=np.float64)
+        swing_now = measured_feet[3 * swing_leg_idx : 3 * swing_leg_idx + 3]
+        swing_goal = foot_anchor[3 * swing_leg_idx : 3 * swing_leg_idx + 3]
+        arrived, _, _ = swing_foot_at_goal(swing_now, swing_goal, random_swing_sampler.cfg)
+        goal_hold_s = goal_hold_s + float(model.opt.timestep) if arrived else 0.0
+
         if _is_crashed():
             _respawn(crashed=True)
+        elif goal_hold_s >= GOAL_HOLD_S:
+            print(
+                f"[goal] swing foot held target for {GOAL_HOLD_S:.0f}s — respawn",
+                flush=True,
+            )
+            _respawn()
          
 
     if headless:
@@ -423,16 +462,17 @@ def main(
         return
 
     def key_callback(key: int):
-        nonlocal foot_anchor
+        nonlocal foot_anchor, goal_hold_s
         if key in RESPAWN_KEYCODES:
             _respawn(manual=True)
         elif key == glfw.KEY_R:
-            # Manually draw a new random swing target in base-frame bounds.
-            new_target = random_swing_sampler.sample_swing_world(
-                data.qpos[:3], data.qpos[3:7]
+            # Manually draw a new random swing target in this foot's quadrant.
+            new_target = _random_swing_world(
+                data.qpos[:3], data.qpos[3:7], swing_leg_idx
             )
             foot_anchor = swing_foot_anchor_from_target(foot_anchor, swing_leg_idx, new_target)
             random_swing_sampler.reset_arrival_state()
+            goal_hold_s = 0.0
             sw = foot_anchor[3*swing_leg_idx : 3*swing_leg_idx+3]
             print(
                 f"[random_swing] resampled → [{sw[0]:.3f}, {sw[1]:.3f}, {sw[2]:.3f}]",
@@ -447,7 +487,10 @@ def main(
                 flush=True,
             )
         else:
-            foot_anchor = swing_foot_cmd.key_callback(key, foot_anchor, data.qpos[3:7])
+            updated = swing_foot_cmd.key_callback(key, foot_anchor, data.qpos[3:7])
+            if updated is not foot_anchor:
+                goal_hold_s = 0.0
+            foot_anchor = updated
 
     # region render initializations---------------------------------------
     _spawn_region_visual = None
@@ -530,7 +573,7 @@ def main(
             if _desired_foot_markers is not None:
                 _desired_foot_markers.draw(
                     viewer, foot_anchor,
-                    contact_mask=np.array(config.balance_fixed_contact_mask),
+                    contact_mask=np.array(contact_mask),
                     swing_only=True, sync=False,
                 )
             # Fixed swing goal sphere
@@ -543,12 +586,12 @@ def main(
                 _swing_workspace_marker.draw(viewer, sync=False)
             # Random swing sampling region (base-frame XYZ bounds box)
             if _swing_bounds_box is not None:
-                random_swing_sampler.update_bounds_box_marker(
-                    _swing_bounds_box,
-                    viewer,
-                    data.qpos[:3],
-                    data.qpos[3:7],
-                    sync=False,
+                if random_swing_sampler.enabled and random_swing_sampler.cfg.show_bounds_box:
+                    _swing_bounds_box.set_frame(data.qpos[:3], data.qpos[3:7])
+                else:
+                    _swing_bounds_box.clear()
+                _swing_bounds_box.draw(
+                    viewer, _bounds_cfg_for_leg(swing_leg_idx), sync=False,
                 )
             #endregion
             #---------------------------------------------------
@@ -565,9 +608,7 @@ def main(
                     contacts=estimate_contacts(
                         data, contact_ids, foot_positions=foot_xyz,
                     ),
-                    contact_nominal=np.asarray(
-                        config.balance_fixed_contact_mask, dtype=np.float32,
-                    ),
+                    contact_nominal=np.array(contact_mask, dtype=np.float32),
                     grf=estimate_foot_grf(model, data, contact_ids),
                     foot_vel=sim_utils.geom_linear_velocities(model, data, contact_ids),
                     ang_vel=np.asarray(data.qvel[3:6]),

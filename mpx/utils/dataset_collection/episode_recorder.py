@@ -68,6 +68,7 @@ from mpx.config.sim_config.config_sensor_noise import (
     sensor_noise_config,
 )
 from mpx.utils.dataset_collection.contact_labeling import (
+    CausalForceAverage,
     ContactDebouncer,
     ContactLabelConfig,
     SubstepForceAccumulator,
@@ -206,9 +207,18 @@ class ControlSample:
     duty_factor: float | None = None
     cmd_base_vel: Any = None
     cmd_segment_id: int = 0
+    # Balance does not run a gait timer (duty_factor is 1, so phase < duty
+    # would mark every foot as stance). The simulator passes the contact mask
+    # the MPC actually solved with.
+    planned_contact: Any = None
 
     def schedule(self, n_feet: int = 4) -> np.ndarray:
         """The contact pattern the controller planned for this step."""
+        if self.planned_contact is not None:
+            planned = np.asarray(self.planned_contact, dtype=np.uint8).reshape(-1)[:n_feet]
+            if planned.size < n_feet:
+                planned = np.pad(planned, (0, n_feet - planned.size))
+            return planned
         if self.leg_phase is None or self.duty_factor is None:
             return np.zeros(n_feet, dtype=np.uint8)
         phase = np.asarray(self.leg_phase, dtype=np.float64).reshape(-1)[:n_feet]
@@ -802,6 +812,9 @@ class EpisodeRecorder:
         self._sampler: StepSampler | None = None
         self._accumulator = SubstepForceAccumulator(config=self.config.contact_labeling)
         self._debouncer = ContactDebouncer(self.config.contact_labeling)
+        self._grf_average = CausalForceAverage(
+            self.config.contact_labeling.schmitt_average_steps
+        )
         # Non-foot contact force is averaged over the same substeps as the GRF,
         # so a one-substep graze does not register as a body strike.
         self._non_foot_forces: List[float] = []
@@ -875,6 +888,7 @@ class EpisodeRecorder:
         self._accumulator.clear()
         self._non_foot_forces.clear()
         self._debouncer.reset()
+        self._grf_average.reset()
         if self._sampler is not None:
             self._sampler.attitude.reset()
             self._sampler.height_debouncer.reset()
@@ -1020,6 +1034,17 @@ class EpisodeRecorder:
             data, control, base_force_pert, reduced, contact,
             non_foot_contact_n=non_foot_n,
         )
+        # Average AFTER the body-frame rotation. Averaging the world vector
+        # over 20 ms and rotating by the latest attitude leaves a heading
+        # residual whenever the robot is turning (ratio 0.74 on the crawl
+        # segment run). The label already ignores a one-step zero; the target
+        # uses the same window so that zero is not stored as 0 N.
+        body = np.asarray(row["grf_base"], dtype=np.float64).reshape(-1, 3)
+        smoothed = self._grf_average.push(body)
+        row["grf_base"] = smoothed.reshape(-1).astype(np.float32)
+        row["grf_yawbase"] = np.asarray(
+            gravity_align(smoothed, row["base_quat"]), dtype=np.float32
+        ).reshape(-1)
 
         for name, value in row.items():
             self._buffer[name].append(value)

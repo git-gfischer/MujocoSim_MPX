@@ -114,8 +114,8 @@ class RandomSwingFootConfig:
     resample_on_arrival: bool = True
 
     # Distance [m] for arrival (separate XY / Z — tripod tracking rarely hits tight 3D).
-    arrival_tolerance_xy_m: float = 0.12
-    arrival_tolerance_z_m: float = 0.1
+    arrival_tolerance_xy_m: float = 0.3
+    arrival_tolerance_z_m: float = 0.3
 
     # When both foot and goal are below this Z [m], use XY+Z tolerances (foot on ground).
     ground_contact_z_max: float = 0.08

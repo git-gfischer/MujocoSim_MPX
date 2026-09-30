@@ -174,6 +174,32 @@ class SubstepForceAccumulator:
         return result
 
 
+class CausalForceAverage:
+    """
+    Causal mean of the per-foot force vector over the Schmitt window.
+
+    Logging is one row per physics step, so the substep average is one sample.
+    The contact label already ignores a single 2 ms zero. The regression target
+    has to use the same window: storing that zero while ``contact`` stays 1
+    puts an exact-0 N outlier under the L2 loss.
+
+    Feed it the body-frame vector. Averaging in the world frame and rotating
+    afterwards leaves heading in the target whenever the robot is yawing.
+    """
+
+    def __init__(self, window: int):
+        if window < 1:
+            raise ValueError("window must be >= 1")
+        self._samples: deque = deque(maxlen=int(window))
+
+    def reset(self) -> None:
+        self._samples.clear()
+
+    def push(self, sample: np.ndarray) -> np.ndarray:
+        self._samples.append(np.asarray(sample, dtype=np.float64).copy())
+        return np.mean(self._samples, axis=0)
+
+
 class ContactDebouncer:
     """
     Hysteresis plus minimum dwell over the per-foot force. Causal.

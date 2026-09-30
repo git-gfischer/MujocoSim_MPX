@@ -147,7 +147,8 @@ EPISODE_COLUMNS: Tuple[Column, ...] = (
            "majority, then Schmitt trigger, then minimum dwell"),
     Column("grf_base", N_FEET * 3, np.float32, "target", "N", "base",
            "PRIMARY GRF TARGET. Per-foot ground reaction force, averaged over the "
-           "substeps of the control interval and rotated into the BODY frame, "
+           "substeps of the control interval and then over the Schmitt window "
+           "(20 ms at 500 Hz), rotated into the BODY frame, "
            "FL FR RL RR x xyz. Body frame because a world-frame vector is not "
            "equivariant under the robot's morphological symmetry group, so a "
            "symmetry-aware model cannot use it as a target"),

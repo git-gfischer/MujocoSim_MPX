@@ -115,13 +115,16 @@ class ResetRandomizationConfig:
     base_height: FloatRangeSpec = FloatRangeSpec(enabled=False, low=0.21, high=0.30)
 
 
-# Loco profile follows the dataclass master switch. Balance stays off until enabled here.
+# Loco profile follows the dataclass master switch.
+# Balance is enabled here; knobs not listed follow the dataclass defaults.
 loco_reset_randomization_config = ResetRandomizationConfig()
 
 balance_reset_randomization_config = ResetRandomizationConfig(
-    enabled=False,
-    max_speed=FloatRangeSpec(enabled=False, low=0.25, high=0.70),
-    max_yaw_rate=FloatRangeSpec(enabled=False, low=0.40, high=1.20),
-    step_freq=FloatRangeSpec(enabled=False, low=1.00, high=1.70),
-    duty_factor=FloatRangeSpec(enabled=False, low=0.55, high=0.80),
+    enabled=True,
+    payload=FloatRangeSpec(enabled=True, low=0.0, high=4.0),
+    solref_timeconst=FloatRangeSpec(
+        enabled=False, low=0.010, high=0.014, log_uniform=True
+    ),
+    friction=FloatRangeSpec(enabled=True, low=1.2, high=2.00),
+    base_height=FloatRangeSpec(enabled=False, low=0.21, high=0.30),
 )

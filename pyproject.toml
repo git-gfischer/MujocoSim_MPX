@@ -63,5 +63,21 @@ trajax = { git = "https://github.com/google/trajax" }
 mpx = { path = ".", editable = true }
 readchar = "*"
 
+# Proprioceptive Image: the default MPX stack plus training and live inference.
+[tool.pixi.feature.pi.dependencies]
+pytorch = { version = ">=2.5", build = "*cuda*" }
+torchvision = { version = ">=0.20", build = "*cuda*" }
+py-opencv = "*"
+numpy = "*"
+tqdm = "*"
+pyyaml = "*"
+wandb = "*"
+scikit-image = "*"
+matplotlib = "*"
+pandas = "*"
+fastparquet = "*"
+
 [tool.pixi.environments]
 default = { solve-group = "default" }
+# default feature is included, so this env has JAX, MuJoCo MJX, and ROS too.
+pi = { features = ["pi"], solve-group = "default" }

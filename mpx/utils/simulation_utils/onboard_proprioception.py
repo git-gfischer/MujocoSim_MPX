@@ -16,10 +16,7 @@ from typing import Sequence
 import mujoco
 import numpy as np
 
-from mpx.config.sim_config.config_sensor_noise import (
-    LatencyConfig,
-    sensor_noise_config,
-)
+from mpx.config.sim_config.config_sensor_noise import sensor_noise_config
 from mpx.utils.simulation_utils.attitude_estimator import ComplementaryAttitudeFilter
 from mpx.utils.simulation_utils.measured_kinematics import (
     ImuReader,
@@ -30,12 +27,12 @@ from mpx.utils.simulation_utils.measured_kinematics import (
 )
 from mpx.utils.simulation_utils.sensor_noise import SensorNoise
 
-# ``SensorNoise`` white-noise stds and the complementary-filter alpha were
-# chosen at the 50 Hz collection rate. Preserve those time constants when PI
-# samples faster: 1 joint-latency step stays 20 ms, and the filter's ~1 s
-# accelerometer blend stays ~1 s.
-COLLECTION_DT = 0.02
-ATTITUDE_ALPHA_50HZ = 0.98
+# Must match collection exactly (episode_recorder.create_collection_session and
+# StepSampler): SensorNoise.from_config(dt=1/row_rate, cfg=sensor_noise_config)
+# with latency_steps used as written, and ComplementaryAttitudeFilter(dt) with its
+# default alpha. Do not rescale either here: the stored datasets and the trained
+# checkpoints saw the unscaled values. A ×10 latency rescale at 500 Hz put the
+# live joints 200 ms behind the training data.
 
 
 @dataclass
@@ -51,20 +48,6 @@ class OnboardSample:
     imu_gyro_body: np.ndarray
     base_quat_est: np.ndarray
     R_est: np.ndarray
-
-
-def _attitude_alpha(dt: float) -> float:
-    tau = COLLECTION_DT / (1.0 - ATTITUDE_ALPHA_50HZ)
-    return float(np.clip(1.0 - float(dt) / tau, 0.0, 0.999999))
-
-
-def _noise_config(dt: float, enabled: bool):
-    scale = COLLECTION_DT / float(dt)
-    latency = LatencyConfig(
-        joint=max(0, int(round(sensor_noise_config.latency_steps.joint * scale))),
-        imu=max(0, int(round(sensor_noise_config.latency_steps.imu * scale))),
-    )
-    return replace(sensor_noise_config, enabled=bool(enabled), latency_steps=latency)
 
 
 class OnboardProprioception:
@@ -88,12 +71,10 @@ class OnboardProprioception:
         self.kinematics = MeasuredKinematics(model, self.foot_site_names, self.n_joints)
         self.sensor_noise = SensorNoise.from_config(
             dt=self.dt,
-            cfg=_noise_config(self.dt, enable_noise),
+            cfg=replace(sensor_noise_config, enabled=bool(enable_noise)),
             rng=rng,
         )
-        self.attitude = ComplementaryAttitudeFilter(
-            dt=self.dt, alpha=_attitude_alpha(self.dt)
-        )
+        self.attitude = ComplementaryAttitudeFilter(dt=self.dt)
         self.sensor_noise.reset(self.n_joints)
 
     @classmethod

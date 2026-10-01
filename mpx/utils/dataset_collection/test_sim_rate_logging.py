@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from mpx.utils.dataset_collection.contact_labeling import (
+    CausalForceAverage,
     ContactLabelConfig,
     debounce_sequence,
 )
@@ -104,6 +105,53 @@ def test_one_physics_step_dropout_does_not_start_a_liftoff():
         ContactLabelConfig(min_dwell_steps=30, schmitt_average_steps=10),
     )
     assert bits[:, 0].min() == 1
+
+
+def test_a_one_step_zero_is_not_stored_as_the_force_target():
+    """The label holds through a 2 ms dropout; the target must not be 0 N there."""
+    average = CausalForceAverage(window=10)
+    stored = None
+    for step in range(20):
+        sample = np.full((4, 3), 40.0)
+        if step == 15:
+            sample[:] = 0.0
+        stored = average.push(sample)
+        if step == 15:
+            assert np.linalg.norm(stored, axis=1).min() > 0.0
+    # A window of 1 is the old instantaneous sample.
+    identity = CausalForceAverage(window=1)
+    assert np.all(identity.push(np.zeros((4, 3))) == 0.0)
+
+
+def test_the_force_window_is_taken_after_the_body_rotation():
+    """Averaging in world, then rotating, puts heading back into the target."""
+    yaw = np.linspace(0.0, np.pi, 40)
+    body = np.tile([20.0, 0.0, 60.0], (len(yaw), 1))
+    world = np.stack(
+        [
+            np.cos(yaw) * body[:, 0] - np.sin(yaw) * body[:, 1],
+            np.sin(yaw) * body[:, 0] + np.cos(yaw) * body[:, 1],
+            body[:, 2],
+        ],
+        axis=1,
+    )
+    heading = np.cos(yaw)
+
+    def corr(series: np.ndarray) -> float:
+        if float(np.std(series)) < 1e-9:
+            return 0.0
+        return abs(float(np.corrcoef(heading, series)[0, 1]))
+
+    world_avg = CausalForceAverage(window=10)
+    late = np.stack([world_avg.push(sample) for sample in world])
+    # Rotate the already-averaged world vector by the latest yaw.
+    late_body_x = np.cos(yaw) * late[:, 0] + np.sin(yaw) * late[:, 1]
+
+    body_avg = CausalForceAverage(window=10)
+    early = np.stack([body_avg.push(sample) for sample in body])
+
+    assert corr(late_body_x) > 0.5
+    assert corr(early[:, 0]) < 0.05
 
 
 def test_a_real_unload_still_lifts_off():

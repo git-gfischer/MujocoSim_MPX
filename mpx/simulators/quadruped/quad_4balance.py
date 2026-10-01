@@ -53,16 +53,6 @@ from mpx.config.sim_config.config_dataset_bucket import dataset_collection_confi
 
 from mpx.estimators.quad_contact_estimation import estimate_contacts, print_contact_friction
 
-# Proprioceptive Image lives in the addon; its imports resolve from that root.
-_PI_ADDON = os.path.abspath(os.path.join(dir_path, "..", "..", "addons", "ProprioceptiveImage"))
-_PI_SIM = os.path.join(_PI_ADDON, "mpx_sim")
-for _p in (_PI_ADDON, _PI_SIM):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-from PI_Pipeline import ProprioceptiveImagePipeline
-
-DEFAULT_PI_CONFIG = os.path.join(_PI_ADDON, "config", "main_config.yaml")
-
 # Set GPU device for JAX
 # gpu_device = jax.devices('gpu')[0]
 # jax.default_device(gpu_device)
@@ -103,9 +93,6 @@ def main(
     collect=False,
     collect_out=None,
     episode_duration_s=None,
-    pi_config=DEFAULT_PI_CONFIG,
-    pi_frequency=100.0,
-    pi_noise=True,
 ):
     model = mujoco.MjModel.from_xml_path(
         dir_path + f"/../../data/{robot}/scene_{scene}.xml"
@@ -122,15 +109,6 @@ def main(
     model.opt.timestep = 1 / sim_frequency
 
     contact_ids = sim_utils.geom_ids(model, config.contact_frame)
-    pi = ProprioceptiveImagePipeline(
-        model=model,
-        contact_ids=contact_ids,
-        n_joints=config.n_joints,
-        sim_frequency=sim_frequency,
-        pi_config=pi_config,
-        pi_frequency=pi_frequency,
-        enable_noise=pi_noise,
-    )
     mpc = MPCWrapper(config, limited_memory=True)
     solve_mpc = _build_solve_fn(mpc)
     reset_mpc = jax.jit(mpc.reset)
@@ -243,7 +221,6 @@ def main(
 
         # 5. Reset auxiliary systems
         base_force_pert.reset()
-        pi.reset()
 
         meta = _randomize_episode()
         extra = ""
@@ -323,7 +300,6 @@ def main(
 
     period = int(sim_frequency / config.mpc_frequency)
     print(f"Controller period: {period} steps at {sim_frequency} Hz simulation frequency.")
-    print(f"Proprioceptive Image period: {pi.period} steps ({pi_frequency} Hz).")
     counter = 0
     tau = jnp.zeros(config.n_joints)
     q_ref = config.q0.copy()
@@ -385,20 +361,13 @@ def main(
             ),
         )
 
-        # Lin_acc / Ang_vel are stored in physical units; LieImage.get_image
-        # integrates the raw IMU window on SE(3).
-        pi.update(data, np.asarray(tau), command, counter, desired_quat=desired_quat)
-
         if _is_crashed():
             _respawn(crashed=True)
          
 
     if headless:
-        try:
-            for _ in range(steps):
-                step_controller()
-        finally:
-            pi.close()
+        for _ in range(steps):
+            step_controller()
         collect_hooks.finish("")
         return
 
@@ -503,7 +472,6 @@ def main(
             viewer.sync()
 
     collect_hooks.finish("")
-    pi.close()
 
 
 if __name__ == "__main__":
@@ -532,23 +500,6 @@ if __name__ == "__main__":
             f"(default: {dataset_collection_config.episode.episode_duration_s} from config)."
         ),
     )
-    parser.add_argument(
-        "--pi-config",
-        type=str,
-        default=DEFAULT_PI_CONFIG,
-        help="Proprioceptive Image configuration (.yaml).",
-    )
-    parser.add_argument(
-        "--pi-frequency",
-        type=float,
-        default=100.0,
-        help="Rate [Hz] at which proprioceptive images are generated.",
-    )
-    parser.add_argument(
-        "--no-pi-noise",
-        action="store_true",
-        help="Disable the sensor noise injected into the proprioceptive time series.",
-    )
     args = parser.parse_args()
     main(
         headless=args.headless,
@@ -558,7 +509,4 @@ if __name__ == "__main__":
         collect=args.collect,
         collect_out=args.collect_out,
         episode_duration_s=args.episode_duration,
-        pi_config=args.pi_config,
-        pi_frequency=args.pi_frequency,
-        pi_noise=not args.no_pi_noise,
     )

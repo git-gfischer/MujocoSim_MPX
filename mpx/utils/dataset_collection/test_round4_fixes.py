@@ -262,6 +262,32 @@ def test_held_out_rows_are_never_reweighted():
     assert abs(float(np.mean(train)) - 1.0) < 0.05
 
 
+def test_invalid_rows_do_not_carry_the_bucket_weight():
+    """The normaliser counts valid rows only, so invalid ones must be weight 0.
+
+    Severe frames land in the rarer buckets. Stamping them with that bucket's
+    weight pulled the mean of positive train weights to 1.10 on crawl.
+    """
+    bucket = DatasetBucketSystem(
+        DatasetBucketConfig(min_bucket_samples_for_weighting=50, max_weight_ratio=10.0),
+        dataset_summary_path=None,
+    )
+    rare = make_record(
+        "ep_train_b", n_steps=60, stance=(1, 0, 0, 1), split="train", group=2.0
+    )
+    rare.arrays["base_height_terrain"][-8:] = 0.16
+    bucket.add_episode(make_record("ep_train_a", n_steps=400, split="train", group=1.0))
+    bucket.add_episode(rare)
+    bucket.add_episode(make_record("ep_val", n_steps=120, split="val", group=4.0))
+
+    rows = bucket.balanced_index_rows()
+    rare_rows = [r for r in rows if r["episode_id"] == "ep_train_b"]
+    assert any(r["weight"] == 0.0 for r in rare_rows), "severe frames kept a weight"
+    assert any(r["weight"] > 0.0 for r in rare_rows), "the bucket itself was dropped"
+    train = [r["weight"] for r in rows if r["split"] == "train" and r["weight"] > 0]
+    assert abs(float(np.mean(train)) - 1.0) < 0.05
+
+
 def test_weights_are_keyed_on_the_whole_bucket():
     bucket = _weighted_bucket_system()
     for label in bucket.bucket_weights():

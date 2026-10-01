@@ -246,6 +246,7 @@ def render_vector(
     scale: float,
     color: np.ndarray = np.array([1.0, 0.0, 0.0, 1.0]),
     geom_id: int = -1,
+    width: float = 0.01,
 ) -> int:
     """Render a decorative arrow aligned with the provided vector."""
 
@@ -272,7 +273,8 @@ def render_vector(
         mat=np.eye(3).reshape(9),
         rgba=np.asarray(color, dtype=np.float32),
     )
-    mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_ARROW, 0.01, start, end)
+    mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_ARROW, width, start, end)
+    geom.rgba[:] = np.asarray(color, dtype=np.float32)
     geom.category = mujoco.mjtCatBit.mjCAT_DECOR
     geom.segid = -1
     geom.objid = -1

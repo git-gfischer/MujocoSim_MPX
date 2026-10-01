@@ -138,7 +138,7 @@ Every stage uses only current and past samples, so the label is reproducible onl
 
 ### The label lags physics by up to 60 ms, by construction
 
-This is the most important property of the label and the easiest one to mistake for a bug. `min_dwell_steps = 3` at 50 Hz means a foot that has genuinely lifted off keeps reading `contact = 1` for up to three more control steps, and a foot that has genuinely touched down keeps reading `0`. That is what bounds the transition rate; it is not a defect.
+This is the most important property of the label and the easiest one to mistake for a bug. `min_dwell_steps = 3` is the **50 Hz config default**. Collection at 500 Hz scales it (`_scale_steps` in `episode_recorder.py`) to **30 logged steps**, which is the same 60 ms. A foot that has genuinely lifted off keeps reading `contact = 1` for up to that dwell, and a foot that has genuinely touched down keeps reading `0`. That is what bounds the transition rate; it is not a defect. The image window is a separate clock: see `docs/agent/05-time-offset.md`.
 
 The consequence a reviewer will trip over: **zero GRF while `contact == 1` is expected inside that window.** On the audited run 0.1076% of in-contact feet carried exactly 0 N, which looks like the aliasing §5 of the R3 work removed — until you measure where those frames sit:
 

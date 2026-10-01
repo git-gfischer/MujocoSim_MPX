@@ -18,6 +18,7 @@ from mpx.utils.dataset_collection.dataset_schema import (
     EpisodeRecord,
 )
 from mpx.utils.dataset_collection.episode_recorder import (
+    ControlSample,
     EpisodeRecorder,
     EpisodeRecorderConfig,
     _ActiveCollectionHooks,
@@ -210,6 +211,23 @@ def test_every_episode_gets_a_split():
 
 
 # ── scene mapping ────────────────────────────────────────────────────────────
+
+def test_planned_contact_overrides_the_gait_timer():
+    # Balance duty is 1, so phase < duty would mark every foot in stance.
+    timer = ControlSample(
+        tau_cmd=np.zeros(12),
+        leg_phase=np.zeros(4),
+        duty_factor=1.0,
+    )
+    np.testing.assert_array_equal(timer.schedule(), np.ones(4, dtype=np.uint8))
+    mask = ControlSample(
+        tau_cmd=np.zeros(12),
+        leg_phase=np.zeros(4),
+        duty_factor=1.0,
+        planned_contact=np.array([0, 1, 1, 1]),
+    )
+    np.testing.assert_array_equal(mask.schedule(), np.array([0, 1, 1, 1], dtype=np.uint8))
+
 
 def test_scene_names_map_to_terrain_types():
     assert scene_to_terrain("flat") is TerrainType.FLAT

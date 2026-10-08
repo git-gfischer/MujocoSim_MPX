@@ -38,6 +38,7 @@ from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config, 
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
 from mpx.config.sim_config.config_base_weight import base_weight_config, BaseWeightConfig
 from mpx.utils.simulation_utils.base_weight import BaseWeightForce
+from mpx.utils.simulation_utils.motor_model import MotorModel
 from mpx.config.sim_config.config_reset_randomization import loco_reset_randomization_config
 from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
 
@@ -47,6 +48,7 @@ from mpx.utils.spawner.spawner import RobotMapSpawner
 from mpx.utils.simulation_utils.console import KeyboardVelocityCommand
 import mpx.utils.simulation_utils.sim_utils as sim_utils
 
+from mpx.navigation.extreme import ExtremeNavigator
 from mpx.navigation.pointNav import PointNavigator
 
 from mpx.utils.simulation_utils.live_plotter import ProprioceptivePlotter
@@ -74,6 +76,7 @@ from mpx.estimators.quad_contact_estimation import estimate_contacts, estimate_f
 
 _ROBOT_DATA_DIR = {
     "go2": "go2",
+    "go2_dls": "go2_dls",
     "aliengo": "aliengo",
     "spot": "boston_dynamics_spot",
     "b2": "b2",
@@ -87,9 +90,9 @@ def robot_config(robot, gait=None, mpc_model="whole_body"):
     ``gait=None`` keeps each robot's own default gait. Go2, Spot and B2 share
     the same gait registry layout (trot / pace / crawl / bound).
     """
-    if robot == "go2":
+    if robot in ("go2", "go2_dls"):
         from mpx.config.robot_config.config_go2 import go2_config, Go2Mode
-        return go2_config(Go2Mode.LOCOMOTION, gait=gait, mpc_model=mpc_model)
+        return go2_config(Go2Mode.LOCOMOTION, gait=gait, mpc_model=mpc_model, robot=robot)
     if mpc_model not in (None, "whole_body"):
         raise ValueError(
             f"--mpc-model {mpc_model!r} is only supported for the go2 "
@@ -129,7 +132,7 @@ def main(
     headless=False,
     steps=500,
     scene="flat",
-    robot="go2",
+    robot="go2_dls",
     nav="vel",
     collect=False,
     collect_out=None,
@@ -156,36 +159,59 @@ def main(
     command_handle = KeyboardVelocityCommand()
     # Navigation mode: "vel" = keyboard velocity, "random" = auto random goals,
     # "pointuser" = user-pointed goal (double-click ground + G in the viewer).
-    use_navigation = nav in ("random", "pointuser")
+    use_navigation = nav in ("random", "random_fb", "pointuser")
     navigator = PointNavigator(
         robot_height=config.robot_height,
-        auto_resample=(nav == "random"),
+        auto_resample=nav in ("random", "random_fb"),
+        random_fb=(nav == "random_fb"),
         # The navigator's command is refreshed once per MPC tick, which is what
         # its yaw slew limit integrates against.
         control_dt=1.0 / config.mpc_frequency,
     )
     # ── where the velocity command comes from ────────────────────────────────
     # "segments" drives the robot with randomly sampled velocity commands rather
-    # than toward a goal. Data collection wants that: goal-following never
-    # commands a yaw rate directly and never reverses, so a dataset built on it
-    # cannot test yaw-invariance or a backward gait.
+    # than toward a goal. Data collection wants that: --nav random never
+    # commands reverse (random_fb does, per goal), and neither commands a yaw
+    # rate except while turning toward a goal.
     #
     # The cost is that the robot deliberately does NOT go to the goal and will
     # walk backwards, which looks like a broken controller if you were not
     # expecting it. So the choice is explicit and announced, never silent.
+    use_extreme = nav == "extreme"
     command_sampler = VelocityCommandSampler(
         dt=1.0 / dataset_collection_config.episode.control_hz
     )
+    extreme = (
+        ExtremeNavigator(
+            robot, getattr(config, "gait_name", "trot"), dt=1.0 / config.mpc_frequency
+        )
+        if use_extreme
+        else None
+    )
+    if extreme is not None:
+        extreme.reset()
     # Asking for a nav mode always wins: --nav random --collect drives to goals.
     # The sampler only steps in when --collect runs WITHOUT one, which is the
     # case that has no other command source anyway (the default --nav vel needs
     # a keyboard, and a headless collection run has none).
+    # --nav extreme is its own navigator, with or without --collect.
     use_command_sampler = (
         collect
         and dataset_collection_config.episode.segmented_commands
         and not use_navigation
+        and not use_extreme
     )
-    if use_command_sampler:
+    if extreme is not None:
+        limits = extreme.limits
+        print(
+            f"[command] --nav extreme ({robot} {extreme.gait}): slewing to "
+            f"±{limits.vx_mps:.2f} m/s, ±{limits.vy_mps:.2f} m/s, "
+            f"±{limits.yaw_rate_rps:.2f} rad/s at "
+            f"{limits.linear_accel_mps2:.2f} m/s² and "
+            f"{limits.yaw_accel_rps2:.2f} rad/s².",
+            flush=True,
+        )
+    elif use_command_sampler:
         print(
             "[command] --collect without a nav mode: driving from random "
             "velocity segments. The robot walks forwards, backwards, sideways "
@@ -194,11 +220,18 @@ def main(
             flush=True,
         )
     elif collect and use_navigation:
+        reverse_note = (
+            "Each new goal is approached forward or backward at random."
+            if nav == "random_fb"
+            else (
+                "Note the dataset will contain no commanded reverse and only the "
+                "yaw the navigator produces turning toward a goal; drop --nav to "
+                "collect the full command envelope instead."
+            )
+        )
         print(
             f"[command] --nav {nav} --collect: driving to navigation goals. "
-            f"Note the dataset will contain no commanded reverse and only the "
-            f"yaw the navigator produces turning toward a goal; drop --nav to "
-            f"collect the full command envelope instead.",
+            f"{reverse_note}",
             flush=True,
         )
     else:
@@ -303,11 +336,14 @@ def main(
         return taken, float(data.qpos[2])
     # endregion
 
+    motor = MotorModel.from_config(dt=1.0 / sim_frequency, n_joints=config.n_joints)
+
     # region reset helper -------------------------------------
     def _respawn(*, manual: bool = False, crashed: bool = False):
         nonlocal mpc_data, tau, q_ref, counter
         collect_hooks.on_respawn(manual=manual, crashed=crashed)
         spawner.apply_to_data(model, data, config.p0, config.quat0, config.q0)
+        motor.reset()
         z_spawned = float(data.qpos[2])
         # Absorb the vertical-relief drop BEFORE the MPC is initialised, so it
         # starts from a pose the robot is actually holding rather than mid-fall.
@@ -325,8 +361,10 @@ def main(
         counter = 0
         base_force_pert.reset()
         command_handle.reset()
-        if nav == "random":
+        if nav in ("random", "random_fb"):
             navigator.reset(np.asarray(data.qpos))
+        if extreme is not None:
+            extreme.reset()
         _randomize_episode(label="respawn")
     # endregion
 
@@ -356,6 +394,9 @@ def main(
             )
         )
         meta = sample.to_metadata()
+        if extreme is not None:
+            meta["max_speed"] = float(extreme.limits.vx_mps)
+            meta["max_yaw_rate"] = float(extreme.limits.yaw_rate_rps)
         collect_hooks.set_episode_conditions(
             randomization=meta,
             seed=episode_seed,
@@ -442,7 +483,10 @@ def main(
         if counter % period == 0:
             foot = jnp.asarray(sim_utils.geom_positions(data, contact_ids))
            
-            if use_command_sampler:
+            if extreme is not None:
+                extreme.step()
+                command = jnp.asarray(extreme.mpc_input(config.robot_height))
+            elif use_command_sampler:
                 command = jnp.asarray(command_sampler.mpc_input(config.robot_height))
             elif use_navigation:
                 command = jnp.asarray(navigator.mpc_input(qpos, config.robot_height))
@@ -483,7 +527,7 @@ def main(
         if use_command_sampler:
             command_sampler.step()
 
-        data.ctrl = np.asarray(tau)
+        data.ctrl = motor(np.asarray(tau), data.qvel[6 : 6 + config.n_joints])
 
         base_force_pert.tick_and_apply(data) # apply random base force perturbation
         base_weight.apply(data)  # extra mass: F = m g, world-down or base-normal
@@ -509,7 +553,11 @@ def main(
                     if command is not None
                     else None
                 ),
-                cmd_segment_id=command_sampler.segment_id if use_command_sampler else 0,
+                cmd_segment_id=(
+                    extreme.segment_id if extreme is not None
+                    else command_sampler.segment_id if use_command_sampler
+                    else 0
+                ),
             ),
         )
 
@@ -661,13 +709,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="flat")
-    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal", "spot", "b2"], default="go2")
+    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "go2_dls", "hyqreal", "spot", "b2"], default="go2_dls")
     parser.add_argument(
         "--nav",
         type=str,
-        choices=["random", "pointuser", "vel"],
+        choices=["random", "random_fb", "pointuser", "vel", "extreme"],
         default="vel",
-        help="Navigation mode: random goals, user-pointed goal, or keyboard velocity.",
+        help=(
+            "Navigation mode: random goals (always forward), random goals "
+            "approached forward or backward, user-pointed goal, keyboard velocity, "
+            "or extreme: slew to that robot's velocity limits "
+            "(linear, yaw, both, or a full stop, either sign)."
+        ),
     )
     parser.add_argument(
         "--gait",

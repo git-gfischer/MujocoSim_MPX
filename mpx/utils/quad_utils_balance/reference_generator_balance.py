@@ -83,20 +83,31 @@ def reference_generator_balance(
 
     ref_lin_vel = Ryaw @ Rpitch @ input[:3]
     ref_ang_vel = input[3:6]
-    p_ref_x = jnp.arange(N + 1) * dt * ref_lin_vel[0] + p[0]
-    p_ref_y = jnp.arange(N + 1) * dt * ref_lin_vel[1] + p[1]
-    p_ref_z = jnp.ones(N + 1) * proprio_height
-    p_ref = jnp.stack([p_ref_x, p_ref_y, p_ref_z], axis=1)
-    dp_ref = jnp.tile(ref_lin_vel, (N + 1, 1))
-    omega_ref = jnp.tile(ref_ang_vel, (N + 1, 1))
     foot_track = jnp.where(use_foot_ref_anchor, foot_ref_anchor, foot)
-    foot_ref = jnp.tile(foot_track, (N + 1, 1))
-    grf_ref = jnp.zeros((N + 1, 3 * n_contact))
 
     runtime = contact.astype(jnp.float32).reshape((n_contact,))
     fallback = fixed_contact_mask.astype(jnp.float32).reshape((n_contact,))
     # Zeros is the wrapper default when no mask is passed; a real stance mask has support.
     mask = jnp.where(jnp.sum(runtime) > 0.5, runtime, fallback)
+    # With one foot unloaded the base origin sits on the diagonal of the other
+    # three, so the opposite foot carries nothing and lifts. Command the trunk
+    # COM (2.1 cm forward of the base origin in go2_mjx.xml) onto the centroid
+    # of the stance feet. Four-foot balance keeps the measured XY.
+    feet_xy = foot_track.reshape((n_contact, 3))[:, :2]
+    stance_w = mask / (jnp.sum(mask) + 1e-6)
+    centroid_xy = jnp.sum(feet_xy * stance_w[:, None], axis=0)
+    trunk_com_xy = Ryaw[:2, :2] @ jnp.array([0.021112, 0.0])
+    shifted_xy = centroid_xy - trunk_com_xy
+    reduced = jnp.sum(mask) < (n_contact - 0.5)
+    origin_xy = jnp.where(reduced, shifted_xy, p[:2])
+    p_ref_x = jnp.arange(N + 1) * dt * ref_lin_vel[0] + origin_xy[0]
+    p_ref_y = jnp.arange(N + 1) * dt * ref_lin_vel[1] + origin_xy[1]
+    p_ref_z = jnp.ones(N + 1) * proprio_height
+    p_ref = jnp.stack([p_ref_x, p_ref_y, p_ref_z], axis=1)
+    dp_ref = jnp.tile(ref_lin_vel, (N + 1, 1))
+    omega_ref = jnp.tile(ref_ang_vel, (N + 1, 1))
+    foot_ref = jnp.tile(foot_track, (N + 1, 1))
+    grf_ref = jnp.zeros((N + 1, 3 * n_contact))
     contact_sequence = jnp.tile(mask, (N + 1, 1))
     sum_m = jnp.sum(mask) + 1e-6
     grf_z_per_leg = mask * (mass * 9.81 / sum_m)

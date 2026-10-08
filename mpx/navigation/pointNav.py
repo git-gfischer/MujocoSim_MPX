@@ -8,7 +8,8 @@ Two ways to set the goal are supported:
 
 * **Random goal** – :meth:`PointNavigator.sample_goal` picks a random XY point at
   a configurable distance from the robot. With ``auto_resample`` a fresh goal is
-  drawn automatically every time the current one is reached.
+  drawn automatically every time the current one is reached. With ``random_fb``
+  each new goal is approached either forward or backward, chosen at random.
 * **User-pointed goal** – in the MuJoCo passive viewer, double-click a spot on
   the ground (this re-centres the camera ``lookat`` there) and press the commit
   key. :meth:`PointNavigator.handle_key` / :meth:`PointNavigator.update` read
@@ -76,6 +77,7 @@ class PointNavigator:
         yaw_accel_rps2: float = 2.0,
         control_dt: float = 0.02,
         auto_resample: bool = True,
+        random_fb: bool = False,
         ground_z: float = 0.0,
         seed: int | None = None,
         commit_key: str = "G",
@@ -97,11 +99,15 @@ class PointNavigator:
         self.yaw_accel_rps2 = float(yaw_accel_rps2)
         self.control_dt = float(control_dt)
         self.auto_resample = bool(auto_resample)
+        # Each new random goal is approached forward or backward with equal chance.
+        self.random_fb = bool(random_fb)
         self.ground_z = float(ground_z)
 
         self._rng = np.random.default_rng(seed)
         self.goal_xy = np.zeros(2, dtype=np.float64)
         self._has_goal = False
+        # True: face the goal and walk forward. False: face away and walk backward.
+        self._drive_forward = True
         # Last commanded yaw rate, carried across calls for the slew limit.
         self._wz = 0.0
 
@@ -124,11 +130,16 @@ class PointNavigator:
 
         self.goal_xy = np.asarray(xy, dtype=np.float64).reshape(2)
         self._has_goal = True
+        self._drive_forward = True
 
     def sample_goal(self, qpos: np.ndarray) -> np.ndarray:
         """Pick a random XY goal at a configured distance from the robot."""
 
         robot_xy = self._robot_xy(qpos)
+        if self.random_fb:
+            self._drive_forward = bool(self._rng.random() < 0.5)
+        else:
+            self._drive_forward = True
         angle = self._rng.uniform(0.0, 2.0 * np.pi)
         radius = self._rng.uniform(*self.goal_distance)
         self.goal_xy = robot_xy + radius * np.array([np.cos(angle), np.sin(angle)])
@@ -186,8 +197,10 @@ class PointNavigator:
             self._wz = self._slew_yaw(0.0)
             return np.array([0.0, 0.0, self._wz], dtype=np.float64)
 
-        # Yaw control: rotate to face the goal.
+        # Yaw control: face the goal to walk forward, or face away to walk backward.
         desired_yaw = float(np.arctan2(to_goal[1], to_goal[0]))
+        if not self._drive_forward:
+            desired_yaw = _wrap_to_pi(desired_yaw + np.pi)
         yaw_error = _wrap_to_pi(desired_yaw - yaw)
         wz = float(np.clip(self.kp_yaw * yaw_error, -self.max_yaw_rate, self.max_yaw_rate))
         wz = self._slew_yaw(wz)
@@ -205,7 +218,8 @@ class PointNavigator:
         body_dir /= max(np.linalg.norm(body_dir), 1e-9)
 
         speed = self.max_speed * min(1.0, distance / self.slowdown_radius)
-        heading_gain = max(0.0, float(np.cos(yaw_error)))  # don't push forward facing away
+        # Hold linear speed until the chosen facing (nose or tail) points at the goal.
+        heading_gain = max(0.0, float(np.cos(yaw_error)))
         vx, vy = speed * heading_gain * body_dir
         return np.array([vx, vy, wz], dtype=np.float64)
 
@@ -280,7 +294,10 @@ class PointNavigator:
     def overlay_text(self) -> tuple[str, str]:
         """Short viewer text describing the controls and goal."""
 
+        facing = ""
+        if self.random_fb:
+            facing = " | fwd" if self._drive_forward else " | back"
         return (
             "Nav: dbl-click ground + G to set goal | N: new random goal",
-            f"goal ({self.goal_xy[0]:+.2f}, {self.goal_xy[1]:+.2f})",
+            f"goal ({self.goal_xy[0]:+.2f}, {self.goal_xy[1]:+.2f}){facing}",
         )

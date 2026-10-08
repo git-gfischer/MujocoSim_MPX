@@ -31,6 +31,7 @@ from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config, 
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
 from mpx.config.sim_config.config_base_weight import base_weight_config
 from mpx.utils.simulation_utils.base_weight import BaseWeightForce
+from mpx.utils.simulation_utils.motor_model import MotorModel
 from mpx.config.sim_config.config_reset_randomization import balance_reset_randomization_config
 from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
 
@@ -59,8 +60,8 @@ from mpx.estimators.quad_contact_estimation import estimate_contacts, print_cont
 
 #region ================Helper functions================
 def robot_config(robot):
-    if robot == "go2":
-        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.FOUR)
+    if robot in ("go2", "go2_dls"):
+        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.FOUR, robot=robot)
     if robot == "b2":
         from mpx.config.robot_config.config_b2 import b2_config, B2Mode
         return b2_config(B2Mode.BALANCE, balance_stance=BalanceStance.FOUR)
@@ -89,7 +90,7 @@ def main(
     headless=False,
     steps=500,
     scene="flat",
-    robot="go2",
+    robot="go2_dls",
     collect=False,
     collect_out=None,
     episode_duration_s=None,
@@ -191,6 +192,8 @@ def main(
         return meta
     # endregion
 
+    motor = MotorModel.from_config(dt=1.0 / sim_frequency, n_joints=config.n_joints)
+
     # region respawn helper -------------------------------------
     def _respawn(*, manual: bool = False, crashed: bool = False):
         nonlocal mpc_data, tau, q_ref, counter, desired_height, desired_quat
@@ -199,6 +202,7 @@ def main(
 
         # 1. Place robot at a random XY/yaw position on the map
         spawner.apply_to_data(model, data, config.p0, config.quat0, config.q0)
+        motor.reset()
 
         # 2. Sample a DELTA pose (roll/pitch/yaw relative to spawn orientation)
         desired_height, delta_quat = desired_pose_sampler.sample()
@@ -337,7 +341,7 @@ def main(
             q_ref = mpc_data.X0[0, 7 : 7 + config.n_joints]
             #print(f"MPC time: {1e3 * (stop - start):.2f} ms")
 
-        data.ctrl = np.asarray(tau)
+        data.ctrl = motor(np.asarray(tau), data.qvel[6 : 6 + config.n_joints])
 
         base_force_pert.tick_and_apply(data) # apply random base force perturbation
         base_weight.apply(data)
@@ -350,9 +354,10 @@ def main(
         # Losing the pose ends the episode but does not respawn, so resample the
         # domain randomization here or the next episode reuses these knobs and
         # becomes a near-duplicate of the one just stored.
-        if collect_hooks.set_recording(_holds_desired_pose(), reason="pose_lost"):
+        pose_closed = collect_hooks.set_recording(_holds_desired_pose(), reason="pose_lost")
+        if pose_closed:
             _randomize_episode()
-        collect_hooks.after_physics_step(
+        duration_closed = collect_hooks.after_physics_step(
             model, data, np.asarray(tau), contact_ids, base_force_pert, config.n_joints,
             control=ControlSample(
                 tau_cmd=np.asarray(tau),
@@ -361,7 +366,12 @@ def main(
             ),
         )
 
-        if _is_crashed():
+        crashed = _is_crashed()
+        # The duration cap closed an episode: the next one gets fresh knobs.
+        # A crash respawns, which resamples on its own.
+        if duration_closed and not pose_closed and not crashed:
+            _randomize_episode()
+        if crashed:
             _respawn(crashed=True)
          
 
@@ -478,7 +488,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="rough")
-    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal", "b2"], default="go2")
+    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "go2_dls", "hyqreal", "b2"], default="go2_dls")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
         "--collect",

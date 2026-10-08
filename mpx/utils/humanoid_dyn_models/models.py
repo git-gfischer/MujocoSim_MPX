@@ -149,6 +149,49 @@ def h1_kinodynamic_torques(
 #endregion
 
 #=============================================================================
+#=========================G1 Humanoid=========================================
+#=============================================================================
+# region humanoid_wb_dynamics
+def humanoid_wb_dynamics(model, mjx_model, contact_id, body_id, n_joints, dt, x, u, t, parameter):
+    """Whole-body dynamics with ``len(contact_id)`` point contacts; ``body_id[i]`` owns contact ``i``.
+
+    Several points on one rigid foot make ``J^T M^-1 J`` rank deficient, so the
+    contact-force solve is regularised. Swing contacts are masked out of the
+    solve instead of being solved for and zeroed afterwards.
+    """
+    n_contact = len(contact_id)
+    mjx_data = mjx.make_data(model)
+    mjx_data = mjx_data.replace(qpos=x[:n_joints+7], qvel=x[n_joints+7:2*n_joints+13])
+    mjx_data = mjx.fwd_position(mjx_model, mjx_data)
+    mjx_data = mjx.fwd_velocity(mjx_model, mjx_data)
+
+    M = mjx_data.qLD
+    D = mjx_data.qfrc_bias
+    v0 = x[n_joints+7:13+2*n_joints]
+
+    contact = parameter[t, :n_contact]
+    mask = jnp.repeat(contact, 3)
+    tau = jnp.concatenate([jnp.zeros(6), u[:n_joints]])
+
+    feet = [mjx_data.geom_xpos[contact_id[i]] for i in range(n_contact)]
+    J = jnp.concatenate(
+        [mjx.jac(mjx_model, mjx_data, feet[i], body_id[i])[0] for i in range(n_contact)], axis=1
+    ) * mask[None, :]
+
+    alpha = 25
+    baumgarte_term = -2 * alpha * (J.T @ v0)
+    JT_M_invJ = J.T @ jax.scipy.linalg.cho_solve((M, False), J) + 1e-4 * jnp.eye(3 * n_contact)
+    rhs = -J.T @ jax.scipy.linalg.cho_solve((M, False), tau - D) + baumgarte_term
+    grf = jax.scipy.linalg.cho_solve(jax.scipy.linalg.cho_factor(JT_M_invJ), rhs) * mask
+
+    v = v0 + jax.scipy.linalg.cho_solve((M, False), tau - D + J @ grf) * dt
+    p = x[:3] + v[:3] * dt
+    quat = math.quat_integrate(x[3:7], v[3:6], dt)
+    q = x[7:7+n_joints] + v[6:6+n_joints] * dt
+    return jnp.concatenate([p, quat, q, v, jnp.concatenate(feet), grf])
+#endregion
+
+#=============================================================================
 #=========================Talos=================================================
 #=============================================================================
 # region talos_wb_dynamics

@@ -64,6 +64,54 @@ def test_omitting_nav_during_collect_uses_velocity_segments():
     assert _resolve_nav("random", collect=True) == "random"
 
 
+def test_nav_random_fb_drives_to_goals_during_collect():
+    use_nav, use_sampler = _collect_command_source(
+        nav="random_fb", segmented_commands=True
+    )
+    assert use_nav is True
+    assert use_sampler is False
+
+
+def test_random_fb_walks_backward_when_the_tail_faces_the_goal():
+    nav = PointNavigator(robot_height=0.3, random_fb=True, max_speed=0.5, seed=1)
+    qpos = np.zeros(7)
+    qpos[3] = 1.0  # identity: facing +x
+    nav.set_goal([2.0, 0.0])
+    nav._drive_forward = False
+    facing_goal = nav.planar_command(qpos)
+    assert facing_goal[0] == 0.0  # hold vx until the tail points at the goal
+    assert facing_goal[2] != 0.0
+
+    qpos[3] = 0.0
+    qpos[6] = 1.0  # yaw = pi, facing -x, so the tail points at +x
+    backing = nav.planar_command(qpos)
+    assert backing[0] < 0.0
+
+
+def test_random_fb_samples_both_directions():
+    nav = PointNavigator(
+        robot_height=0.3,
+        random_fb=True,
+        goal_distance=(2.0, 2.0),
+        seed=0,
+    )
+    qpos = np.zeros(7)
+    qpos[3] = 1.0
+    seen = set()
+    for _ in range(40):
+        nav.sample_goal(qpos)
+        seen.add(nav._drive_forward)
+    assert seen == {True, False}
+
+
+def test_nav_extreme_is_not_the_uniform_sampler():
+    use_nav, use_sampler = _collect_command_source(
+        nav="extreme", segmented_commands=True
+    )
+    assert use_nav is False
+    assert use_sampler is False
+
+
 def test_nav_vel_collect_uses_velocity_segments():
     use_nav, use_sampler = _collect_command_source(
         nav="vel", segmented_commands=True

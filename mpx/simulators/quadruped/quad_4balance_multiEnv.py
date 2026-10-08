@@ -50,6 +50,7 @@ from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
 from mpx.config.sim_config.config_base_weight import base_weight_config
 from mpx.utils.simulation_utils.base_weight import BaseWeightForce
+from mpx.utils.simulation_utils.motor_model import MotorModel
 from mpx.config.sim_config.config_reset_randomization import balance_reset_randomization_config
 from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
 from mpx.config.sim_config.config_quad_spawn import spawn_config
@@ -74,8 +75,8 @@ from mpx.utils.math_utils.quad_math import (
 
 
 def _robot_config(robot: str):
-    if robot == "go2":
-        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.FOUR)
+    if robot in ("go2", "go2_dls"):
+        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.FOUR, robot=robot)
     if robot == "b2":
         from mpx.config.robot_config.config_b2 import b2_config, B2Mode
         return b2_config(B2Mode.BALANCE, balance_stance=BalanceStance.FOUR)
@@ -265,6 +266,10 @@ def _main_collect(
 
     episode_seeds = [0] * n_env
     tau_np = np.zeros((n_env, config.n_joints), dtype=np.float64)
+    motors = [
+        MotorModel.from_config(dt=1.0 / sim_frequency, n_joints=config.n_joints)
+        for _ in range(n_env)
+    ]
     crash_height = config.robot_height * 0.5
     crash_tilt = np.deg2rad(60.0)
 
@@ -321,6 +326,7 @@ def _main_collect(
         single = _randomize(i, single)
         perturbers[i].reset()
         tau_np[i] = 0.0
+        motors[i].reset()
         return _tree_set_index(batch_mpc, i, single), x0, foot
 
     batch_mpc = jax.vmap(lambda _: mpc.make_data())(jnp.arange(n_env))
@@ -386,7 +392,7 @@ def _main_collect(
                 print(f"  step {counter:6d}  batched MPC {1e3 * (timer() - start):.1f} ms", flush=True)
 
         for i in range(n_env):
-            datas[i].ctrl = tau_np[i]
+            datas[i].ctrl = motors[i](tau_np[i], datas[i].qvel[6 : 6 + config.n_joints])
             perturbers[i].tick_and_apply(datas[i])
             weights[i].apply(datas[i])
             mujoco.mj_step(models[i], datas[i])
@@ -507,7 +513,7 @@ def main(
     headless: bool = False,
     steps: int | None = None,
     scene: str = "flat",
-    robot: str = "go2",
+    robot: str = "go2_dls",
     n_env: int = 8,
     collect: bool = False,
     collect_out=None,
@@ -879,7 +885,7 @@ if __name__ == "__main__":
     parser.add_argument("--scene", type=str,
                         choices=["flat", "rough", "perlin", "stairs", "ramp", "slippery"],
                         default="flat")
-    parser.add_argument("--robot", type=str, choices=["go2", "b2"], default="go2")
+    parser.add_argument("--robot", type=str, choices=["go2", "go2_dls", "b2"], default="go2_dls")
     parser.add_argument("--n-env", type=int, default=8,
                         help="Number of parallel environments.")
     parser.add_argument("--headless", action="store_true")

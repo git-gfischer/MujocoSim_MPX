@@ -188,6 +188,19 @@ def swing_foot_anchor_from_target(
     return anchor
 
 
+def tripod_balance_anchor(sampled_anchor, measured_feet, swing_leg_idx, swing_target_world):
+    """Stance feet stay on the ground. The swing foot takes the full target.
+
+    ``p_legs0`` has foot z = 0, and the sampler adds the base position, so a raw
+    sample sits at hip height. Measured foot z is the ground contact. The swing
+    target then overwrites that one foot in XYZ.
+    """
+    anchor = np.asarray(sampled_anchor, dtype=np.float64).copy()
+    measured = np.asarray(measured_feet, dtype=np.float64).reshape(-1)
+    anchor[2::3] = measured[2::3]
+    return swing_foot_anchor_from_target(anchor, swing_leg_idx, swing_target_world)
+
+
 def foot_target_foot_local_to_world(
     foot_current_world: np.ndarray,
     quat: np.ndarray,
@@ -801,7 +814,6 @@ class RandomSwingFootSampler:
         if hold_after < self.cfg.arrival_hold_steps:
             return np.asarray(foot_anchor, dtype=np.float64), 0, hold_after, False
 
-        # Sample next target in base-frame bounds.
         new_target = self.sample_swing_world(base_pos_world, base_quat)
         updated = swing_foot_anchor_from_target(foot_anchor, swing_leg_idx, new_target)
         cooldown = max(1, int(round(self.cfg.resample_cooldown_s / sim_dt)))

@@ -403,6 +403,9 @@ def ensure_signal_bounds_file(
     out = Path(path) if path is not None else default_signal_bounds_path()
     if out.is_file() and not force:
         return out
+    # Same hardware: go2_dls changes only joint damping/armature/friction.
+    if robot == "go2_dls":
+        robot = "go2"
 
     # The YAML operating envelope is the source of truth where one exists; this
     # module's kinematic envelope is the fallback for a robot that has no

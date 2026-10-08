@@ -1,0 +1,25 @@
+# Go2 joint actuator parameters for MotorModel
+# (mpx/utils/simulation_utils/motor_model.py, loaded by
+# mpx/config/sim_config/config_motor_model.py).
+#
+# Joint side (after the gearbox). Each list is [hip HAA, thigh HFE, knee KFE]
+# and repeats for the four legs.
+# Turning the model on is MotorModelConfig.enabled, not this file.
+# null = not known yet. MotorModel refuses to enable until it is set.
+
+# [N*m] Unitree go2_description URDF <limit effort>
+# (unitreerobotics/unitree_ros, robots/go2_description/urdf/go2_description.urdf).
+# Same values as the go2_mjx.xml forcerange.
+peak_torque_nm: [23.7, 23.7, 45.43]
+
+# [rad/s] Unitree go2_description URDF <limit velocity>, used as the joint
+# speed where available torque reaches 0.
+no_load_speed_rad_s: [30.1, 30.1, 15.70]
+
+# [rad/s] Joint speed where available torque starts to drop. Not published;
+# needs the motor torque-speed curve.
+corner_speed_rad_s: [13.5, 13.5, 7.0]
+
+# [s] Current-loop torque time constant. Not published; needs a torque step
+# test or the driver bandwidth f_c (time constant = 1 / (2 pi f_c)).
+torque_time_constant_s: 0.002

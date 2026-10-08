@@ -52,6 +52,7 @@ from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
 from mpx.config.sim_config.config_base_weight import base_weight_config
 from mpx.utils.simulation_utils.base_weight import BaseWeightForce
+from mpx.utils.simulation_utils.motor_model import MotorModel
 from mpx.config.sim_config.config_reset_randomization import balance_reset_randomization_config
 from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
 from mpx.config.sim_config.config_quad_spawn import spawn_config
@@ -75,6 +76,7 @@ from mpx.utils.quad_utils_balance.foot_reference import (
     FootReferenceManager,
     RandomSwingFootSampler,
     swing_foot_anchor_from_target,
+    tripod_balance_anchor,
     foot_target_foot_local_to_world,
     swing_foot_at_goal,
     base_yaw_offset_to_world,
@@ -89,8 +91,8 @@ from mpx.utils.math_utils.quad_math import (
 
 
 def _robot_config(robot: str):
-    if robot == "go2":
-        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.TRIPOD_SWING_FL)
+    if robot in ("go2", "go2_dls"):
+        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.TRIPOD_SWING_FL, robot=robot)
     if robot == "b2":
         from mpx.config.robot_config.config_b2 import b2_config, B2Mode
         return b2_config(B2Mode.BALANCE, balance_stance=BalanceStance.TRIPOD_SWING_FL)
@@ -362,6 +364,10 @@ def _main_collect(
 
     episode_seeds = [0] * n_env
     tau_np = np.zeros((n_env, config.n_joints), dtype=np.float64)
+    motors = [
+        MotorModel.from_config(dt=1.0 / sim_frequency, n_joints=config.n_joints)
+        for _ in range(n_env)
+    ]
     crash_height = config.robot_height * 0.5
     crash_tilt = np.deg2rad(60.0)
 
@@ -405,11 +411,12 @@ def _main_collect(
                 quat=jnp.asarray(datas[i].qpos[3:7]),
                 foot0=jnp.asarray(config.p_legs0),
                 n_contact=config.n_contact,
-                sigma=np.array([0.04, 0.04, 0.0]),
+                sigma=np.array([0.01, 0.01, 0.0]),
             ),
             dtype=np.float64,
         )
-        measured_swing = _feet(i)[3 * leg : 3 * leg + 3]
+        measured_feet = _feet(i)
+        measured_swing = measured_feet[3 * leg : 3 * leg + 3]
         if random_swing_sampler.resample_on_respawn:
             new_swing = _random_swing_world(
                 random_swing_sampler, config.p_legs0, leg,
@@ -419,8 +426,8 @@ def _main_collect(
             new_swing = foot_target_foot_local_to_world(
                 measured_swing, datas[i].qpos[3:7], swing_init_offset
             )
-        foot_anchors[i] = swing_foot_anchor_from_target(
-            anchor, leg, new_swing
+        foot_anchors[i] = tripod_balance_anchor(
+            anchor, measured_feet, leg, new_swing
         ).astype(np.float32)
         arrival_cooldown_steps[i] = 0
         arrival_hold_steps[i] = 0
@@ -459,6 +466,7 @@ def _main_collect(
         single = _randomize(i, single)
         perturbers[i].reset()
         tau_np[i] = 0.0
+        motors[i].reset()
         return _tree_set_index(batch_mpc, i, single), x0, foot
 
     batch_mpc = jax.vmap(lambda _: mpc.make_data())(jnp.arange(n_env))
@@ -511,7 +519,7 @@ def _main_collect(
                 print(f"  step {counter:6d}  batched MPC {1e3 * (timer() - start):.1f} ms", flush=True)
 
         for i in range(n_env):
-            datas[i].ctrl = tau_np[i]
+            datas[i].ctrl = motors[i](tau_np[i], datas[i].qvel[6 : 6 + config.n_joints])
             perturbers[i].tick_and_apply(datas[i])
             weights[i].apply(datas[i])
             mujoco.mj_step(models[i], datas[i])
@@ -665,7 +673,7 @@ def main(
     headless: bool = False,
     steps: int | None = None,
     scene: str = "flat",
-    robot: str = "go2",
+    robot: str = "go2_dls",
     n_env: int = 8,
     collect: bool = False,
     collect_out=None,
@@ -806,9 +814,9 @@ def main(
     pending_reset = np.zeros(n_env, dtype=bool)
 
     def _sample_foot_anchor(
-        i: int, qpos_i: np.ndarray, measured_swing_world: np.ndarray, leg: int,
+        i: int, qpos_i: np.ndarray, measured_feet: np.ndarray, leg: int,
     ) -> np.ndarray:
-        """Compute world-frame tripod foot anchor for robot i (at its current pose)."""
+        """World-frame tripod anchor: stance feet on the ground, swing foot lifted in z."""
         rng_key = jax.random.PRNGKey(int(time.time() * 1000 + i) & 0x7FFFFFFF)
         anchor = np.asarray(
             foot_ref_mgr.tripod_foot_reference_world(
@@ -817,18 +825,19 @@ def main(
                 quat=jnp.asarray(qpos_i[3:7]),
                 foot0=jnp.asarray(config.p_legs0),
                 n_contact=config.n_contact,
-                sigma=np.array([0.04, 0.04, 0.0]),
+                sigma=np.array([0.01, 0.01, 0.0]),
             ),
             dtype=np.float64,
         )
-        origin = np.asarray(measured_swing_world, dtype=np.float64).reshape(3)
+        measured = np.asarray(measured_feet, dtype=np.float64).reshape(-1)
+        origin = measured[3 * leg : 3 * leg + 3]
         if random_swing_sampler.resample_on_respawn:
             new_swing = _random_swing_world(
                 random_swing_sampler, config.p_legs0, leg, qpos_i[:3], qpos_i[3:7],
             )
         else:
             new_swing = foot_target_foot_local_to_world(origin, qpos_i[3:7], SWING_INIT_OFFSET)
-        return swing_foot_anchor_from_target(anchor, leg, new_swing).astype(np.float32)
+        return tripod_balance_anchor(anchor, measured, leg, new_swing).astype(np.float32)
 
     def _reset_robot(i: int, qpos_np: np.ndarray, *, reason: str = "respawn") -> None:
         """Reset robot i, then pick a new swing foot and its target."""
@@ -848,10 +857,8 @@ def main(
         ).astype(np.float32)
         scratch_data.qpos[:len(qpos0_single)] = qpos_np[i]
         mujoco.mj_forward(model, scratch_data)
-        measured_swing = sim_utils.geom_positions(scratch_data, cpu_contact_ids)[
-            3 * leg : 3 * leg + 3
-        ]
-        foot_anchors[i] = _sample_foot_anchor(i, qpos_np[i], measured_swing, leg)
+        measured_feet = sim_utils.geom_positions(scratch_data, cpu_contact_ids)
+        foot_anchors[i] = _sample_foot_anchor(i, qpos_np[i], measured_feet, leg)
         perturbers[i].reset()
         print(f"  [{reason}] robot {i} swing={config.contact_frame[leg]}", flush=True)
 
@@ -1150,7 +1157,7 @@ if __name__ == "__main__":
     parser.add_argument("--scene", type=str,
                         choices=["flat", "rough", "perlin", "stairs", "ramp", "slippery"],
                         default="flat")
-    parser.add_argument("--robot", type=str, choices=["go2", "b2"], default="go2")
+    parser.add_argument("--robot", type=str, choices=["go2", "go2_dls", "b2"], default="go2_dls")
     parser.add_argument("--n-env", type=int, default=8,
                         help="Number of parallel environments.")
     parser.add_argument("--headless", action="store_true")

@@ -7,7 +7,10 @@ that mesh. The other robots are ghost overlays on a square grid.
 
 Navigation modes (``--nav``):
   random     — each robot gets an independent random goal; auto-resampled on arrival.
+  random_fb  — same as random, but each new goal is approached forward or backward.
   vel        — all robots share the same keyboard velocity command (for debugging).
+  extreme    — slews to that robot's linear and yaw limits (either sign). Each
+               segment is linear only, yaw only, both, or a full stop.
 
 Usage::
 
@@ -46,6 +49,7 @@ from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
 from mpx.config.sim_config.config_base_weight import base_weight_config
 from mpx.utils.simulation_utils.base_weight import BaseWeightForce
+from mpx.utils.simulation_utils.motor_model import MotorModel
 from mpx.config.sim_config.config_reset_randomization import loco_reset_randomization_config
 from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
 from mpx.config.sim_config.config_quad_spawn import spawn_config
@@ -54,6 +58,7 @@ from mpx.utils.spawner.spawner import RobotMapSpawner
 from mpx.utils.simulation_utils.console import KeyboardVelocityCommand
 import mpx.utils.simulation_utils.sim_utils as sim_utils
 
+from mpx.navigation.extreme import ExtremeNavigator
 from mpx.navigation.pointNav import PointNavigator
 from mpx.estimators.quad_contact_estimation import estimate_contacts
 from mpx.utils.simulation_utils.velocity_command import (
@@ -74,9 +79,9 @@ from mpx.config.sim_config.config_dataset_bucket import dataset_collection_confi
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _robot_config(robot: str, mpc_model: str = "whole_body", gait=None):
-    if robot == "go2":
+    if robot in ("go2", "go2_dls"):
         from mpx.config.robot_config.config_go2 import go2_config, Go2Mode
-        return go2_config(Go2Mode.LOCOMOTION, gait=gait, mpc_model=mpc_model)
+        return go2_config(Go2Mode.LOCOMOTION, gait=gait, mpc_model=mpc_model, robot=robot)
     if mpc_model not in (None, "whole_body"):
         raise ValueError(
             f"--mpc-model {mpc_model!r} is only supported for the go2 "
@@ -127,9 +132,14 @@ def _resolve_nav(nav: str | None, collect: bool) -> str:
 
 
 def _collect_command_source(nav: str, segmented_commands: bool) -> tuple[bool, bool]:
-    """``--nav random`` always follows goals; segments fill in when there is no nav."""
-    use_navigation = nav in ("random", "pointuser")
-    use_command_sampler = bool(segmented_commands) and not use_navigation
+    """``--nav random`` always follows goals; segments fill in when there is no nav.
+
+    ``--nav extreme`` is its own navigator, not the uniform segment sampler.
+    """
+    use_navigation = nav in ("random", "random_fb", "pointuser")
+    use_command_sampler = (
+        bool(segmented_commands) and not use_navigation and nav != "extreme"
+    )
     return use_navigation, use_command_sampler
 
 
@@ -261,7 +271,8 @@ def _main_collect(
     navigators = [
         PointNavigator(
             robot_height=config.robot_height,
-            auto_resample=(nav == "random"),
+            auto_resample=nav in ("random", "random_fb"),
+            random_fb=(nav == "random_fb"),
             control_dt=1.0 / config.mpc_frequency,
         )
         for _ in range(n_env)
@@ -269,8 +280,26 @@ def _main_collect(
     samplers = [
         VelocityCommandSampler(dt=1.0 / dataset_collection_config.episode.control_hz)
         for _ in range(n_env)
-    ]
-    if use_command_sampler:
+    ] if use_command_sampler else []
+    extremes = [
+        ExtremeNavigator(
+            robot, getattr(config, "gait_name", "trot"), dt=1.0 / config.mpc_frequency
+        )
+        for _ in range(n_env)
+    ] if nav == "extreme" else []
+    for extreme in extremes:
+        extreme.reset()
+    if extremes:
+        limits = extremes[0].limits
+        print(
+            f"[command] --nav extreme ({robot} {extremes[0].gait}): slewing to "
+            f"±{limits.vx_mps:.2f} m/s, ±{limits.vy_mps:.2f} m/s, "
+            f"±{limits.yaw_rate_rps:.2f} rad/s at "
+            f"{limits.linear_accel_mps2:.2f} m/s² and "
+            f"{limits.yaw_accel_rps2:.2f} rad/s².",
+            flush=True,
+        )
+    elif use_command_sampler:
         print(
             "[command] --collect without a nav mode: random velocity segments.",
             flush=True,
@@ -306,6 +335,10 @@ def _main_collect(
     collapse_counters = [0] * n_env
     commands = [None] * n_env
     tau_np = np.zeros((n_env, config.n_joints), dtype=np.float64)
+    motors = [
+        MotorModel.from_config(dt=1.0 / sim_frequency, n_joints=config.n_joints)
+        for _ in range(n_env)
+    ]
 
     def _pack_env(i: int):
         foot = jnp.asarray(sim_utils.geom_positions(datas[i], contact_ids[i]))
@@ -324,8 +357,12 @@ def _main_collect(
                 mpc_data=mpc_data_i,
             )
         )
+        meta = sample.to_metadata()
+        if extremes:
+            meta["max_speed"] = float(extremes[i].limits.vx_mps)
+            meta["max_yaw_rate"] = float(extremes[i].limits.yaw_rate_rps)
         collectors.env[i].set_episode_conditions(
-            randomization=sample.to_metadata(),
+            randomization=meta,
             seed=episode_seeds[i],
             mode="locomotion",
             **read_episode_conditions(models[i], contact_ids[i], weights[i]),
@@ -343,10 +380,14 @@ def _main_collect(
         single = mpc.reset(mpc.make_data(), datas[i].qpos.copy(), datas[i].qvel.copy(), foot)
         single = _randomize(i, single, label="respawn")
         perturbers[i].reset()
-        samplers[i].reset()
-        if nav == "random":
+        if use_command_sampler:
+            samplers[i].reset()
+        if extremes:
+            extremes[i].reset()
+        if nav in ("random", "random_fb"):
             navigators[i].reset(np.asarray(datas[i].qpos))
         tau_np[i] = 0.0
+        motors[i].reset()
         return _tree_set_index(batch_mpc, i, single), x0, foot
 
     batch_mpc = jax.vmap(lambda _: mpc.make_data())(jnp.arange(n_env))
@@ -391,7 +432,10 @@ def _main_collect(
             for i in range(n_env):
                 x0, _ = _pack_env(i)
                 x0_list.append(x0)
-                if use_command_sampler:
+                if extremes:
+                    extremes[i].step()
+                    cmd = jnp.asarray(extremes[i].mpc_input(config.robot_height))
+                elif use_command_sampler:
                     cmd = jnp.asarray(samplers[i].mpc_input(config.robot_height))
                 elif use_navigation:
                     cmd = jnp.asarray(
@@ -422,7 +466,7 @@ def _main_collect(
                 s.step()
 
         for i in range(n_env):
-            datas[i].ctrl = tau_np[i]
+            datas[i].ctrl = motors[i](tau_np[i], datas[i].qvel[6 : 6 + config.n_joints])
             perturbers[i].tick_and_apply(datas[i])
             weights[i].apply(datas[i])
             mujoco.mj_step(models[i], datas[i])
@@ -443,7 +487,11 @@ def _main_collect(
                         if commands[i] is not None
                         else None
                     ),
-                    cmd_segment_id=samplers[i].segment_id if use_command_sampler else 0,
+                    cmd_segment_id=(
+                        extremes[i].segment_id if extremes
+                        else samplers[i].segment_id if use_command_sampler
+                        else 0
+                    ),
                 ),
             )
             if closed:
@@ -523,7 +571,7 @@ def main(
     headless: bool = False,
     steps: int | None = None,
     scene: str = "flat",
-    robot: str = "go2",
+    robot: str = "go2_dls",
     nav: str = "random",
     n_env: int = 8,
     mpc_model: str = "whole_body",
@@ -627,11 +675,24 @@ def main(
 
     # ── Navigators (one per robot, pure-Python) ───────────────────────────────
     navigators = [
-        PointNavigator(robot_height=config.robot_height, auto_resample=(nav == "random"))
+        PointNavigator(
+            robot_height=config.robot_height,
+            auto_resample=nav in ("random", "random_fb"),
+            random_fb=(nav == "random_fb"),
+        )
         for _ in range(n_env)
     ]
-    use_navigation = (nav == "random")
+    use_navigation = nav in ("random", "random_fb")
+    use_extreme = nav == "extreme"
     command_handle = KeyboardVelocityCommand()  # shared keyboard fallback (nav=="vel")
+    extreme_navs = [
+        ExtremeNavigator(
+            robot, getattr(config, "gait_name", "trot"), dt=1.0 / config.mpc_frequency
+        )
+        for _ in range(n_env)
+    ] if use_extreme else []
+    for extreme in extreme_navs:
+        extreme.reset()
 
     def _build_batch_command(qpos_batch: jnp.ndarray) -> jnp.ndarray:
         """Compute the (N, 7) MPC command array from navigator states."""
@@ -646,6 +707,23 @@ def main(
         """Broadcast one keyboard command to all robots."""
         cmd = command_handle.mpc_input(config.robot_height)
         return jnp.tile(jnp.asarray(cmd), (n_env, 1))
+
+    def _build_extreme_command() -> jnp.ndarray:
+        """One slewed near-limit command per robot."""
+        for extreme in extreme_navs:
+            extreme.step()
+        commands = np.array(
+            [extreme.mpc_input(config.robot_height) for extreme in extreme_navs],
+            dtype=np.float64,
+        )
+        return jnp.asarray(commands)
+
+    def _batch_command(qpos_batch: jnp.ndarray) -> jnp.ndarray:
+        if use_extreme:
+            return _build_extreme_command()
+        if use_navigation:
+            return _build_batch_command(qpos_batch)
+        return _build_keyboard_command()
 
     # ── Base-force perturbations (one per robot) ──────────────────────────────
     perturbers = [
@@ -705,10 +783,7 @@ def main(
         for _ in range(steps):
             if counter % period == 0:
                 batch_x0, _ = build_x0_batch(batch_data)
-                if use_navigation:
-                    batch_cmd = _build_batch_command(batch_data.qpos)
-                else:
-                    batch_cmd = _build_keyboard_command()
+                batch_cmd = _batch_command(batch_data.qpos)
                 start = timer()
                 batch_mpc_data, tau_batch = batched_solve(batch_mpc_data, batch_x0, batch_cmd)
                 tau_batch.block_until_ready()
@@ -724,6 +799,8 @@ def main(
                 for i in np.where(crashed)[0]:
                     qpos_np[i] = qpos0_single
                     navigators[i].reset(qpos_np[i])
+                    if use_extreme:
+                        extreme_navs[i].reset()
                     perturbers[i].reset()
                 new_qpos = jnp.asarray(qpos_np)
                 batch_data = jax.vmap(
@@ -771,10 +848,7 @@ def main(
             # ── MPC solve (every period steps) ───────────────────────────────
             if counter % period == 0:
                 batch_x0, _ = build_x0_batch(batch_data)
-                if use_navigation:
-                    batch_cmd = _build_batch_command(batch_data.qpos)
-                else:
-                    batch_cmd = _build_keyboard_command()
+                batch_cmd = _batch_command(batch_data.qpos)
 
                 start = timer()
                 batch_mpc_data, tau_batch = batched_solve(batch_mpc_data, batch_x0, batch_cmd)
@@ -791,6 +865,8 @@ def main(
                 for i in np.where(crashed)[0]:
                     qpos_np[i] = qpos0_single
                     navigators[i].reset(qpos_np[i])
+                    if use_extreme:
+                        extreme_navs[i].reset()
                     perturbers[i].reset()
                     print(f"  [crash] robot {i} respawned", flush=True)
                 batch_data = jax.vmap(
@@ -866,13 +942,18 @@ if __name__ == "__main__":
                         choices=["flat", "rough", "perlin", "stairs", "ramp", "slippery"],
                         default="flat")
     parser.add_argument("--robot", type=str,
-                        choices=["go2", "b2"], default="go2")
+                        choices=["go2", "go2_dls", "b2"], default="go2_dls")
     parser.add_argument("--nav", type=str,
-                        choices=["random", "vel"], default=None,
-                        help="random: each robot walks to its own goal. "
+                        choices=["random", "random_fb", "vel", "extreme"], default=None,
+                        help="random: each robot walks forward to its own goal. "
+                             "random_fb: same goals, but each one is approached "
+                             "forward or backward at random. "
                              "vel: keyboard velocity, or random forward/back/"
                              "sideways/turn segments when --collect is set. "
-                             "Omitting this during --collect uses those segments "
+                             "extreme: slews to that robot's linear and yaw limits, "
+                             "positive or negative. Each segment is linear only, "
+                             "yaw only, both, or a full stop. "
+                             "Omitting this during --collect uses vel segments "
                              "(the robot does reverse). Omitting it otherwise "
                              "is random goals.")
     parser.add_argument("--n-env", type=int, default=8,

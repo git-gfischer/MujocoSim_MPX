@@ -3,19 +3,30 @@ Sample and apply episode parameters on each MuJoCo respawn.
 
 Sampling is uniform (or log-uniform) over config ranges. Applying writes to
 whatever targets are present: payload force, navigator limits, MPC gait timing,
-and foot geom ``solref`` time constants and sliding friction.
+foot geom ``solref`` time constants and sliding friction, and per-joint scales
+on the XML joint damping, armature and frictionloss.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
+import mujoco
 import numpy as np
 
 from mpx.config.sim_config.config_reset_randomization import (
     FloatRangeSpec,
     ResetRandomizationConfig,
     loco_reset_randomization_config,
+)
+from mpx.utils.dataset_collection.dataset_schema import FOOT_ORDER, JOINT_ORDER, N_JOINTS
+
+# Metadata suffix per joint, in the model's actuated-joint order (FL, FR, RL, RR).
+_JOINT_NAMES = tuple(f"{foot}_{joint}" for foot in FOOT_ORDER for joint in JOINT_ORDER)
+_JOINT_FIELDS = (
+    ("joint_damping_scale", "dof_damping"),
+    ("joint_armature_scale", "dof_armature"),
+    ("joint_frictionloss_scale", "dof_frictionloss"),
 )
 
 
@@ -31,10 +42,14 @@ class ResetSample:
     solref_timeconst: float | None = None
     friction: float | None = None
     base_height: float | None = None
+    # One scale per joint, multiplying the XML value.
+    joint_damping_scale: tuple[float, ...] | None = None
+    joint_armature_scale: tuple[float, ...] | None = None
+    joint_frictionloss_scale: tuple[float, ...] | None = None
 
     def to_metadata(self) -> dict[str, float]:
         """JSON-friendly dict of sampled knobs only."""
-        return {
+        meta = {
             name: float(value)
             for name, value in (
                 ("payload_kg", self.payload_kg),
@@ -48,6 +63,13 @@ class ResetSample:
             )
             if value is not None
         }
+        for name, _ in _JOINT_FIELDS:
+            scales = getattr(self, name)
+            if scales is not None:
+                meta.update(
+                    {f"{name}_{joint}": float(s) for joint, s in zip(_JOINT_NAMES, scales)}
+                )
+        return meta
 
 
 @dataclass
@@ -75,6 +97,8 @@ class ResetRandomizer:
     ):
         self.cfg = cfg
         self._rng = rng if rng is not None else np.random.default_rng(cfg.rng_seed)
+        # XML joint values per model, captured on first write so scales never compound.
+        self._joint_nominal: dict[int, tuple[np.ndarray, dict[str, np.ndarray]]] = {}
 
     @classmethod
     def from_config(
@@ -96,6 +120,9 @@ class ResetRandomizer:
             solref_timeconst=self._draw(self.cfg.solref_timeconst),
             friction=self._draw(self.cfg.friction),
             base_height=self._draw(self.cfg.base_height),
+            joint_damping_scale=self._draw_joints(self.cfg.joint_damping_scale),
+            joint_armature_scale=self._draw_joints(self.cfg.joint_armature_scale),
+            joint_frictionloss_scale=self._draw_joints(self.cfg.joint_frictionloss_scale),
         )
 
     def apply(self, sample: ResetSample, targets: ResetTargets) -> Any:
@@ -140,12 +167,34 @@ class ResetRandomizer:
             mu = float(sample.friction)
             for geom_id in np.asarray(targets.foot_geom_ids).reshape(-1):
                 targets.model.geom_friction[int(geom_id), 0] = mu
+        if targets.model is not None:
+            self._apply_joint_scales(sample, targets.model)
         return mpc_data
 
     def sample_and_apply(self, targets: ResetTargets) -> tuple[ResetSample, Any]:
         sample = self.sample()
         mpc_data = self.apply(sample, targets)
         return sample, mpc_data
+
+    def _apply_joint_scales(self, sample: ResetSample, model: mujoco.MjModel) -> None:
+        knobs = [(field, getattr(sample, name)) for name, field in _JOINT_FIELDS]
+        if all(scales is None for _, scales in knobs):
+            return
+        if id(model) not in self._joint_nominal:
+            hinge = np.asarray(model.jnt_type) == mujoco.mjtJoint.mjJNT_HINGE
+            dofs = np.asarray(model.jnt_dofadr)[hinge]
+            if dofs.size != N_JOINTS:
+                raise ValueError(f"joint randomization expects {N_JOINTS} hinge joints, got {dofs.size}")
+            self._joint_nominal[id(model)] = (
+                dofs,
+                {field: np.array(getattr(model, field)[dofs]) for field, _ in knobs},
+            )
+        dofs, nominal = self._joint_nominal[id(model)]
+        for field, scales in knobs:
+            if scales is not None:
+                getattr(model, field)[dofs] = nominal[field] * np.asarray(scales)
+        # Armature feeds dof_invweight0 / actuator_acc0, which scale constraint softness.
+        mujoco.mj_setConst(model, mujoco.MjData(model))
 
     def _draw(self, spec: FloatRangeSpec) -> float | None:
         if not spec.enabled:
@@ -155,3 +204,8 @@ class ResetRandomizer:
             log_high = np.log(spec.high)
             return float(np.exp(self._rng.uniform(log_low, log_high)))
         return float(self._rng.uniform(spec.low, spec.high))
+
+    def _draw_joints(self, spec: FloatRangeSpec) -> tuple[float, ...] | None:
+        if not spec.enabled:
+            return None
+        return tuple(self._draw(spec) for _ in range(N_JOINTS))

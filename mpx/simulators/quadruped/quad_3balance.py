@@ -30,6 +30,7 @@ from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config, 
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
 from mpx.config.sim_config.config_base_weight import base_weight_config
 from mpx.utils.simulation_utils.base_weight import BaseWeightForce
+from mpx.utils.simulation_utils.motor_model import MotorModel
 from mpx.config.sim_config.config_reset_randomization import balance_reset_randomization_config
 from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
 
@@ -44,6 +45,7 @@ from mpx.utils.quad_utils_balance.foot_reference import (
     FootReferenceManager,
     RandomSwingFootSampler,
     swing_foot_anchor_from_target,
+    tripod_balance_anchor,
     foot_target_foot_local_to_world,
     swing_foot_at_goal,
     base_yaw_offset_to_world,
@@ -75,8 +77,8 @@ from timeit import default_timer as timer
 
 #region ================Helper functions================
 def robot_config(robot):
-    if robot == "go2":
-        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.TRIPOD_SWING_FL)
+    if robot in ("go2", "go2_dls"):
+        return go2_config(Go2Mode.BALANCE, balance_stance=BalanceStance.TRIPOD_SWING_FL, robot=robot)
     if robot == "b2":
         from mpx.config.robot_config.config_b2 import b2_config, B2Mode
         return b2_config(B2Mode.BALANCE, balance_stance=BalanceStance.TRIPOD_SWING_FL)
@@ -106,7 +108,7 @@ def main(
     headless=False,
     steps=500,
     scene="flat",
-    robot="go2",
+    robot="go2_dls",
     collect=False,
     collect_out=None,
     episode_duration_s=None,
@@ -268,6 +270,29 @@ def main(
     #------------------------------------------------
 
 
+    motor = MotorModel.from_config(dt=1.0 / sim_frequency, n_joints=config.n_joints)
+
+    def _randomize_episode() -> dict:
+        nonlocal mpc_data, episode_seed
+        sample, mpc_data = reset_randomizer.sample_and_apply(
+            ResetTargets(
+                model=model,
+                foot_geom_ids=contact_ids,
+                base_weight=base_weight,
+                navigator=None,
+                mpc_data=mpc_data,
+            )
+        )
+        meta = sample.to_metadata()
+        episode_seed += 1
+        collect_hooks.set_episode_conditions(
+            randomization=meta,
+            seed=episode_seed,
+            mode=f"stand_3leg_{config.contact_frame[swing_leg_idx]}",
+            **read_episode_conditions(model, contact_ids, base_weight),
+        )
+        return meta
+
     # region respawn helper -------------------------------------
     def _respawn(*, manual: bool = False, crashed: bool = False):
         nonlocal mpc_data, tau, q_ref, counter, desired_height, desired_quat, foot_anchor
@@ -283,6 +308,7 @@ def main(
 
         # 1. Place robot at a random XY/yaw position on the map
         spawner.apply_to_data(model, data, config.p0, config.quat0, config.q0)
+        motor.reset()
 
         # 2. Sample desired body pose (height + orientation delta relative to spawn)
         desired_height, delta_quat = desired_pose_sampler.sample()
@@ -297,19 +323,20 @@ def main(
                 quat=jnp.asarray(data.qpos[3:7]),
                 foot0=jnp.asarray(config.p_legs0),
                 n_contact=config.n_contact,
-                sigma=np.array([0.04, 0.04, 0.0]),   # ±4 cm XY, fixed Z
+                sigma=np.array([0.01, 0.01, 0.0]),   # ±1 cm XY; 4 cm erased the tripod margin
             ),
             dtype=np.float64,
         )
 
-        # 4. Place swing foot — random target in that foot's quadrant, else fixed offset
-        measured_swing_world = sim_utils.geom_positions(data, contact_ids)[
-            3 * swing_leg_idx : 3 * swing_leg_idx + 3
-        ]
+        # 4. Plant stance feet on the measured ground height and lift the swing foot in z only.
+        measured_feet = sim_utils.geom_positions(data, contact_ids)
+        measured_swing_world = measured_feet[3 * swing_leg_idx : 3 * swing_leg_idx + 3]
         new_swing_world = _swing_target_world(
             data.qpos[:3], data.qpos[3:7], swing_leg_idx, measured_swing_world
         )
-        foot_anchor = swing_foot_anchor_from_target(foot_anchor, swing_leg_idx, new_swing_world)
+        foot_anchor = tripod_balance_anchor(
+            foot_anchor, measured_feet, swing_leg_idx, new_swing_world
+        )
 
         # 5. Reset MPC warm-start from the new spawn state
         foot     = jnp.asarray(sim_utils.geom_positions(data, contact_ids))
@@ -323,24 +350,7 @@ def main(
         swing_foot_cmd.reset()
         random_swing_sampler.reset_arrival_state()
 
-        sample, mpc_data = reset_randomizer.sample_and_apply(
-            ResetTargets(
-                model=model,
-                foot_geom_ids=contact_ids,
-                base_weight=base_weight,
-                navigator=None,
-                mpc_data=mpc_data,
-            )
-        )
-        meta = sample.to_metadata()
-        nonlocal episode_seed
-        episode_seed += 1
-        collect_hooks.set_episode_conditions(
-            randomization=meta,
-            seed=episode_seed,
-            mode=f"stand_3leg_{config.contact_frame[swing_leg_idx]}",
-            **read_episode_conditions(model, contact_ids, base_weight),
-        )
+        meta = _randomize_episode()
         extra = ""
         if meta:
             extra = "  " + "  ".join(
@@ -424,13 +434,13 @@ def main(
             )
             tau.block_until_ready()
             q_ref = mpc_data.X0[0, 7 : 7 + config.n_joints]
-        data.ctrl = np.asarray(tau)
+        data.ctrl = motor(np.asarray(tau), data.qvel[6 : 6 + config.n_joints])
         base_force_pert.tick_and_apply(data)
         base_weight.apply(data)
         mujoco.mj_step(model, data)
         counter += 1
 
-        collect_hooks.after_physics_step(
+        duration_closed = collect_hooks.after_physics_step(
             model, data, np.asarray(tau), contact_ids, base_force_pert, config.n_joints,
             control=ControlSample(
                 tau_cmd=np.asarray(tau),
@@ -445,9 +455,15 @@ def main(
         arrived, _, _ = swing_foot_at_goal(swing_now, swing_goal, random_swing_sampler.cfg)
         goal_hold_s = goal_hold_s + float(model.opt.timestep) if arrived else 0.0
 
-        if _is_crashed():
+        crashed = _is_crashed()
+        held = goal_hold_s >= GOAL_HOLD_S
+        # The duration cap closed an episode: the next one gets fresh knobs.
+        # A crash or a held goal respawns, which resamples on its own.
+        if duration_closed and not crashed and not held:
+            _randomize_episode()
+        if crashed:
             _respawn(crashed=True)
-        elif goal_hold_s >= GOAL_HOLD_S:
+        elif held:
             print(
                 f"[goal] swing foot held target for {GOAL_HOLD_S:.0f}s — respawn",
                 flush=True,
@@ -631,7 +647,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="flat")
-    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "hyqreal", "b2"], default="go2")
+    parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "go2_dls", "hyqreal", "b2"], default="go2_dls")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
         "--collect",

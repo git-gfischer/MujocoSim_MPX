@@ -47,7 +47,7 @@ so it always discards the buffer.
 from __future__ import annotations
 
 import atexit
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List
 
@@ -67,6 +67,7 @@ from mpx.config.sim_config.config_sensor_noise import (
     SensorNoiseConfig,
     sensor_noise_config,
 )
+from mpx.config.sim_config.config_motor_model import motor_model_config
 from mpx.utils.dataset_collection.contact_labeling import (
     CausalForceAverage,
     ContactDebouncer,
@@ -1689,6 +1690,7 @@ def setup_sim_collection(
             "substeps_per_control": recorder.substeps_per_control,
             "episode_duration_s": ep_duration,
             "sensor_noise": recorder.sensor_noise.to_metadata(),
+            "motor_model": asdict(motor_model_config),
             "contact_labeling": recorder.config.contact_labeling.to_metadata(
                 recorder.substeps_per_control, DEFAULT_BODY_WEIGHT_N
             ),

@@ -1,0 +1,47 @@
+<mujoco model="go2_dls">
+  <!-- Plant model. Same as go2/go2_mjx.xml except the joint damping, armature
+       and frictionloss, which are the IIT-DLS MuJoCo sysid values
+       (github.com/iit-DLSLab/sim2real-robot-identification, robot_model/go2)
+       averaged over the four legs per joint type. go2_mjx_mpc.xml must keep the
+       same values minus frictionloss. -->
+  <compiler angle="radian" meshdir="../go2/assets" autolimits="true"/>
+
+  <option cone="pyramidal" impratio="100" iterations="50" ls_iterations="10">
+    <flag eulerdamp="disable"/>
+  </option>
+
+  <default>
+    <default class="go2">
+      <geom friction="0.6" margin="0.001" condim="3"/>
+      <joint axis="0 1 0" solreflimit="0.004 1" solimplimit="0.98 0.9999 0.0005 0.5 2"/>
+      <motor ctrlrange="-23.7 23.7" forcerange="-23.7 23.7"/>
+
+      <default class="abduction">
+        <joint axis="1 0 0" range="-1.0472 1.0472" damping="0.2348" armature="0.0074" frictionloss="0.2189"/>
+      </default>
+      <default class="hip">
+        <joint range="-1.5708 3.4907" damping="0.2040" armature="0.0169" frictionloss="0.1999"/>
+      </default>
+      <default class="knee">
+        <joint range="-2.7227 -0.83776" damping="0.1345" armature="0.0322" frictionloss="0.9132"/>
+        <motor ctrlrange="-45.43 45.43" forcerange="-45.43 45.43"/>
+      </default>
+      <default class="visual">
+        <geom type="mesh" contype="0" conaffinity="0" group="2"/>
+      </default>
+      <default class="go2foot">
+        <site group="1" pos="-0.002 0 -0.213"/>
+        <geom rgba="0.231373 0.380392 0.705882 1"/>
+      </default>
+      <default class="collision">
+        <geom group="3"/>
+        <default class="foot">
+          <geom size="0.0175" pos="-0.002 0 -0.213" priority="1" solref="0.01 1" solimp="0.9 0.95 0.001" condim="6"
+            friction="1.2 0.02 0.01"/>
+        </default>
+      </default>
+    </default>
+  </default>
+
+  <include file="go2_body.xml"/>
+</mujoco>

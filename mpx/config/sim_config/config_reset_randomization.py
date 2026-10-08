@@ -42,7 +42,7 @@ class ResetRandomizationConfig:
     enabled: bool = True
     rng_seed: int | None = None
 
-    payload: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.0, high=5.0)
+    payload: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.0, high=2.0) # 0.0, 5.0 
 
     # Realised median base speed in v3 was only 0.26 m/s against a [0.25, 0.70]
     # range. Widened, and the sign is handled by the navigator so reverse and
@@ -50,7 +50,7 @@ class ResetRandomizationConfig:
     # Measured: at 1.0 m/s this MPC lost the robot in 6 of 10 episodes, and the
     # falls were what pushed joints past their limits. 0.80 keeps the coverage
     # Task 9d asks for while leaving the controller able to track the command.
-    max_speed: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.20, high=0.80)
+    max_speed: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.25, high=0.50) # 0.20, 0.80
     # Yaw rate cap handed to the navigator [rad/s]. Was [0.40, 1.50]; 1.50 rad/s
     # is ~86 deg/s and the navigator saturates it the instant a new goal appears
     # (kp_yaw * yaw_error saturates for any error past ~0.5 rad), while the
@@ -59,7 +59,7 @@ class ResetRandomizationConfig:
     # the floor. 0.80 is the navigator's own tuned default and stays inside what
     # this MPC tracks; PointNavigator now also slews toward the cap rather than
     # stepping to it (``yaw_accel_rps2``).
-    max_yaw_rate: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.30, high=1.50)
+    max_yaw_rate: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.15, high=0.55) # 0.30, 1.50
 
     # Gait timing is OFF. duty_factor and step_freq are no longer independent
     # knobs: they belong to a gait, and config_go2.GO2_GAITS holds a matched set
@@ -113,6 +113,16 @@ class ResetRandomizationConfig:
     # to the lowest collision-free z, which measures +0.010 m on flat but up to
     # the +0.100 m cap on rough. See SpawnConfig.foot_relief_max.
     base_height: FloatRangeSpec = FloatRangeSpec(enabled=False, low=0.21, high=0.30)
+
+    # Per-joint scale on the plant's XML joint damping, armature and
+    # frictionloss, drawn independently for each of the 12 joints. 0.5-1.5
+    # covers the leg-to-leg spread of the IIT-DLS identified Go2 (knee
+    # frictionloss 0.49-1.36 N*m around the 0.91 go2_dls value). Only the plant
+    # model is written; the MPC keeps its nominal model. A field that is 0 in
+    # the XML stays 0 (go2 has no frictionloss).
+    joint_damping_scale: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.5, high=1.5)
+    joint_armature_scale: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.5, high=1.5)
+    joint_frictionloss_scale: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.5, high=1.5)
 
 
 # Loco profile follows the dataclass master switch.

@@ -205,4 +205,48 @@ def talos_wb_obj(n_joints,n_contact,N,W,reference,x, u, t):
     return jnp.where(t == N, 0.5 * term_cost, 0.5 * stage_cost)
 #endregion
 
+# region humanoid_wb_obj
+def humanoid_wb_obj(n_joints, n_contact, N, torque_limits, W, reference, x, u, t):
+    """Whole-body cost for :func:`humanoid_wb_dynamics` (state ``[qpos, qvel, feet, grf]``).
+
+    ``W`` blocks: ``[p, rot, q, dp, omega, dq, foot, tau, grf]``; ``torque_limits``
+    holds one symmetric bound per joint.
+    """
+    nj, nc = n_joints, n_contact
+    p, quat, q = x[:3], x[3:7], x[7:7+nj]
+    dp, omega, dq = x[7+nj:10+nj], x[10+nj:13+nj], x[13+nj:13+2*nj]
+    p_leg = x[13+2*nj:13+2*nj+3*nc]
+    grf = x[13+2*nj+3*nc:]
+    tau = u[:nj]
+
+    ref = reference[t]
+    p_ref, quat_ref, q_ref = ref[:3], ref[3:7], ref[7:7+nj]
+    dp_ref, omega_ref = ref[7+nj:10+nj], ref[10+nj:13+nj]
+    p_leg_ref = ref[13+nj:13+nj+3*nc]
+    contact = ref[13+nj+3*nc:13+nj+4*nc]
+    grf_ref = ref[13+nj+4*nc:13+nj+7*nc]
+
+    def quad(e, start):
+        return e.T @ W[start:start+e.shape[0], start:start+e.shape[0]] @ e
+
+    i_dp = 6 + nj
+    i_dq = 12 + nj
+    i_foot = 12 + 2*nj
+    i_tau = i_foot + 3*nc
+    i_grf = i_tau + nj
+    term_cost = quad(p - p_ref, 0) + quad(math.quat_sub(quat, quat_ref), 3) + quad(q - q_ref, 6) + \
+                quad(dp - dp_ref, i_dp) + quad(omega - omega_ref, i_dp + 3) + quad(dq, i_dq)
+
+    mu = 0.5
+    friction_cone = penalty(mu*grf[2::3] - jnp.sqrt(jnp.square(grf[1::3]) + jnp.square(grf[::3]) + 1e-2))
+    sign = jnp.kron(jnp.eye(nj), jnp.array([-1, 1])).T
+    torque_margin = sign @ tau + jnp.repeat(torque_limits, 2) + 1e-2
+    speed_margin = sign @ dq + 10.0 + 1e-2
+
+    stage_cost = term_cost + quad(p_leg - p_leg_ref, i_foot) + quad(tau, i_tau) + quad(grf - grf_ref, i_grf) + \
+                 jnp.sum(penalty(torque_margin, 1, 1)) + jnp.sum(friction_cone*contact) + jnp.sum(penalty(speed_margin, 1, 1))
+
+    return jnp.where(t == N, 0.5 * term_cost, 0.5 * stage_cost)
+#endregion
+
 # region talos_wb_hessian_gnpenalty

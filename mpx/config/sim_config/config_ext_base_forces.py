@@ -25,13 +25,13 @@ from dataclasses import dataclass
 class ExtBaseForceConfig:
     """Configuration for ``RandomBaseForcePerturbation``."""
 
-    enabled: bool = True
+    enabled: bool = False
 
     # Random constant force pulse magnitude [N].
-    force_magnitude_range: tuple[float, float] = (10.0, 50.0)
+    force_magnitude_range: tuple[float, float] = (5.0, 50.0)
 
     # Pulse duration [s].
-    duration_range_s: tuple[float, float] = (0.05, 0.30)
+    duration_range_s: tuple[float, float] = (0.05, 0.50)
 
     # Idle wait between pulses [s].
     cooldown_range_s: tuple[float, float] = (0.3, 1.0)

@@ -101,10 +101,13 @@ class RandomSwingFootConfig:
     enabled: bool = True
 
     # Base-frame offset ranges (origin at qpos[:3], yaw-aligned axes).
-    # Tune these to match your robot's reachable workspace.
-    x_bounds: tuple[float, float] = (-0.05, 0.4)   # forward   [m]
-    y_bounds: tuple[float, float] = (0.05, 0.3)  # lateral   [m]
-    z_bounds: tuple[float, float] = (-0.27, -0.20)  # vertical  [m]  (negative = below base)
+    # Magnitudes are mirrored into each foot's quadrant. Nominal Go2 feet sit
+    # near |x|=0.19 m, |y|=0.14 m. This box is about ±10 cm around that, and
+    # the foot can rise about 15 cm (z = -0.12). The old box reached 0.40 m
+    # forward and 0.30 m out, which pulled the body out of the triangle.
+    x_bounds: tuple[float, float] = (0.09, 0.29)   # forward   [m]
+    y_bounds: tuple[float, float] = (0.04, 0.24)   # lateral   [m]
+    z_bounds: tuple[float, float] = (-0.27, -0.12)  # vertical  [m]  (negative = below base)
 
     # When True, a new random target is drawn automatically on every respawn.
     resample_on_respawn: bool = True

@@ -332,7 +332,7 @@ python -m mpx.utils.dataset_collection.grf_diversity datasets/<run>
 
 The fix is always at the episode level, never at the label level:
 
-- **Widen the velocity command.** `segmented_commands = True` drives collection from a segmented velocity command instead of goal following. Goal following never commands a yaw rate and never reverses — the audited v4 run had commanded yaw identically zero for all 23,994 rows, so yaw-invariance could not be tested at all, and the GRF distribution was correspondingly narrow. A collapsed `speed_bin` in the key now points straight at this knob.
+- **Widen the velocity command.** `--nav random` follows goals forward and barely commands yaw. `--nav random_fb` approaches each goal forward or backward. `--nav extreme` slews to that robot's linear and yaw limits. `--nav vel` is the keyboard, including during `--collect`.
 - **Resample the randomization more often.** `randomize_per_episode = True` resamples every knob at each episode boundary. v3 reused one parameter set across up to 12 consecutive episodes, which both narrowed the spread and put near-duplicate episodes in different splits. This is what `n_randomization_groups` measures.
 - **Vary friction, payload and terrain.** Foot μ and `solref` sampling lives in `config_reset_randomization.py`; see [mujoco_contact_friction.md](mujoco_contact_friction.md).
 - **Add perturbation magnitude range**, not just presence — which the `small`/`large` split now makes visible.
@@ -503,7 +503,6 @@ All in `mpx/config/sim_config/config_dataset_bucket.py`. Nothing below is also h
 | `episode_mode` | `"event"` | Close on task event; duration is a cap |
 | `goal_closes_episode_after_s` | 30.0 | Earliest goal that ends an episode |
 | `randomize_per_episode` | True | Resample DR at every episode boundary |
-| `segmented_commands` | True | Velocity-command driving instead of goal following |
 | `val_ratio` / `test_ratio` / `split_seed` | 0.15 / 0.10 / 0 | Per-episode split |
 | `validate_after_run` | True | Run the validator when the run closes |
 | `validate_skip` | `()` | Nothing skipped — the difficulty probe is the gate that decides whether a folder is worth training on, and it spent every run so far reported as SKIPPED |

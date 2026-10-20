@@ -51,6 +51,9 @@ _DIR = os.path.dirname(os.path.realpath(__file__))
 _DEFAULT_MODEL_PATH = os.path.abspath(
     os.path.join(_DIR, "..", "..", "data", "go2", "go2_mjx.xml")
 )
+_DLS_MPC_MODEL_PATH = os.path.abspath(
+    os.path.join(_DIR, "..", "..", "data", "go2_dls", "go2_mjx_mpc.xml")
+)
 
 # Contact bitmask order follows ``contact_frame``: FL, FR, RL, RR (1 = in stance).
 
@@ -776,6 +779,7 @@ def go2_config(
     gait: str | GaitParams | None = None,
     balance_stance: str | None = None,
     mpc_model: str = Go2MpcModel.WHOLE_BODY,
+    robot: str = "go2",
 ) -> _Go2Common:
     """
     Parameters
@@ -789,7 +793,20 @@ def go2_config(
     mpc_model
         Locomotion only. ``Go2MpcModel.WHOLE_BODY`` (default),
         ``Go2MpcModel.INVERSE_DYNAMICS``, or ``Go2MpcModel.SRBD``.
+    robot
+        ``"go2"`` or ``"go2_dls"``. ``"go2_dls"`` puts the MPC on
+        ``data/go2_dls/go2_mjx_mpc.xml``: identified joint damping and
+        armature, no joint frictionloss.
     """
+    if robot not in ("go2", "go2_dls"):
+        raise ValueError(f"Unknown Go2 robot {robot!r}; expected 'go2' or 'go2_dls'.")
+    cfg = _go2_behaviour_config(mode, gait, balance_stance, mpc_model)
+    if robot == "go2_dls":
+        cfg.model_path = _DLS_MPC_MODEL_PATH
+    return cfg
+
+
+def _go2_behaviour_config(mode, gait, balance_stance, mpc_model) -> _Go2Common:
     key = mode.lower().strip()
     model_key = str(mpc_model).lower().strip().replace("-", "_")
     if key == Go2Mode.LOCOMOTION:

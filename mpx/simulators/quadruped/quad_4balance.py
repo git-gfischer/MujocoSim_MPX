@@ -34,6 +34,7 @@ from mpx.utils.simulation_utils.base_weight import BaseWeightForce
 from mpx.utils.simulation_utils.motor_model import MotorModel
 from mpx.config.sim_config.config_reset_randomization import balance_reset_randomization_config
 from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
+from mpx.utils.simulation_utils.pilar_terrain import PilarTerrain
 
 from mpx.config.sim_config.config_quad_spawn import spawn_config, SpawnConfig
 from mpx.utils.spawner.spawner import RobotMapSpawner
@@ -52,6 +53,8 @@ from mpx.utils.dataset_collection.episode_recorder import (
 from mpx.utils.dataset_collection.dataset_bucket_system import GaitType
 from mpx.config.sim_config.config_dataset_bucket import dataset_collection_config
 
+from mpx.config.sim_config.config_camurri_contact import camurri_contact_config
+from mpx.estimators.camurri_contact import camurri_from_sim, format_camurri
 from mpx.estimators.quad_contact_estimation import estimate_contacts, print_contact_friction
 
 # Set GPU device for JAX
@@ -98,6 +101,7 @@ def main(
     model = mujoco.MjModel.from_xml_path(
         dir_path + f"/../../data/{robot}/scene_{scene}.xml"
     )
+    pilar_terrain = PilarTerrain.from_scene(scene, model)
 
     # robot configuration
     config = robot_config(robot)
@@ -124,6 +128,7 @@ def main(
         episode_duration_s=episode_duration_s,
         collect_out=collect_out,
         name_prefix="4balance",
+        reset_randomization=balance_reset_randomization_config.to_metadata(),
         cfg=dataset_collection_config,
     )
     #endregion------------------------------------------------
@@ -152,6 +157,7 @@ def main(
     reset_randomizer = ResetRandomizer.from_config(balance_reset_randomization_config)
     # Incremented once per episode; recorded so a run is reproducible.
     episode_seed = 0
+    pilar_sample = None
     #------------------------------------------------
 
     # region desired pose sampler configuration---------------------------------------
@@ -183,6 +189,8 @@ def main(
             )
         )
         meta = sample.to_metadata()
+        if pilar_sample is not None:
+            meta = {**meta, **pilar_sample.to_metadata()}
         collect_hooks.set_episode_conditions(
             randomization=meta,
             seed=episode_seed,
@@ -197,11 +205,21 @@ def main(
     # region respawn helper -------------------------------------
     def _respawn(*, manual: bool = False, crashed: bool = False):
         nonlocal mpc_data, tau, q_ref, counter, desired_height, desired_quat
+        nonlocal foot_anchor, pilar_sample
 
         collect_hooks.on_respawn(manual=manual, crashed=crashed)
 
-        # 1. Place robot at a random XY/yaw position on the map
-        spawner.apply_to_data(model, data, config.p0, config.quat0, config.q0)
+        # 1. Pillars (if this scene), then place the robot.
+        pilar_sample = pilar_terrain.apply(model)
+        if pilar_sample is None:
+            spawner.apply_to_data(model, data, config.p0, config.quat0, config.q0)
+        else:
+            p0, xy_yaw = pilar_terrain.spawn_p0_and_xy_yaw(
+                pilar_sample, float(config.robot_height)
+            )
+            spawner.apply_to_data(
+                model, data, p0, config.quat0, config.q0, xy_yaw=xy_yaw
+            )
         motor.reset()
 
         # 2. Sample a DELTA pose (roll/pitch/yaw relative to spawn orientation)
@@ -217,7 +235,11 @@ def main(
 
         # 4. Reset MPC warm-start from the new spawn state
         foot = jnp.asarray(sim_utils.geom_positions(data, contact_ids))
-        foot_anchor = np.asarray(foot, dtype=np.float64)   # ← lock feet to spawn positions
+        if pilar_sample is None:
+            foot_anchor = np.asarray(foot, dtype=np.float64)
+        else:
+            desired_height = float(desired_height) + pilar_sample.mean_height
+            foot_anchor = pilar_terrain.foot_anchor(pilar_sample)
         mpc_data = reset_mpc(mpc.make_data(), data.qpos.copy(), data.qvel.copy(), foot)
         tau      = jnp.zeros(config.n_joints)
         q_ref    = config.q0.copy()
@@ -320,6 +342,9 @@ def main(
            
             command = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, desired_height], dtype=np.float64)
             contact = jnp.asarray(estimate_contacts(data, contact_ids))
+            camurri_prob, camurri_stance = camurri_from_sim(model, data, contact_ids)
+            if camurri_contact_config.echo:
+                print(format_camurri(camurri_prob, camurri_stance))
             # print(f"Contact: {contact}")
             # print(foot)
             # print(f"Command: {command}")
@@ -487,7 +512,7 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=500)
-    parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="rough")
+    parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery", "pilars"], default="rough")
     parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "go2_dls", "hyqreal", "b2"], default="go2_dls")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(

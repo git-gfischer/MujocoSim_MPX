@@ -1,0 +1,17 @@
+<mujoco>
+  <body name="ramp_00">
+    <geom name="ramp_00" type="mesh" mesh="ramp_00" material="pyramid" priority="2" condim="6" friction="2 0.1 0.05" solref="0.01 1" solimp="0.9 0.95 0.001 0.5 2"/>
+  </body>
+  <body name="ramp_01">
+    <geom name="ramp_01" type="mesh" mesh="ramp_01" material="pyramid" priority="2" condim="6" friction="2 0.1 0.05" solref="0.01 1" solimp="0.9 0.95 0.001 0.5 2"/>
+  </body>
+  <body name="ramp_02">
+    <geom name="ramp_02" type="mesh" mesh="ramp_02" material="pyramid" priority="2" condim="6" friction="2 0.1 0.05" solref="0.01 1" solimp="0.9 0.95 0.001 0.5 2"/>
+  </body>
+  <body name="ramp_03">
+    <geom name="ramp_03" type="mesh" mesh="ramp_03" material="pyramid" priority="2" condim="6" friction="2 0.1 0.05" solref="0.01 1" solimp="0.9 0.95 0.001 0.5 2"/>
+  </body>
+  <body name="ramp_04">
+    <geom name="ramp_04" type="mesh" mesh="ramp_04" material="pyramid" priority="2" condim="6" friction="2 0.1 0.05" solref="0.01 1" solimp="0.9 0.95 0.001 0.5 2"/>
+  </body>
+</mujoco>

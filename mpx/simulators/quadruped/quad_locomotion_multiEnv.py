@@ -8,7 +8,7 @@ that mesh. The other robots are ghost overlays on a square grid.
 Navigation modes (``--nav``):
   random     — each robot gets an independent random goal; auto-resampled on arrival.
   random_fb  — same as random, but each new goal is approached forward or backward.
-  vel        — all robots share the same keyboard velocity command (for debugging).
+  vel        — all robots share one keyboard velocity command, including --collect.
   extreme    — slews to that robot's linear and yaw limits (either sign). Each
                segment is linear only, yaw only, both, or a full stop.
 
@@ -44,6 +44,8 @@ jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 from mpx.utils.quad_utils_locomotion.mpc_wrapper_inverse import make_locomotion_mpc
+from mpx.utils.simulation_utils.measured_kinematics import apply_rough_terrain_mpc
+from mpx.utils.simulation_utils.pyramid_terrain import copy_scene_stamp, stamp_scene
 
 from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
@@ -60,11 +62,9 @@ import mpx.utils.simulation_utils.sim_utils as sim_utils
 
 from mpx.navigation.extreme import ExtremeNavigator
 from mpx.navigation.pointNav import PointNavigator
+from mpx.estimators.camurri_contact import camurri_from_sim
 from mpx.estimators.quad_contact_estimation import estimate_contacts
-from mpx.utils.simulation_utils.velocity_command import (
-    VelocityCommandSampler,
-    command_from_mpc_input,
-)
+from mpx.utils.simulation_utils.velocity_command import command_from_mpc_input
 from mpx.utils.dataset_collection.episode_recorder import (
     ControlSample,
     read_episode_conditions,
@@ -121,26 +121,19 @@ def _env_scalar(value, i: int) -> float:
 
 
 def _resolve_nav(nav: str | None, collect: bool) -> str:
-    """Omitting ``--nav`` during collection is the velocity-segment walk.
+    """Omitting ``--nav`` during collection keeps the keyboard (``vel``).
 
-    The flag used to default to ``random``, so a collect run that simply left
-    ``--nav`` off still drove to goals and never commanded reverse.
+    A collect run that leaves the flag off does not drive to goals. Reverse
+    and near-limit commands are ``--nav random_fb`` and ``--nav extreme``.
     """
     if nav is not None:
         return nav
     return "vel" if collect else "random"
 
 
-def _collect_command_source(nav: str, segmented_commands: bool) -> tuple[bool, bool]:
-    """``--nav random`` always follows goals; segments fill in when there is no nav.
-
-    ``--nav extreme`` is its own navigator, not the uniform segment sampler.
-    """
-    use_navigation = nav in ("random", "random_fb", "pointuser")
-    use_command_sampler = (
-        bool(segmented_commands) and not use_navigation and nav != "extreme"
-    )
-    return use_navigation, use_command_sampler
+def _collect_command_source(nav: str) -> bool:
+    """Goal modes follow a point. ``vel`` is the keyboard; ``extreme`` is separate."""
+    return nav in ("random", "random_fb", "pointuser")
 
 
 def _tick_navigators(navigators, qpos_batch, viewer=None) -> None:
@@ -226,6 +219,7 @@ def _main_collect(
     collect_out,
     episode_duration_s,
     gait,
+    terrain_aware: bool = True,
 ):
     """N CPU MuJoCo worlds, batched MPC, one dataset run directory."""
     config = _robot_config(robot, mpc_model=mpc_model, gait=gait)
@@ -240,11 +234,19 @@ def _main_collect(
     for _ in range(n_env):
         model = mujoco.MjModel.from_xml_path(xml_path)
         model.opt.timestep = 1.0 / sim_frequency
+        if models:
+            # ponytail: one stamp for every env; the height grid is built from model 0
+            copy_scene_stamp(models[0], model)
+        else:
+            stamp_scene(scene, model)
         data = mujoco.MjData(model)
         models.append(model)
         datas.append(data)
         contact_ids.append(sim_utils.geom_ids(model, config.contact_frame))
 
+    apply_rough_terrain_mpc(
+        config, models[0], scene=scene, terrain_aware=terrain_aware,
+    )
     mpc = make_locomotion_mpc(config, limited_memory=True)
 
     def _run_one(mpc_data_i, x0_i, command_i, contact_i):
@@ -261,12 +263,14 @@ def _main_collect(
         robot=robot,
         episode_duration_s=episode_duration_s,
         collect_out=collect_out,
+        nav=nav,
+        reset_randomization=loco_reset_randomization_config.for_scene(
+            scene, gait=getattr(config, "gait_name", None), robot=robot
+        ).to_metadata(),
         cfg=dataset_collection_config,
     )
 
-    use_navigation, use_command_sampler = _collect_command_source(
-        nav, dataset_collection_config.episode.segmented_commands
-    )
+    use_navigation = _collect_command_source(nav)
     command_handle = KeyboardVelocityCommand()
     navigators = [
         PointNavigator(
@@ -277,10 +281,6 @@ def _main_collect(
         )
         for _ in range(n_env)
     ]
-    samplers = [
-        VelocityCommandSampler(dt=1.0 / dataset_collection_config.episode.control_hz)
-        for _ in range(n_env)
-    ] if use_command_sampler else []
     extremes = [
         ExtremeNavigator(
             robot, getattr(config, "gait_name", "trot"), dt=1.0 / config.mpc_frequency
@@ -297,11 +297,6 @@ def _main_collect(
             f"±{limits.yaw_rate_rps:.2f} rad/s at "
             f"{limits.linear_accel_mps2:.2f} m/s² and "
             f"{limits.yaw_accel_rps2:.2f} rad/s².",
-            flush=True,
-        )
-    elif use_command_sampler:
-        print(
-            "[command] --collect without a nav mode: random velocity segments.",
             flush=True,
         )
     elif use_navigation:
@@ -328,7 +323,12 @@ def _main_collect(
     ]
     weights = [BaseWeightForce.from_config(cfg=base_weight_config) for _ in range(n_env)]
     randomizers = [
-        ResetRandomizer.from_config(loco_reset_randomization_config) for _ in range(n_env)
+        ResetRandomizer.from_config(
+            loco_reset_randomization_config.for_scene(
+                scene, gait=getattr(config, "gait_name", None), robot=robot
+            )
+        )
+        for _ in range(n_env)
     ]
 
     episode_seeds = [0] * n_env
@@ -353,7 +353,6 @@ def _main_collect(
                 foot_geom_ids=contact_ids[i],
                 base_weight=weights[i],
                 navigator=navigators[i] if use_navigation else None,
-                command_sampler=samplers[i] if use_command_sampler else None,
                 mpc_data=mpc_data_i,
             )
         )
@@ -380,8 +379,6 @@ def _main_collect(
         single = mpc.reset(mpc.make_data(), datas[i].qpos.copy(), datas[i].qvel.copy(), foot)
         single = _randomize(i, single, label="respawn")
         perturbers[i].reset()
-        if use_command_sampler:
-            samplers[i].reset()
         if extremes:
             extremes[i].reset()
         if nav in ("random", "random_fb"):
@@ -429,14 +426,13 @@ def _main_collect(
             x0_list = []
             cmd_list = []
             contact_list = []
+            camurri_mismatch = 0
             for i in range(n_env):
                 x0, _ = _pack_env(i)
                 x0_list.append(x0)
                 if extremes:
                     extremes[i].step()
                     cmd = jnp.asarray(extremes[i].mpc_input(config.robot_height))
-                elif use_command_sampler:
-                    cmd = jnp.asarray(samplers[i].mpc_input(config.robot_height))
                 elif use_navigation:
                     cmd = jnp.asarray(
                         navigators[i].mpc_input(datas[i].qpos, config.robot_height)
@@ -445,6 +441,10 @@ def _main_collect(
                     cmd = jnp.asarray(command_handle.mpc_input(config.robot_height))
                 commands[i] = cmd
                 contact = jnp.asarray(estimate_contacts(datas[i], contact_ids[i]))
+                _, camurri_stance = camurri_from_sim(models[i], datas[i], contact_ids[i])
+                camurri_mismatch += int(np.count_nonzero(
+                    np.asarray(contact) != camurri_stance
+                ))
                 if getattr(config, "mpc_model", "whole_body") != "srbd":
                     contact = contact * 0.0
                 cmd_list.append(cmd)
@@ -459,11 +459,11 @@ def _main_collect(
             tau_batch.block_until_ready()
             tau_np[:] = np.asarray(tau_batch)
             if counter == 0 or counter % (period * 50) == 0:
-                print(f"  step {counter:6d}  batched MPC {1e3 * (timer() - start):.1f} ms", flush=True)
-
-        if use_command_sampler:
-            for s in samplers:
-                s.step()
+                print(
+                    f"  step {counter:6d}  batched MPC {1e3 * (timer() - start):.1f} ms"
+                    f"  camurri_mismatch_feet={camurri_mismatch}",
+                    flush=True,
+                )
 
         for i in range(n_env):
             datas[i].ctrl = motors[i](tau_np[i], datas[i].qvel[6 : 6 + config.n_joints])
@@ -488,9 +488,7 @@ def _main_collect(
                         else None
                     ),
                     cmd_segment_id=(
-                        extremes[i].segment_id if extremes
-                        else samplers[i].segment_id if use_command_sampler
-                        else 0
+                        extremes[i].segment_id if extremes else 0
                     ),
                 ),
             )
@@ -579,6 +577,7 @@ def main(
     collect_out=None,
     episode_duration_s=None,
     gait=None,
+    terrain_aware: bool = True,
 ):
     duration_s = (
         episode_duration_s
@@ -610,6 +609,7 @@ def main(
             collect_out=collect_out,
             episode_duration_s=episode_duration_s,
             gait=gait,
+            terrain_aware=terrain_aware,
         )
 
     # ── Config & CPU model ──────────────────────────────────────────────────
@@ -634,6 +634,7 @@ def main(
 
     data.qpos = qpos0_single
     mujoco.mj_forward(model, data)
+    apply_rough_terrain_mpc(config, model, scene=scene, terrain_aware=terrain_aware)
     mjx_data_template = mjx.put_data(model, data)
 
     # All robots start at the same pose; the grid offset is added only for rendering.
@@ -939,7 +940,7 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--scene", type=str,
-                        choices=["flat", "rough", "perlin", "stairs", "ramp", "slippery"],
+                        choices=["flat", "rough", "perlin", "stairs", "ramp", "staired_pyramid", "slippery"],
                         default="flat")
     parser.add_argument("--robot", type=str,
                         choices=["go2", "go2_dls", "b2"], default="go2_dls")
@@ -948,17 +949,26 @@ if __name__ == "__main__":
                         help="random: each robot walks forward to its own goal. "
                              "random_fb: same goals, but each one is approached "
                              "forward or backward at random. "
-                             "vel: keyboard velocity, or random forward/back/"
-                             "sideways/turn segments when --collect is set. "
+                             "vel: keyboard velocity, including during --collect. "
                              "extreme: slews to that robot's linear and yaw limits, "
                              "positive or negative. Each segment is linear only, "
                              "yaw only, both, or a full stop. "
-                             "Omitting this during --collect uses vel segments "
-                             "(the robot does reverse). Omitting it otherwise "
-                             "is random goals.")
+                             "Omitting this during --collect keeps the keyboard. "
+                             "Omitting it otherwise is random goals. "
+                             "Reverse goals are random_fb.")
     parser.add_argument("--n-env", type=int, default=8,
                         help="Number of parallel environments.")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--terrain-aware",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "On --scene rough, stairs, ramp, or staired_pyramid, land swings on the raycast height grid. "
+            "--no-terrain-aware keeps the blind foothold height. "
+            "Ignored on other scenes."
+        ),
+    )
     parser.add_argument(
         "--mpc-model",
         type=str,
@@ -1003,4 +1013,5 @@ if __name__ == "__main__":
         collect_out=args.collect_out,
         episode_duration_s=args.episode_duration,
         gait=args.gait,
+        terrain_aware=args.terrain_aware,
     )

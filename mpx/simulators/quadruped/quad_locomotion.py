@@ -1,7 +1,9 @@
 # Usage: python quad_locomotion.py --headless --steps 2000 --scene flat --robot go2 --nav random --n-env 8 --gait trot
 # dataset_collection: python quad_locomotion.py --collect --scene flat --robot go2 --nav random
+# pickle collection: python quad_locomotion.py --collect pickle --scene flat --robot go2 --nav random
 # Note for dataset collection: python -m mpx.utils.dataset_collection.make_signal_bounds --robot go2
 # dataset_collection: python quad_locomotion.py --collect --scene flat --robot go2 --nav random
+# pickle collection: python quad_locomotion.py --collect pickle --scene flat --robot go2 --nav random
 # Note for dataset collection: python -m mpx.utils.dataset_collection.make_signal_bounds --robot go2
 
 import argparse
@@ -32,6 +34,13 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 #from gym_quadruped.utils.mujoco.visual import render_vector
 
 from mpx.utils.quad_utils_locomotion.mpc_wrapper_inverse import make_locomotion_mpc
+from mpx.utils.simulation_utils.measured_kinematics import (
+    apply_rough_terrain_mpc,
+    build_terrain_height_grid,
+    terrain_overlay_grid,
+)
+from mpx.utils.simulation_utils.pyramid_terrain import PyramidTerrain, opposite_goal
+from mpx.utils.simulation_utils.ramp_pyramid import RampPyramid
 #from mpx.utils.quad_utils_locomotion.mpc_wrapper_locomotion import LocomotionMPCControllerWrapper
 
 from mpx.config.sim_config.config_ext_base_forces import ext_base_force_config, ExtBaseForceConfig
@@ -53,9 +62,12 @@ from mpx.navigation.pointNav import PointNavigator
 
 from mpx.utils.simulation_utils.live_plotter import ProprioceptivePlotter
 from mpx.config.sim_config.config_live_plotter import live_plotter_config
-from mpx.utils.simulation_utils.velocity_command import (
-    VelocityCommandSampler,
-    command_from_mpc_input,
+from mpx.utils.simulation_utils.velocity_command import command_from_mpc_input
+from mpx.utils.dataset_collection.dataset_pickle import (
+    COLLECT_PARQUET,
+    COLLECT_PICKLE,
+    PickleSimCollector,
+    add_collect_argument,
 )
 from mpx.utils.dataset_collection.episode_recorder import (
     ControlSample,
@@ -68,6 +80,7 @@ from mpx.utils.dataset_collection.dataset_bucket_system import (
 )
 from mpx.config.sim_config.config_dataset_bucket import dataset_collection_config
 
+from mpx.estimators.camurri_contact import camurri_from_sim, format_camurri
 from mpx.estimators.quad_contact_estimation import estimate_contacts, estimate_foot_grf
 
 # Set GPU device for JAX
@@ -121,9 +134,9 @@ def _scene_xml_path(robot: str, scene: str) -> str:
 #------------------------------------------------
 def _build_solve_fn(mpc):
     @jax.jit
-    def solve_mpc(mpc_data, qpos, qvel, foot, command, contact):
+    def solve_mpc(mpc_data, qpos, qvel, foot, command, contact, terrain=None):
         x0 = mpc.pack_state(qpos, qvel, foot)
-        return mpc.run(mpc_data, x0, command, contact)
+        return mpc.run(mpc_data, x0, command, contact, terrain=terrain)
 
     return solve_mpc
 #endregion------------------------------------------------
@@ -134,13 +147,24 @@ def main(
     scene="flat",
     robot="go2_dls",
     nav="vel",
-    collect=False,
+    collect=None,
     collect_out=None,
     episode_duration_s=None,
     gait=None,
     mpc_model="whole_body",
+    terrain_aware=True,
 ):
+    collect_parquet = collect == COLLECT_PARQUET
+    collect_pickle = collect == COLLECT_PICKLE
+    collecting = collect_parquet or collect_pickle
     model = mujoco.MjModel.from_xml_path(_scene_xml_path(robot, scene))
+    # Place staired-pyramid layers and the ramp stamp before the height grid
+    # is raycast. Other scenes are a no-op and keep the XML as loaded.
+    ramp_pyramid = RampPyramid.from_scene(scene, model)
+    if ramp_pyramid.active:
+        ramp_pyramid.apply(model)
+    pyramid_terrain = PyramidTerrain.from_scene(scene, model)
+    pyramid_sample = pyramid_terrain.apply(model)
 
     # robot configuration
     config = robot_config(robot, gait=gait, mpc_model=mpc_model)
@@ -155,6 +179,9 @@ def main(
     model.opt.timestep = 1 / sim_frequency
 
     contact_ids = sim_utils.geom_ids(model, config.contact_frame)
+    apply_rough_terrain_mpc(config, model, scene=scene, terrain_aware=terrain_aware)
+    if terrain_aware and (ramp_pyramid.active or pyramid_terrain.kind == "staired_pyramid"):
+        config.terrain_grid_dynamic = True
     mpc = make_locomotion_mpc(config, limited_memory=True)
     command_handle = KeyboardVelocityCommand()
     # Navigation mode: "vel" = keyboard velocity, "random" = auto random goals,
@@ -168,19 +195,16 @@ def main(
         # its yaw slew limit integrates against.
         control_dt=1.0 / config.mpc_frequency,
     )
-    # ── where the velocity command comes from ────────────────────────────────
-    # "segments" drives the robot with randomly sampled velocity commands rather
-    # than toward a goal. Data collection wants that: --nav random never
-    # commands reverse (random_fb does, per goal), and neither commands a yaw
-    # rate except while turning toward a goal.
-    #
-    # The cost is that the robot deliberately does NOT go to the goal and will
-    # walk backwards, which looks like a broken controller if you were not
-    # expecting it. So the choice is explicit and announced, never silent.
+    if ramp_pyramid.active and nav in ("random", "random_fb"):
+        navigator.goal_sampler = ramp_pyramid.opposite_goal
+    elif pyramid_terrain.kind == "staired_pyramid" and nav in ("random", "random_fb"):
+        # Across the pyramid: random nearby goals mostly walked off the region.
+        navigator.goal_sampler = lambda qpos: opposite_goal(
+            qpos, pyramid_sample, pyramid_terrain.cfg
+        )
+    # --nav vel is the keyboard, including during --collect. Reverse and
+    # near-limit commands come from --nav random_fb and --nav extreme.
     use_extreme = nav == "extreme"
-    command_sampler = VelocityCommandSampler(
-        dt=1.0 / dataset_collection_config.episode.control_hz
-    )
     extreme = (
         ExtremeNavigator(
             robot, getattr(config, "gait_name", "trot"), dt=1.0 / config.mpc_frequency
@@ -190,18 +214,6 @@ def main(
     )
     if extreme is not None:
         extreme.reset()
-    # Asking for a nav mode always wins: --nav random --collect drives to goals.
-    # The sampler only steps in when --collect runs WITHOUT one, which is the
-    # case that has no other command source anyway (the default --nav vel needs
-    # a keyboard, and a headless collection run has none).
-    # --nav extreme is its own navigator, with or without --collect.
-    use_command_sampler = (
-        collect
-        and dataset_collection_config.episode.segmented_commands
-        and not use_navigation
-        and not use_extreme
-    )
-    if extreme is not None:
         limits = extreme.limits
         print(
             f"[command] --nav extreme ({robot} {extreme.gait}): slewing to "
@@ -211,22 +223,13 @@ def main(
             f"{limits.yaw_accel_rps2:.2f} rad/s².",
             flush=True,
         )
-    elif use_command_sampler:
-        print(
-            "[command] --collect without a nav mode: driving from random "
-            "velocity segments. The robot walks forwards, backwards, sideways "
-            "and turns, with no goal — that is what gives the dataset the "
-            "reverse and turning coverage goal-following cannot produce.",
-            flush=True,
-        )
-    elif collect and use_navigation:
+    elif collecting and use_navigation:
         reverse_note = (
             "Each new goal is approached forward or backward at random."
             if nav == "random_fb"
             else (
-                "Note the dataset will contain no commanded reverse and only the "
-                "yaw the navigator produces turning toward a goal; drop --nav to "
-                "collect the full command envelope instead."
+                "Forward goals only. Commanded reverse is --nav random_fb; "
+                "near-limit linear and yaw commands are --nav extreme."
             )
         )
         print(
@@ -242,11 +245,11 @@ def main(
 
     plotter = (
         ProprioceptivePlotter.from_config(cfg=live_plotter_config)
-        if live_plotter_config.enabled and not collect
+        if live_plotter_config.enabled and not collecting
         else None
     )
     collect_hooks = setup_sim_collection(
-        collect,
+        collect_parquet,
         # Read the gait off the controller's phase offsets rather than
         # hardcoding it: config_go2.timer_t decides what the robot walks,
         # and a hardcoded label put "trot" on a crawling robot.
@@ -256,6 +259,10 @@ def main(
         robot=robot,
         episode_duration_s=episode_duration_s,
         collect_out=collect_out,
+        nav=nav,
+        reset_randomization=loco_reset_randomization_config.for_scene(
+            scene, gait=getattr(config, "gait_name", None), robot=robot
+        ).to_metadata(),
         cfg=dataset_collection_config,
     )
 
@@ -284,7 +291,11 @@ def main(
     )
     # Constant extra-mass load on the base (added after pulse write).
     base_weight = BaseWeightForce.from_config(cfg=base_weight_config)
-    reset_randomizer = ResetRandomizer.from_config(loco_reset_randomization_config)
+    reset_randomizer = ResetRandomizer.from_config(
+        loco_reset_randomization_config.for_scene(
+            scene, gait=getattr(config, "gait_name", None), robot=robot
+        )
+    )
     #------------------------------------------------
 
     # region spawn settle -------------------------------------
@@ -337,18 +348,94 @@ def main(
     # endregion
 
     motor = MotorModel.from_config(dt=1.0 / sim_frequency, n_joints=config.n_joints)
+    pickle_collector = None
+    if collect_pickle:
+        duration = (
+            dataset_collection_config.episode.episode_duration_s
+            if episode_duration_s is None
+            else episode_duration_s
+        )
+        pickle_collector = PickleSimCollector(
+            model, contact_ids, config.n_joints, sim_frequency, duration,
+        )
+
+    # region terrain map for the MPC -----------------------------
+    # solve_mpc is jitted, so the map goes in as an argument: one held by the
+    # wrapper is frozen into the first trace, and every respawned pyramid was
+    # planned on the old steps. A fixed extent keeps the grid shape, so a new
+    # pyramid does not recompile the MPC.
+    terrain = None
+    grid_extent = (
+        float(pyramid_terrain.cfg.base_half.high) + 0.5
+        if pyramid_terrain.kind == "staired_pyramid"
+        else None
+    )
+
+    def _rebuild_terrain_grid():
+        nonlocal terrain
+        if not getattr(config, "terrain_grid_dynamic", False):
+            return
+        built = build_terrain_height_grid(
+            model,
+            resolution=float(config.terrain_height_resolution),
+            extent=grid_extent,
+        )
+        if built is None:
+            return
+        grid, origin, res = built
+        config.terrain_height_grid = grid
+        config.terrain_height_origin = origin
+        config.terrain_height_resolution = res
+        terrain = (jnp.asarray(grid), jnp.asarray(origin))
+    # endregion
 
     # region reset helper -------------------------------------
     def _respawn(*, manual: bool = False, crashed: bool = False):
-        nonlocal mpc_data, tau, q_ref, counter
+        nonlocal mpc_data, tau, q_ref, counter, pyramid_sample
         collect_hooks.on_respawn(manual=manual, crashed=crashed)
-        spawner.apply_to_data(model, data, config.p0, config.quat0, config.q0)
+        if pickle_collector is not None:
+            pickle_collector.end_episode()
+        if ramp_pyramid.active:
+            sample = ramp_pyramid.apply(model)
+            _rebuild_terrain_grid()
+            if sample is not None and not collecting:
+                print(
+                    f"[ramp] slope {sample.slope_deg:.1f} deg, "
+                    f"height {sample.height:.2f} m",
+                    flush=True,
+                )
+            ramp_pyramid.try_spawn(
+                spawner, model, data, config.quat0, config.q0,
+                float(config.robot_height),
+            )
+        elif pyramid_terrain.kind == "staired_pyramid":
+            pyramid_sample = pyramid_terrain.apply(model)
+            _rebuild_terrain_grid()
+            if pyramid_sample is not None and not collecting:
+                print(
+                    f"[staired_pyramid] base {pyramid_sample.base_half:.2f} m, "
+                    f"height {pyramid_sample.height:.2f} m, "
+                    f"steps {pyramid_sample.n_steps} "
+                    f"(rise {pyramid_sample.rise:.2f} m, tread {pyramid_sample.tread:.2f} m)",
+                    flush=True,
+                )
+            pyramid_terrain.try_spawn(
+                spawner, model, data, config.quat0, config.q0,
+                pyramid_sample, float(config.robot_height),
+            )
+        elif pyramid_sample is not None:
+            pyramid_terrain.try_spawn(
+                spawner, model, data, config.quat0, config.q0,
+                pyramid_sample, float(config.robot_height),
+            )
+        else:
+            spawner.apply_to_data(model, data, config.p0, config.quat0, config.q0)
         motor.reset()
         z_spawned = float(data.qpos[2])
         # Absorb the vertical-relief drop BEFORE the MPC is initialised, so it
         # starts from a pose the robot is actually holding rather than mid-fall.
         settle_steps, z_settled = _settle_after_spawn()
-        if settle_steps and not collect_hooks.enabled:
+        if settle_steps and not collecting:
             print(
                 f"[spawn] settled {z_spawned:.3f} -> {z_settled:.3f} m "
                 f"in {settle_steps / sim_frequency:.2f} s",
@@ -387,9 +474,6 @@ def main(
                 foot_geom_ids=contact_ids,
                 base_weight=base_weight,
                 navigator=navigator if use_navigation else None,
-                # The same speed/yaw knobs drive whichever command source is
-                # active, so the envelope varies per episode in both modes.
-                command_sampler=command_sampler if use_command_sampler else None,
                 mpc_data=mpc_data,
             )
         )
@@ -448,6 +532,22 @@ def main(
             return True
         return False
     # endregion
+
+    # region out-of-bounds reset --------------------------
+    # Ramp and staired pyramid: this far past the farthest spawn, the robot is
+    # walking flat floor away from the terrain. Not a crash: the episode is
+    # kept, and the next one starts on a new pyramid.
+    OUT_OF_BOUNDS_MARGIN = 0.4   # [m]
+
+    def _out_of_bounds() -> bool:
+        if ramp_pyramid.active:
+            extent = ramp_pyramid.spawn_reach
+        elif pyramid_sample is not None:
+            extent = pyramid_terrain.floor_ring_outer(pyramid_sample)
+        else:
+            return False
+        return float(np.max(np.abs(data.qpos[:2]))) > extent + OUT_OF_BOUNDS_MARGIN
+    # endregion
     #------------------------------------------------
     
     _respawn()
@@ -460,6 +560,7 @@ def main(
         foot,
         warm_command,
         warm_contact,
+        terrain,
     )
     tau.block_until_ready()
     _respawn()
@@ -486,15 +587,15 @@ def main(
             if extreme is not None:
                 extreme.step()
                 command = jnp.asarray(extreme.mpc_input(config.robot_height))
-            elif use_command_sampler:
-                command = jnp.asarray(command_sampler.mpc_input(config.robot_height))
             elif use_navigation:
                 command = jnp.asarray(navigator.mpc_input(qpos, config.robot_height))
             else:
                 command = jnp.asarray(command_handle.mpc_input(config.robot_height))
             contact = jnp.asarray(estimate_contacts(data, contact_ids))
-            if not collect_hooks.enabled and not headless:
+            camurri_prob, camurri_stance = camurri_from_sim(model, data, contact_ids)
+            if not collecting and not headless:
                 print(f"Contact: {contact}")
+                print(format_camurri(camurri_prob, camurri_stance))
                 print(foot)
                 print(f"Command: {command}")
             
@@ -511,6 +612,7 @@ def main(
                 foot,
                 command,
                 mpc_contact,
+                terrain,
             )
             tau.block_until_ready()
             stop = timer()
@@ -521,11 +623,8 @@ def main(
                 q_ref = config.q0.copy()
             else:
                 q_ref = mpc_data.X0[0, 7 : 7 + config.n_joints]
-            if not headless and not collect_hooks.enabled:
+            if not headless and not collecting:
                 print(f"MPC time: {1e3 * (stop - start):.2f} ms")
-
-        if use_command_sampler:
-            command_sampler.step()
 
         data.ctrl = motor(np.asarray(tau), data.qvel[6 : 6 + config.n_joints])
 
@@ -554,12 +653,13 @@ def main(
                     else None
                 ),
                 cmd_segment_id=(
-                    extreme.segment_id if extreme is not None
-                    else command_sampler.segment_id if use_command_sampler
-                    else 0
+                    extreme.segment_id if extreme is not None else 0
                 ),
             ),
         )
+
+        if pickle_collector is not None and pickle_collector.step(data):
+            _randomize_episode()
 
         # The duration cap closed an episode: the next one gets fresh knobs.
         if closed:
@@ -574,21 +674,33 @@ def main(
         # after it closes the episode and redraws the knobs.
         if use_navigation and navigator.reached(data.qpos):
             episode_cfg = dataset_collection_config.episode
-            long_enough = (
-                collect_hooks.episode_seconds >= episode_cfg.goal_closes_episode_after_s
+            episode_seconds = (
+                pickle_collector.seconds if pickle_collector is not None
+                else collect_hooks.episode_seconds
             )
+            long_enough = episode_seconds >= episode_cfg.goal_closes_episode_after_s
             if episode_cfg.end_episode_on_goal and long_enough:
-                collect_hooks.end_episode(reason="goal_reached")
+                if pickle_collector is not None:
+                    pickle_collector.end_episode()
+                else:
+                    collect_hooks.end_episode(reason="goal_reached")
                 _randomize_episode()
             if navigator.auto_resample:
                 navigator.sample_goal(np.asarray(data.qpos))
 
         if _is_crashed():
             _respawn(crashed=True)
+        elif _out_of_bounds():
+            if not collecting:
+                print("[reset] left the terrain region", flush=True)
+            collect_hooks.end_episode(reason="out_of_bounds")
+            _respawn()
 
     if headless:
         for _ in range(steps):
             step_controller()
+        if pickle_collector is not None:
+            pickle_collector.close()
         collect_hooks.finish("")
         return
 
@@ -602,7 +714,8 @@ def main(
 
     _spawn_region_visual = None
     _force_geom_id = -1
-    _weight_geom_id = -1 
+    _weight_geom_id = -1
+    _height_map_ids = None 
 
     if plotter is not None:
         plotter.start()
@@ -613,11 +726,13 @@ def main(
         key_callback=key_callback,
     ) as viewer:
         viewer.sync()
+        # Once, so the view starts on the robot. Repeating this every frame
+        # overwrites azimuth, elevation, and distance and locks the camera.
+        sim_utils.setup_tracking_camera(
+            viewer, model, body_name=getattr(config, "base_body_name", "base")
+        )
         while viewer.is_running():
             overlay_text = command_handle.consume_overlay_text()
-            sim_utils.setup_tracking_camera(
-                viewer, model, body_name=getattr(config, "base_body_name", "base")
-            )
             tic = timer()
             if overlay_text is not None:
                 viewer.set_texts((None, None, *overlay_text))
@@ -674,6 +789,17 @@ def main(
             if use_navigation:
                 navigator.update(np.asarray(data.qpos), viewer)
 
+            overlay = terrain_overlay_grid(config)
+            if overlay is not None:
+                _height_map_ids = sim_utils.render_height_grid(
+                    viewer,
+                    overlay[0],
+                    overlay[1],
+                    overlay[2],
+                    base_pos[:2],
+                    _height_map_ids,
+                )
+
             step_controller()
 
             # Stream all proprioception signals; only toggled-on plots render.
@@ -702,13 +828,15 @@ def main(
     if plotter is not None:
         plotter.stop()
 
+    if pickle_collector is not None:
+        pickle_collector.close()
     collect_hooks.finish("")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=500)
-    parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "slippery"], default="flat")
+    parser.add_argument("--scene", type=str, choices=["flat", "rough", "perlin","stairs","ramp", "staired_pyramid", "slippery"], default="flat")
     parser.add_argument("--robot", type=str, choices=["aliengo", "mini_cheetah", "go2", "go2_dls", "hyqreal", "spot", "b2"], default="go2_dls")
     parser.add_argument(
         "--nav",
@@ -742,12 +870,19 @@ if __name__ == "__main__":
             "inverse-dynamics with equality constraints, or centroidal SRBD."
         ),
     )
-    parser.add_argument("--headless", action="store_true")
     parser.add_argument(
-        "--collect",
-        action="store_true",
-        help="Collect proprioceptive dataset into contact-state buckets.",
+        "--terrain-aware",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "On --scene rough, stairs, ramp, or staired_pyramid, land swings on "
+            "the raycast height grid and draw that grid. "
+            "--no-terrain-aware keeps the blind foothold height and draws nothing. "
+            "Ignored on other scenes."
+        ),
     )
+    parser.add_argument("--headless", action="store_true")
+    add_collect_argument(parser)
     parser.add_argument(
         "--collect-out",
         type=str,
@@ -775,4 +910,5 @@ if __name__ == "__main__":
         episode_duration_s=args.episode_duration,
         gait=args.gait,
         mpc_model=args.mpc_model,
+        terrain_aware=args.terrain_aware,
     )

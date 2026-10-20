@@ -13,6 +13,7 @@ Quadruped body tree
 
 Viewer overlay
     :func:`alloc_decor_geom` — reserve a decoration geom in ``viewer.user_scn``.
+    :func:`render_height_grid` — colored tiles of the rough-terrain height grid.
 
 Model lookup
     :func:`resolve_foot_geom_ids` — foot geom names → MuJoCo geom indices.
@@ -344,6 +345,128 @@ def render_sphere_trajectory(
             geom_id=geom_ids[idx],
         )
 
+    return geom_ids
+
+
+_HEIGHT_GRID_HALF_EXTENT = 1.0
+_HEIGHT_GRID_LIFT = 0.012
+_HEIGHT_GRID_MARGIN = 64
+_HEIGHT_LOW = np.array([0.15, 0.45, 0.95, 0.92], dtype=np.float32)
+_HEIGHT_HIGH = np.array([0.95, 0.28, 0.08, 0.92], dtype=np.float32)
+
+
+def _height_grid_stride(n_side: int, room: int) -> int:
+    """Cell stride that keeps an ``n_side`` window inside ``room`` decoration geoms."""
+    if room < 1 or n_side < 1:
+        return 0
+    stride = 1
+    while ((n_side + stride - 1) // stride) ** 2 > room:
+        stride += 1
+        if stride > n_side:
+            return 0
+    return stride
+
+
+def render_height_grid(
+    viewer,
+    grid: np.ndarray | None,
+    origin_xy: np.ndarray | None,
+    resolution: float,
+    center_xy: np.ndarray,
+    geom_ids: list[int] | None = None,
+    *,
+    half_extent: float = _HEIGHT_GRID_HALF_EXTENT,
+) -> list[int]:
+    """Draw the controller height grid as colored tiles around ``center_xy``.
+
+    Pass the returned ids back on the next frame. Cells outside the grid are
+    hidden. The patch is coarsened when the viewer decoration scene is too small
+    for one tile per cell. Low ground is blue and high ground is red.
+    """
+    if viewer is None or grid is None or origin_xy is None or resolution <= 0.0:
+        return geom_ids or []
+
+    grid = np.asarray(grid, dtype=np.float32)
+    origin = np.asarray(origin_xy, dtype=np.float64).reshape(2)
+    center = np.asarray(center_xy, dtype=np.float64).reshape(2)
+    nx, ny = grid.shape
+    n_half = int(np.floor(float(half_extent) / float(resolution)))
+    n_side = 2 * n_half + 1
+    if geom_ids is None:
+        room = int(viewer.user_scn.maxgeom) - int(viewer.user_scn.ngeom) - _HEIGHT_GRID_MARGIN
+        stride = _height_grid_stride(n_side, room)
+        if stride == 0:
+            return []
+        n_draw = (n_side + stride - 1) // stride
+        geom_ids = [-1] * (n_draw * n_draw)
+    else:
+        n_draw = int(np.sqrt(len(geom_ids)))
+        if n_draw < 1 or n_draw * n_draw != len(geom_ids):
+            return geom_ids
+        stride = max(1, int(np.ceil(n_side / n_draw)))
+
+    ix_c = int(np.rint((center[0] - origin[0]) / resolution))
+    iy_c = int(np.rint((center[1] - origin[1]) / resolution))
+    ix0 = ix_c - n_half
+    iy0 = iy_c - n_half
+    cell = float(resolution) * stride
+    half_xy = 0.42 * cell
+    size = np.array([half_xy, half_xy, 0.002], dtype=np.float64)
+    hidden = np.zeros(4, dtype=np.float32)
+
+    heights = np.empty(len(geom_ids), dtype=np.float32)
+    inside = np.zeros(len(geom_ids), dtype=bool)
+    coords = np.empty((len(geom_ids), 2), dtype=np.float64)
+    slot = 0
+    for ix_i in range(n_draw):
+        ix = ix0 + ix_i * stride
+        x = origin[0] + ix * resolution
+        for iy_i in range(n_draw):
+            iy = iy0 + iy_i * stride
+            y = origin[1] + iy * resolution
+            coords[slot, 0] = x
+            coords[slot, 1] = y
+            if 0 <= ix < nx and 0 <= iy < ny:
+                inside[slot] = True
+                heights[slot] = grid[ix, iy]
+            slot += 1
+
+    if np.any(inside):
+        lo = float(np.min(heights[inside]))
+        hi = float(np.max(heights[inside]))
+    else:
+        lo, hi = 0.0, 0.0
+    span = hi - lo
+
+    eye = np.eye(3, dtype=np.float64).reshape(9)
+    for slot, geom_id in enumerate(geom_ids):
+        if geom_id < 0:
+            geom_id = _reserve_user_geom(viewer)
+            geom_ids[slot] = geom_id
+        geom = viewer.user_scn.geoms[geom_id]
+        if inside[slot]:
+            t = 0.0 if span < 1e-6 else float((heights[slot] - lo) / span)
+            rgba = (1.0 - t) * _HEIGHT_LOW + t * _HEIGHT_HIGH
+            pos = np.array(
+                [coords[slot, 0], coords[slot, 1], float(heights[slot]) + _HEIGHT_GRID_LIFT],
+                dtype=np.float64,
+            )
+            tile = size
+        else:
+            rgba = hidden
+            pos = np.zeros(3, dtype=np.float64)
+            tile = np.full(3, 1e-6, dtype=np.float64)
+        mujoco.mjv_initGeom(
+            geom,
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=tile,
+            pos=pos,
+            mat=eye,
+            rgba=np.asarray(rgba, dtype=np.float32),
+        )
+        geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+        geom.segid = -1
+        geom.objid = -1
     return geom_ids
 
 #-------------------------Ghost Geom Helpers-------------------------

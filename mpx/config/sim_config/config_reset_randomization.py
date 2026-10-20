@@ -14,7 +14,7 @@ Typical use::
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,61 @@ class FloatRangeSpec:
             raise ValueError("log_uniform ranges require low > 0")
 
 
+# Navigation command limits drawn per episode [m/s, rad/s]. See the
+# max_speed / max_yaw_rate fields below for how these were chosen.
+NOMINAL_MAX_SPEED = FloatRangeSpec(enabled=True, low=0.25, high=0.50)
+NOMINAL_MAX_YAW_RATE = FloatRangeSpec(enabled=True, low=0.15, high=0.55)
+# Stairs: on the staired pyramid, turning or side-stepping on the steps ended
+# in a roll-over 3x as often as walking straight (8.3 vs 2.85 per minute on
+# the steps). Turn slower there, and stride shorter so a step-down is smaller.
+STAIRS_MAX_SPEED = FloatRangeSpec(enabled=True, low=0.15, high=0.35)
+STAIRS_MAX_YAW_RATE = FloatRangeSpec(enabled=True, low=0.10, high=0.30)
+
+# Velocity command ranges per terrain (--scene). ``for_scene`` swaps them into
+# a profile; a scene missing here keeps the profile's own ranges.
+SCENE_COMMAND_RANGES: dict[str, dict[str, FloatRangeSpec]] = {
+    "flat": {"max_speed": NOMINAL_MAX_SPEED, "max_yaw_rate": NOMINAL_MAX_YAW_RATE},
+    "rough": {"max_speed": NOMINAL_MAX_SPEED, "max_yaw_rate": NOMINAL_MAX_YAW_RATE},
+    "perlin": {"max_speed": NOMINAL_MAX_SPEED, "max_yaw_rate": NOMINAL_MAX_YAW_RATE},
+    "slippery": {"max_speed": NOMINAL_MAX_SPEED, "max_yaw_rate": NOMINAL_MAX_YAW_RATE},
+    "ramp": {"max_speed": NOMINAL_MAX_SPEED, "max_yaw_rate": NOMINAL_MAX_YAW_RATE},
+    "stairs": {"max_speed": STAIRS_MAX_SPEED, "max_yaw_rate": STAIRS_MAX_YAW_RATE},
+    "staired_pyramid": {"max_speed": STAIRS_MAX_SPEED, "max_yaw_rate": STAIRS_MAX_YAW_RATE},
+}
+
+# go2_dls, non-slippery floor, tested per gait: (lin max m/s, yaw max rad/s).
+# Yaw is always [-yaw max, yaw max]. Linear sign follows the nav mode:
+# flat and rough use random_fb, so vx is [-lin max, lin max]; ramp and
+# staired_pyramid walk forward only, so vx is [0, lin max].
+# Slippery floors are a separate set, not here.
+GO2_DLS_NONSLIP_CAPS: dict[str, dict[str, tuple[float, float]]] = {
+    "flat": {
+        "bound": (0.8, 1.5),
+        "pace": (0.8, 1.5),
+        "trot": (1.0, 1.5),
+        "crawl": (0.8, 1.5),
+    },
+    "rough": {
+        "bound": (0.8, 1.5),
+        "pace": (0.7, 1.5),
+        "trot": (1.0, 1.5),
+        "crawl": (0.8, 1.5),
+    },
+    "staired_pyramid": {
+        "bound": (0.2, 0.6),
+        "pace": (0.3, 1.0),
+        "trot": (0.5, 1.2),
+        "crawl": (0.4, 1.2),
+    },
+    "ramp": {
+        "bound": (0.3, 1.0),
+        "pace": (0.4, 1.5),
+        "trot": (1.0, 1.5),
+        "crawl": (0.5, 1.2),
+    },
+}
+
+
 @dataclass
 class ResetRandomizationConfig:
     """Master switch plus per-knob ranges for :class:`ResetRandomizer`."""
@@ -50,7 +105,7 @@ class ResetRandomizationConfig:
     # Measured: at 1.0 m/s this MPC lost the robot in 6 of 10 episodes, and the
     # falls were what pushed joints past their limits. 0.80 keeps the coverage
     # Task 9d asks for while leaving the controller able to track the command.
-    max_speed: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.25, high=0.50) # 0.20, 0.80
+    max_speed: FloatRangeSpec = NOMINAL_MAX_SPEED # 0.20, 0.80
     # Yaw rate cap handed to the navigator [rad/s]. Was [0.40, 1.50]; 1.50 rad/s
     # is ~86 deg/s and the navigator saturates it the instant a new goal appears
     # (kp_yaw * yaw_error saturates for any error past ~0.5 rad), while the
@@ -59,7 +114,7 @@ class ResetRandomizationConfig:
     # the floor. 0.80 is the navigator's own tuned default and stays inside what
     # this MPC tracks; PointNavigator now also slews toward the cap rather than
     # stepping to it (``yaw_accel_rps2``).
-    max_yaw_rate: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.15, high=0.55) # 0.30, 1.50
+    max_yaw_rate: FloatRangeSpec = NOMINAL_MAX_YAW_RATE # 0.30, 1.50
 
     # Gait timing is OFF. duty_factor and step_freq are no longer independent
     # knobs: they belong to a gait, and config_go2.GO2_GAITS holds a matched set
@@ -123,6 +178,32 @@ class ResetRandomizationConfig:
     joint_damping_scale: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.5, high=1.5)
     joint_armature_scale: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.5, high=1.5)
     joint_frictionloss_scale: FloatRangeSpec = FloatRangeSpec(enabled=True, low=0.5, high=1.5)
+
+    def to_metadata(self) -> dict:
+        """Ranges for this profile. A later split can select runs on these."""
+        return asdict(self)
+
+    def for_scene(
+        self,
+        scene: str,
+        gait: str | None = None,
+        robot: str | None = None,
+    ) -> "ResetRandomizationConfig":
+        """This profile with the velocity command ranges of ``scene``.
+
+        go2_dls on flat, rough, ramp, or staired_pyramid pins the cap to the
+        tested gait ceiling. Other robots, and a gait with no entry, keep the
+        scene range.
+        """
+        ranges = SCENE_COMMAND_RANGES.get(scene, {})
+        caps = GO2_DLS_NONSLIP_CAPS.get(scene, {})
+        if robot == "go2_dls" and gait in caps:
+            lin_max, yaw_max = caps[gait]
+            ranges = {
+                "max_speed": FloatRangeSpec(enabled=True, low=lin_max, high=lin_max),
+                "max_yaw_rate": FloatRangeSpec(enabled=True, low=yaw_max, high=yaw_max),
+            }
+        return replace(self, **ranges)
 
 
 # Loco profile follows the dataclass master switch.

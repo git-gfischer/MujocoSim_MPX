@@ -35,7 +35,7 @@ Fully differentiable solver easily integrates into learning pipelines and suppor
 The solver is wrapped by the `MPCControllerWrapper` class, and all the settings (such as the dynamics model and cost function to be used) can be changed in the config files. Examples for various legged robots are provided in the `examples` folder.
 > **Note:**  
 > If you want to solve multiple MPC in parallel, look at the examples/multi_env.py
-> `MPCWrapper` is designed to use the whole body model, if you want to use the srbd model, use `mpc_wrapper_srbd.py`; look at examples/srbd_quad.py
+> `MPCWrapper` is designed to use the whole body model. For centroidal SRBD on Go2, run `python mpx/simulators/quadruped/quad_locomotion.py --robot go2 --mpc-model srbd`.
 
 ## Task examples
 | Acrobot Swing-Up | Quadruped Trot | Humanoid Jump | Quadruped Barrel Roll | Obstacle Avoidance |
@@ -72,6 +72,10 @@ pixi install
 
 # Activate the environment
 pixi shell
+
+# Proprioceptive Image: same stack plus PyTorch
+pixi install -e pi
+pixi shell -e pi
 ```
 
 ### Alternative: Traditional Conda Setup (Deprecated)

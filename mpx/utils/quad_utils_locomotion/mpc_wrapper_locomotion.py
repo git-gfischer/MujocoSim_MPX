@@ -26,7 +26,11 @@ import mpx.jax_ocp_solvers.optimizers as optimizers
 from mujoco.mjx._src.dataclasses import PyTreeNode
 from timeit import default_timer as timer
 from mpx.utils.mpc_wrapper import mpx_data, MPCData
-from mpx.utils.quad_utils_locomotion.reference_generator_locomotion import reference_generator_locomotion
+from mpx.utils.quad_utils_locomotion.reference_generator_locomotion import (
+    call_ref,
+    dynamic_terrain_kwargs,
+    reference_generator_locomotion,
+)
 from mpx.utils.simulation_utils.sim_utils import timer_run
 
 def build_solver_step(config, cost, dynamics, hessian_approx, limited_memory):
@@ -165,6 +169,7 @@ class MPCWrapper:
 
         reference_generator = getattr(config, "reference_generator", reference_generator_locomotion)
         clearance_speed = getattr(config, "clearance_speed", getattr(config, "clearence_speed", 0.2))
+        terrain_kw, self._terrain_grid, self._terrain_origin = dynamic_terrain_kwargs(config)
         self._ref_gen = jax.jit(
             partial(
                 reference_generator,
@@ -177,6 +182,7 @@ class MPCWrapper:
                 foot0=config.p_legs0,
                 q0=config.q0,
                 clearence_speed=clearance_speed,
+                **terrain_kw,
             )
         )
         self._timer_run = jax.jit(timer_run)
@@ -217,7 +223,7 @@ class MPCWrapper:
         del x0, X, reference, parameter
         return U[0, : self.config.n_joints]
 
-    def _run_impl(self, data, x0, input, contact):
+    def _run_impl(self, data, x0, input, contact, terrain=None):
         _, contact_time = self._timer_run(
             data.duty_factor,
             data.step_freq,
@@ -225,7 +231,7 @@ class MPCWrapper:
             1 / self.mpc_frequency,
         )
 
-        reference, parameter, liftoff = self._ref_gen(
+        reference, parameter, liftoff = call_ref(self, terrain,
             duty_factor=data.duty_factor,
             step_freq=data.step_freq,
             step_height=data.step_height,
@@ -273,11 +279,11 @@ class MPCWrapper:
         )
         return data, tau, q, dq
 
-    def run(self, data, x0, input, contact=None):
+    def run(self, data, x0, input, contact=None, terrain=None):
         """Run one MPC step and return the updated carry and torque command."""
 
         contact = self.default_contact if contact is None else jnp.asarray(contact)
-        data, tau, _, _ = self._run_impl(data, x0, input, contact)
+        data, tau, _, _ = self._run_impl(data, x0, input, contact, terrain)
         return data, tau
 
     def reset(self, data, qpos, qvel, foot):

@@ -10,6 +10,180 @@ from mpx.estimators.terrain_orientation import terrain_orientation
 
 
 
+_LIP_SAMPLES = 8
+# Go2's foot sphere is 1.75 cm. A full stair (5 cm) must not count, or the
+# base is held in the air on a flat plateau.
+_FOOT_OFFSET_MAX = 0.02
+
+
+def sample_terrain_height(x, y, grid, origin, resolution):
+    """Nearest-cell elevation. Points outside the grid are ground at 0."""
+    ix = jnp.rint((x - origin[0]) / resolution).astype(jnp.int32)
+    iy = jnp.rint((y - origin[1]) / resolution).astype(jnp.int32)
+    nx, ny = grid.shape
+    inside = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+    return jnp.where(
+        inside,
+        grid[jnp.clip(ix, 0, nx - 1), jnp.clip(iy, 0, ny - 1)],
+        0.0,
+    )
+
+
+def sample_terrain_peak(x, y, grid, origin, resolution):
+    """Highest cell in the 3x3 around the point.
+
+    A foothold on the lip of a step otherwise snaps to the floor cell and the
+    swing drives the foot into the riser.
+    """
+    ix = jnp.rint((x - origin[0]) / resolution).astype(jnp.int32)
+    iy = jnp.rint((y - origin[1]) / resolution).astype(jnp.int32)
+    nx, ny = grid.shape
+    vals = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            jx = ix + dx
+            jy = iy + dy
+            inside = (jx >= 0) & (jx < nx) & (jy >= 0) & (jy < ny)
+            vals.append(
+                jnp.where(
+                    inside,
+                    grid[jnp.clip(jx, 0, nx - 1), jnp.clip(jy, 0, ny - 1)],
+                    0.0,
+                )
+            )
+    return jnp.max(jnp.stack(vals, axis=0), axis=0)
+
+
+def swing_landing_and_apex(
+    liftoff_x, liftoff_y, liftoff_z,
+    foothold_x, foothold_y,
+    step_height,
+    grid, origin, resolution,
+):
+    """Foot-center landing height and swing apex from a height grid.
+
+    The foot site sits a couple of centimetres above the surface. That clearance
+    is clipped so a foot already in the air does not aim the next step, or the
+    base, up with it. The apex clears the highest sample between liftoff and
+    the foothold.
+    """
+    alphas = jnp.linspace(0.0, 1.0, _LIP_SAMPLES)
+    along_x = liftoff_x + alphas[:, None] * (foothold_x - liftoff_x)
+    along_y = liftoff_y + alphas[:, None] * (foothold_y - liftoff_y)
+    # Exact cells only. The 3x3 peak pulled in the next stair and the swing
+    # cleared the whole approach.
+    lip = jnp.max(sample_terrain_height(along_x, along_y, grid, origin, resolution), axis=0)
+    liftoff_h = sample_terrain_height(liftoff_x, liftoff_y, grid, origin, resolution)
+    offset = jnp.clip(liftoff_z - liftoff_h, 0.0, _FOOT_OFFSET_MAX)
+    here = sample_terrain_height(foothold_x, foothold_y, grid, origin, resolution)
+    # No cap relative to the liftoff cell: one stride climbs two or three
+    # stairs, and a lagging rear foot more. Capped, the foot aimed into a riser.
+    surface = jnp.minimum(
+        sample_terrain_peak(foothold_x, foothold_y, grid, origin, resolution),
+        here + 0.05,
+    )
+    landing = surface + offset
+    apex = jnp.maximum(jnp.maximum(liftoff_z, landing), lip + offset) + step_height
+    return landing, apex
+
+
+def terrain_reference_kwargs(config):
+    """Keyword args that turn the swing spline onto a pre-sampled height grid."""
+    grid = getattr(config, "terrain_height_grid", None)
+    if grid is None:
+        return {}
+    return {
+        "use_terrain_height": True,
+        "terrain_grid": jnp.asarray(grid, dtype=jnp.float32),
+        "terrain_origin": jnp.asarray(config.terrain_height_origin, dtype=jnp.float32),
+        "terrain_resolution": float(config.terrain_height_resolution),
+    }
+
+
+def dynamic_terrain_kwargs(config):
+    """Closed-over terrain kwargs, with the grid and its origin left free.
+
+    A respawn rebuilds the height map, and a different footprint moves the
+    origin. Baking either into ``jax.jit`` keeps the first pyramid, so the
+    lookup misses the top and the base target falls to the floor.
+    """
+    kw = terrain_reference_kwargs(config)
+    grid = None
+    origin = None
+    if getattr(config, "terrain_grid_dynamic", False):
+        grid = kw.pop("terrain_grid", None)
+        origin = kw.pop("terrain_origin", None)
+    return kw, grid, origin
+
+
+def call_ref(wrapper, terrain=None, **kwargs):
+    """``terrain=(grid, origin)`` replaces the map built with the wrapper.
+
+    A caller that jits the MPC step must pass the map here, as a jit
+    argument. Anything read off the wrapper is frozen into the first trace,
+    so a map rebuilt on respawn never reaches the reference.
+    """
+    if terrain is None:
+        terrain = (
+            getattr(wrapper, "_terrain_grid", None),
+            getattr(wrapper, "_terrain_origin", None),
+        )
+    grid, origin = terrain
+    if grid is not None:
+        kwargs["terrain_grid"] = grid
+    if origin is not None:
+        kwargs["terrain_origin"] = origin
+    return wrapper._ref_gen(**kwargs)
+
+
+def base_height_reference(
+    use_terrain_height,
+    proprio_height,
+    clearance,
+    liftoff_x, liftoff_y, liftoff_z,
+    p_ref_x, p_ref_y,
+    terrain_grid, terrain_origin, terrain_resolution,
+):
+    """Absolute base height along the planned path.
+
+    Without a height grid this is the constant ``proprio_height`` (commanded
+    clearance plus the current foot height). With a grid, the same clearance
+    is added to the terrain under each planned ``(x, y)``, so the base rises
+    and falls with the map instead of holding the height it had at liftoff.
+    """
+    if not use_terrain_height:
+        return jnp.ones_like(p_ref_x) * proprio_height
+    under_feet = sample_terrain_height(
+        liftoff_x, liftoff_y, terrain_grid, terrain_origin, terrain_resolution,
+    )
+    foot_above = jnp.mean(
+        jnp.clip(liftoff_z - under_feet, 0.0, _FOOT_OFFSET_MAX)
+    )
+    # No clamp to the feet: walking down, the rear feet stand a few stairs
+    # above the ground under the base, and a clamp lifted the base 13 cm.
+    ground = sample_terrain_height(
+        p_ref_x, p_ref_y, terrain_grid, terrain_origin, terrain_resolution,
+    )
+    return ground + clearance + foot_above
+
+
+def _swing_z(
+    use_terrain_height,
+    liftoff_x, liftoff_y, liftoff_z,
+    foothold_x, foothold_y,
+    step_height,
+    terrain_grid, terrain_origin, terrain_resolution,
+):
+    if use_terrain_height:
+        return swing_landing_and_apex(
+            liftoff_x, liftoff_y, liftoff_z,
+            foothold_x, foothold_y,
+            step_height,
+            terrain_grid, terrain_origin, terrain_resolution,
+        )
+    return liftoff_z, liftoff_z + step_height
+
+
 def _mean_stance_foot_z(foot, contact, liftoff, n_contact):
     """Terrain elevation from measured stance feet; fallback to liftoff average."""
     foot_z = foot[2::3]
@@ -22,7 +196,11 @@ def _mean_stance_foot_z(foot, contact, liftoff, n_contact):
 
 
 # region reference_generator_locomotion
-@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5))
+@partial(
+    jax.jit,
+    static_argnums=(0, 1, 2, 3, 4, 5),
+    static_argnames=("use_terrain_height",),
+)
 def reference_generator_locomotion(
     use_terrain_estimator,
     N,
@@ -41,7 +219,12 @@ def reference_generator_locomotion(
     step_height,
     liftoff,
     contact,
-    clearence_speed
+    clearence_speed,
+    *,
+    use_terrain_height=False,
+    terrain_grid=None,
+    terrain_origin=None,
+    terrain_resolution=0.05,
 ):
     p = x[:3]
     quat = x[3:7]
@@ -66,7 +249,12 @@ def reference_generator_locomotion(
     ref_ang_vel = input[3:6]
     p_ref_x = jnp.arange(N+1) * dt * ref_lin_vel[0] + p[0]
     p_ref_y = jnp.arange(N+1) * dt * ref_lin_vel[1] + p[1]
-    p_ref_z = jnp.ones(N+1) * proprio_height
+    p_ref_z = base_height_reference(
+        use_terrain_height, proprio_height, input[6],
+        liftoff[::3], liftoff[1::3], liftoff[2::3],
+        p_ref_x, p_ref_y,
+        terrain_grid, terrain_origin, terrain_resolution,
+    )
     p_ref = jnp.stack([p_ref_x, p_ref_y, p_ref_z], axis=1)
     dp_ref = jnp.tile(ref_lin_vel, (N+1, 1))
     omega_ref = jnp.tile(ref_ang_vel, (N+1, 1))
@@ -123,10 +311,19 @@ def reference_generator_locomotion(
             return a*val**4 + b*val**3 + c*val**2 + d*val + e
         
         initial_speed = - ref_lin_vel / (jnp.linalg.norm(ref_lin_vel) + 1e-6) * clearence_speed
+        landing_z, apex_z = _swing_z(
+            use_terrain_height,
+            liftoff_x, liftoff_y, liftoff_z,
+            foothold_x, foothold_y,
+            step_height,
+            terrain_grid, terrain_origin, terrain_resolution,
+        )
+        phase = (new_t - duty_factor) / (1 - duty_factor)
+        in_contact = jnp.logical_or(new_contact_sequence > 0, early_contact == 1)
 
-        new_foot_x = jnp.where(jnp.logical_or(new_contact_sequence>0,early_contact==1), new_foot[t-1,::3], cubic_splineXY(liftoff_x, foothold_x,initial_speed[0],(new_t-duty_factor)/(1-duty_factor)))
-        new_foot_y = jnp.where(jnp.logical_or(new_contact_sequence>0,early_contact==1), new_foot[t-1,1::3], cubic_splineXY(liftoff_y, foothold_y,initial_speed[1],(new_t-duty_factor)/(1-duty_factor)))
-        new_foot_z = jnp.where(jnp.logical_or(new_contact_sequence>0,early_contact==1), new_foot[t-1,2::3], cubic_splineZ(liftoff_z,liftoff_z,liftoff_z + step_height,(new_t-duty_factor)/(1-duty_factor)))
+        new_foot_x = jnp.where(in_contact, new_foot[t-1,::3], cubic_splineXY(liftoff_x, foothold_x,initial_speed[0], phase))
+        new_foot_y = jnp.where(in_contact, new_foot[t-1,1::3], cubic_splineXY(liftoff_y, foothold_y,initial_speed[1], phase))
+        new_foot_z = jnp.where(in_contact, new_foot[t-1,2::3], cubic_splineZ(liftoff_z, landing_z, apex_z, phase))
 
         new_foot = new_foot.at[t,::3].set(new_foot_x)
         new_foot = new_foot.at[t,1::3].set(new_foot_y)
@@ -282,8 +479,16 @@ def whole_body_interface(model, mjx_model, contact_id, body_id,sim_frequency,Kp,
 #endregion
 
 # region reference_generator_srbd
-@partial(jax.jit, static_argnums=(0,1,2,3))
-def reference_generator_srbd(use_terrain_estimator,N,dt,n_contact,mass,foot0,t_timer, x, foot, input, duty_factor, step_freq,step_height,liftoff,contact,clearence_speed):
+@partial(jax.jit, static_argnums=(0, 1, 2, 3), static_argnames=("use_terrain_height",))
+def reference_generator_srbd(
+    use_terrain_estimator, N, dt, n_contact, mass, foot0, t_timer, x, foot, input,
+    duty_factor, step_freq, step_height, liftoff, contact, clearence_speed,
+    *,
+    use_terrain_height=False,
+    terrain_grid=None,
+    terrain_origin=None,
+    terrain_resolution=0.05,
+):
     p = x[:3]
     quat = x[3:7]
     dp = x[7:10]
@@ -302,7 +507,12 @@ def reference_generator_srbd(use_terrain_estimator,N,dt,n_contact,mass,foot0,t_t
     ref_ang_vel = input[3:6]
     p_ref_x = jnp.arange(N+1) * dt * ref_lin_vel[0] + p[0]
     p_ref_y = jnp.arange(N+1) * dt * ref_lin_vel[1] + p[1]
-    p_ref_z = jnp.ones(N+1) * proprio_height
+    p_ref_z = base_height_reference(
+        use_terrain_height, proprio_height, input[6],
+        liftoff[::3], liftoff[1::3], liftoff[2::3],
+        p_ref_x, p_ref_y,
+        terrain_grid, terrain_origin, terrain_resolution,
+    )
     p_ref = jnp.stack([p_ref_x, p_ref_y, p_ref_z], axis=1)
     dp_ref = jnp.tile(ref_lin_vel, (N+1, 1))
     omega_ref = jnp.tile(ref_ang_vel, (N+1, 1))
@@ -373,17 +583,27 @@ def reference_generator_srbd(use_terrain_estimator,N,dt,n_contact,mass,foot0,t_t
             d = initial_speed
             return 4*a*val**3 + 3*b*val**2 + 2*c*val + d
 
-        new_foot_x = jnp.where(jnp.logical_or(new_contact_sequence>0,early_contact==1), new_foot[t-1,::3], cubic_splineXY(liftoff_x, foothold_x,initial_speed[0],(new_t-duty_factor)/(1-duty_factor)))
-        new_foot_y = jnp.where(jnp.logical_or(new_contact_sequence>0,early_contact==1), new_foot[t-1,1::3], cubic_splineXY(liftoff_y, foothold_y,initial_speed[1],(new_t-duty_factor)/(1-duty_factor)))
-        new_foot_z = jnp.where(jnp.logical_or(new_contact_sequence>0,early_contact==1), new_foot[t-1,2::3], cubic_splineZ(liftoff_z,liftoff_z,liftoff_z + step_height,(new_t-duty_factor)/(1-duty_factor)))
+        landing_z, apex_z = _swing_z(
+            use_terrain_height,
+            liftoff_x, liftoff_y, liftoff_z,
+            foothold_x, foothold_y,
+            step_height,
+            terrain_grid, terrain_origin, terrain_resolution,
+        )
+        phase = (new_t - duty_factor) / (1 - duty_factor)
+        in_contact = jnp.logical_or(new_contact_sequence > 0, early_contact == 1)
+
+        new_foot_x = jnp.where(in_contact, new_foot[t-1,::3], cubic_splineXY(liftoff_x, foothold_x,initial_speed[0], phase))
+        new_foot_y = jnp.where(in_contact, new_foot[t-1,1::3], cubic_splineXY(liftoff_y, foothold_y,initial_speed[1], phase))
+        new_foot_z = jnp.where(in_contact, new_foot[t-1,2::3], cubic_splineZ(liftoff_z, landing_z, apex_z, phase))
 
         new_foot = new_foot.at[t,::3].set(new_foot_x)
         new_foot = new_foot.at[t,1::3].set(new_foot_y)
         new_foot = new_foot.at[t,2::3].set(new_foot_z)
 
-        new_foot_dot = new_foot_dot.at[t,::3].set(jnp.where(jnp.logical_or(new_contact_sequence>0,early_contact==1), 0, cubic_splineXY_dot(liftoff_x, foothold_x,initial_speed[0],(new_t-duty_factor)/(1-duty_factor))))
-        new_foot_dot = new_foot_dot.at[t,1::3].set(jnp.where(jnp.logical_or(new_contact_sequence>0,early_contact==1), 0, cubic_splineXY_dot(liftoff_y, foothold_y,initial_speed[1],(new_t-duty_factor)/(1-duty_factor))))
-        new_foot_dot = new_foot_dot.at[t,2::3].set(jnp.where(jnp.logical_or(new_contact_sequence>0,early_contact==1), 0, cubic_splineZ_dot(liftoff_z,liftoff_z,liftoff_z + step_height,(new_t-duty_factor)/(1-duty_factor))))
+        new_foot_dot = new_foot_dot.at[t,::3].set(jnp.where(in_contact, 0, cubic_splineXY_dot(liftoff_x, foothold_x,initial_speed[0], phase)))
+        new_foot_dot = new_foot_dot.at[t,1::3].set(jnp.where(in_contact, 0, cubic_splineXY_dot(liftoff_y, foothold_y,initial_speed[1], phase)))
+        new_foot_dot = new_foot_dot.at[t,2::3].set(jnp.where(in_contact, 0, cubic_splineZ_dot(liftoff_z, landing_z, apex_z, phase)))
 
         # new_foot_ddot = new_foot_ddot.at[t,::3].set(jnp.where(new_contact_sequence>0, 0, cubic_splineXY_ddot(liftoff_x, foothold_x,(new_t-duty_factor)/(1-duty_factor))))
         # new_foot_ddot = new_foot_ddot.at[t,1::3].set(jnp.where(new_contact_sequence>0, 0, cubic_splineXY_ddot(liftoff_y, foothold_y,(new_t-duty_factor)/(1-duty_factor))))

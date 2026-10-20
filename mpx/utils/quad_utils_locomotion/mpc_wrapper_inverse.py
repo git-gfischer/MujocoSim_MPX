@@ -11,6 +11,8 @@ from mujoco.mjx._src.dataclasses import PyTreeNode
 import mpx.jax_ocp_solvers.optimizers as optimizers
 from mpx.utils.mpc_wrapper import MPCData
 from mpx.utils.quad_utils_locomotion.reference_generator_locomotion import (
+    call_ref,
+    dynamic_terrain_kwargs,
     reference_generator_locomotion,
 )
 from mpx.utils.quadruped_dyn_models.inverse import (
@@ -162,6 +164,7 @@ class InverseDynamicsMPCWrapper:
         clearance_speed = getattr(
             config, "clearance_speed", getattr(config, "clearence_speed", 0.2)
         )
+        terrain_kw, self._terrain_grid, self._terrain_origin = dynamic_terrain_kwargs(config)
         self._ref_gen = jax.jit(
             partial(
                 reference_generator,
@@ -174,6 +177,7 @@ class InverseDynamicsMPCWrapper:
                 foot0=config.p_legs0,
                 q0=config.q0,
                 clearence_speed=clearance_speed,
+                **terrain_kw,
             )
         )
         self._timer_run = jax.jit(timer_run)
@@ -227,7 +231,7 @@ class InverseDynamicsMPCWrapper:
             )
         return x, foot
 
-    def _run_impl(self, data, x0, input, contact):
+    def _run_impl(self, data, x0, input, contact, terrain=None):
         _, contact_time = self._timer_run(
             data.duty_factor,
             data.step_freq,
@@ -235,7 +239,7 @@ class InverseDynamicsMPCWrapper:
             1 / self.mpc_frequency,
         )
         x, foot = self._split_x0(x0)
-        reference, parameter, liftoff = self._ref_gen(
+        reference, parameter, liftoff = call_ref(self, terrain,
             duty_factor=data.duty_factor,
             step_freq=data.step_freq,
             step_height=data.step_height,
@@ -285,9 +289,9 @@ class InverseDynamicsMPCWrapper:
         )
         return data, tau, q, dq
 
-    def run(self, data, x0, input, contact=None):
+    def run(self, data, x0, input, contact=None, terrain=None):
         contact = self.default_contact if contact is None else jnp.asarray(contact)
-        data, tau, _, _ = self._run_impl(data, x0, input, contact)
+        data, tau, _, _ = self._run_impl(data, x0, input, contact, terrain)
         return data, tau
 
     def reset(self, data, qpos, qvel, foot):

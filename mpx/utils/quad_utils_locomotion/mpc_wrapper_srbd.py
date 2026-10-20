@@ -10,6 +10,8 @@ from mujoco import mjx
 from mpx.utils.mpc_wrapper import MPCData
 from mpx.utils.quad_utils_locomotion.mpc_wrapper_locomotion import build_solver_step
 from mpx.utils.quad_utils_locomotion.reference_generator_locomotion import (
+    call_ref,
+    dynamic_terrain_kwargs,
     reference_generator_srbd,
     whole_body_interface,
 )
@@ -105,6 +107,7 @@ class SrbdMPCWrapper:
         clearance_speed = getattr(
             config, "clearance_speed", getattr(config, "clearence_speed", 0.2)
         )
+        terrain_kw, self._terrain_grid, self._terrain_origin = dynamic_terrain_kwargs(config)
         self._ref_gen = jax.jit(
             partial(
                 reference_generator_srbd,
@@ -115,6 +118,7 @@ class SrbdMPCWrapper:
                 mass=config.mass,
                 foot0=config.p_legs0,
                 clearence_speed=clearance_speed,
+                **terrain_kw,
             )
         )
         self._timer_run = jax.jit(timer_run)
@@ -165,7 +169,7 @@ class SrbdMPCWrapper:
         x_srbd = jnp.concatenate([qpos[:7], qvel[:6]])
         return qpos, qvel, foot, x_srbd
 
-    def _run_impl(self, data, x0, input, contact):
+    def _run_impl(self, data, x0, input, contact, terrain=None):
         qpos, qvel, foot, x_srbd = self._centroidal(x0)
         planned_contact, contact_time = self._timer_run(
             data.duty_factor,
@@ -173,7 +177,7 @@ class SrbdMPCWrapper:
             data.contact_time,
             1 / self.mpc_frequency,
         )
-        reference, parameter, liftoff, foot_ref_dot = self._ref_gen(
+        reference, parameter, liftoff, foot_ref_dot = call_ref(self, terrain,
             t_timer=data.contact_time,
             x=x_srbd,
             foot=foot,
@@ -217,9 +221,9 @@ class SrbdMPCWrapper:
         )
         return data, tau
 
-    def run(self, data, x0, input, contact=None):
+    def run(self, data, x0, input, contact=None, terrain=None):
         contact = self.default_contact if contact is None else jnp.asarray(contact)
-        return self._run_impl(data, x0, input, contact)
+        return self._run_impl(data, x0, input, contact, terrain)
 
     def reset(self, data, qpos, qvel, foot):
         qpos = jnp.ravel(qpos)

@@ -90,6 +90,33 @@ def test_setup_stamps_scaled_contact_dwell(tmp_path):
     assert dataset_collection_config.contact_labeling.schmitt_average_steps == 1
 
 
+def test_setup_records_nav_when_the_collector_has_one(tmp_path):
+    stamped = setup_sim_collection(
+        True,
+        gait_type=GaitType.TROT,
+        scene="rough",
+        sim_hz=500.0,
+        robot="go2",
+        nav="extreme",
+        reset_randomization={"max_speed": {"low": 0.25, "high": 0.5}},
+        collect_out=str(tmp_path / "stamped"),
+        register_atexit=False,
+    )
+    plain = setup_sim_collection(
+        True,
+        gait_type=GaitType.TROT,
+        scene="flat",
+        sim_hz=500.0,
+        robot="go2",
+        collect_out=str(tmp_path / "plain"),
+        register_atexit=False,
+    )
+    assert stamped._metadata["nav"] == "extreme"
+    assert stamped._metadata["reset_randomization"]["max_speed"]["high"] == 0.5
+    assert "nav" not in plain._metadata
+    assert "reset_randomization" not in plain._metadata
+
+
 def test_one_physics_step_dropout_does_not_start_a_liftoff():
     """A 2 ms zero must not lift a loaded foot when the Schmitt sees 20 ms.
 

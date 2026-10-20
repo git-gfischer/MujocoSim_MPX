@@ -45,7 +45,19 @@ def test_ground_truth_channels_are_targets():
     target_names = {c.name for c in TARGET_COLUMNS}
     assert target_names == {
         "contact", "grf_base", "grf_yawbase", "external_force", "base_lin_vel",
+        "foot_vslip_yawbase",
     }
+
+
+def test_slip_columns_are_privileged():
+    from mpx.utils.dataset_collection.dataset_schema import COLUMNS_BY_NAME, INPUT_COLUMNS
+
+    inputs = {c.name for c in INPUT_COLUMNS}
+    for name, width in (("foot_vel_world", 12), ("foot_mu", 4), ("slip_event", 4)):
+        column = COLUMNS_BY_NAME[name]
+        assert column.role == "privileged"
+        assert column.width == width
+        assert name not in inputs
 
 
 def test_the_grf_target_is_body_frame_and_the_world_one_is_deprecated():

@@ -37,6 +37,8 @@ Frames
                                      the base; the site is offset in translation)
 ``base_lin_vel``                     base frame
 ``foot_pos_base``/``foot_vel_base``  yaw-aligned base frame (X fwd, Y left, Z up)
+``foot_vslip_yawbase``               yaw-base tangential contact-point velocity
+``foot_vel_world``                   world velocity of the foot contact point
 ``grf_base``                         base frame (the GRF regression target)
 ``grf_yawbase``                      gravity-aligned base frame, TRUE attitude
 ``grf_mean_world``, ``external_force``  world frame
@@ -62,7 +64,10 @@ from mpx.utils.dataset_collection.operating_regime import REGIME_DTYPE
 # v4: body-frame IMU + base_quat, debounced contacts from per-substep force,
 #     forward kinematics on the measured joint state, measured actuator force,
 #     privileged/deprecated roles, terrain geometry, per-episode randomization.
-EPISODE_SCHEMA_VERSION = 4
+# v5: foot_vslip_yawbase, tangential velocity of the foot contact point.
+# v6: foot_vel_world, foot_mu, slip_event. Privileged. slip_event stays 0
+# until a per-foot friction injector writes it.
+EPISODE_SCHEMA_VERSION = 6
 
 # Foot order used by every per-foot column in this module.
 FOOT_ORDER: Tuple[str, str, str, str] = ("FL", "FR", "RL", "RR")
@@ -160,6 +165,12 @@ EPISODE_COLUMNS: Tuple[Column, ...] = (
            "External perturbation force applied to the base"),
     Column("base_lin_vel", 3, np.float32, "target", "m/s", "base",
            "Base linear velocity expressed in the base frame"),
+    Column("foot_vslip_yawbase", N_FEET * 3, np.float32, "target", "m/s", "yaw_base",
+           "Tangential velocity of each foot's contact point in the yaw-base "
+           "frame: (I - n n^T) R_WY^T (v_site + ω × (−r n)). n points from the "
+           "contact toward the foot, or world up when the foot is not touching. "
+           "This is the world velocity of the material point in contact, not "
+           "the sphere-centre velocity relative to the base. FL FR RL RR x xyz"),
 
     # ── context ─────────────────────────────────────────────────────────────
     Column("contact_from_height", N_FEET, np.uint8, "context", "-", "-",
@@ -245,6 +256,16 @@ EPISODE_COLUMNS: Tuple[Column, ...] = (
            "Realised gyroscope bias (random walk) at this step"),
     Column("foot_pos_world", N_FEET * 3, np.float32, "privileged", "m", "world",
            "Foot positions in world, FL FR RL RR x xyz"),
+    Column("foot_vel_world", N_FEET * 3, np.float32, "privileged", "m/s", "world",
+           "World velocity of each foot contact point: v_site + ω × (−r n). "
+           "Not an input. The yaw-base tangential target is foot_vslip_yawbase. "
+           "FL FR RL RR x xyz"),
+    Column("foot_mu", N_FEET, np.float32, "privileged", "-", "-",
+           "Sliding friction on each foot geom this step (geom_friction[:, 0]). "
+           "Foot priority is above the floor, so this is the μ the contact uses"),
+    Column("slip_event", N_FEET, np.uint8, "privileged", "-", "-",
+           "1 when an injected low-friction event is active on that foot. "
+           "Debug only, not a training label. 0 until an injector sets it"),
     Column("terrain_height_under_foot", N_FEET, np.float32, "privileged", "m", "world",
            "Terrain elevation directly beneath each foot"),
     Column("foot_height_terrain", N_FEET, np.float32, "privileged", "m", "world",

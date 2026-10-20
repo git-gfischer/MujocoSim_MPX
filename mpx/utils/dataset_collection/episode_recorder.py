@@ -56,6 +56,7 @@ import numpy as np
 
 from mpx.estimators.quad_contact_estimation import (
     estimate_foot_grf,
+    foot_contact_normals,
     non_foot_contact_force,
 )
 from mpx.utils.simulation_utils.base_force_perturbation import RandomBaseForcePerturbation
@@ -124,7 +125,9 @@ from mpx.utils.simulation_utils.measured_kinematics import (
     TerrainProbe,
     gravity_align,
     measured_joint_torque,
+    contact_point_world_velocity,
     quat_to_rotmat,
+    tangential_contact_velocity,
 )
 from mpx.utils.simulation_utils.sensor_noise import SensorNoise
 
@@ -137,6 +140,7 @@ def scene_to_terrain(scene: str) -> TerrainType:
         return TerrainType.FLAT
     if scene in ("stairs", "staired_pyramid"):
         return TerrainType.STAIRS
+    # rough, pilars, pyramid, and any other uneven scene.
     return TerrainType.ROUGH
 
 
@@ -273,6 +277,8 @@ class StepSampler:
         ]
         self.imu = ImuReader.from_model(model)
         self.kinematics = MeasuredKinematics(model, self.foot_site_names, n_joints)
+        self._jacp = np.zeros((3, model.nv), dtype=np.float64)
+        self._jacr = np.zeros((3, model.nv), dtype=np.float64)
         self.terrain = TerrainProbe(model)
 
         # Attitude from the IMU alone. A gravity-aligned *input* channel must not
@@ -315,6 +321,16 @@ class StepSampler:
         return np.asarray(
             estimate_foot_grf(self.model, data, self.contact_ids), dtype=np.float64
         )
+
+    def _site_world_twist(self, data: mujoco.MjData):
+        """World linear and angular velocity of each foot site, ``(n_feet, 3)``."""
+        linear = np.empty((self.n_feet, 3), dtype=np.float64)
+        angular = np.empty((self.n_feet, 3), dtype=np.float64)
+        for i, site_id in enumerate(self.foot_site_ids):
+            mujoco.mj_jacSite(self.model, data, self._jacp, self._jacr, int(site_id))
+            linear[i] = self._jacp @ data.qvel
+            angular[i] = self._jacr @ data.qvel
+        return linear, angular
 
     def row(
         self,
@@ -364,6 +380,23 @@ class StepSampler:
         foot_vel_yaw = gravity_align(foot_vel_base, quat_est)
         foot_pos_yaw_true = gravity_align(foot_pos_true, imu_true["quat"])
         foot_vel_yaw_true = gravity_align(foot_vel_true, imu_true["quat"])
+        # World velocity of the contact point, not the centre relative to the
+        # base. The FK above zeros the base twist, so it cannot be the slip target.
+        v_site, w_site = self._site_world_twist(data)
+        normals = foot_contact_normals(self.model, data, self.contact_ids)
+        v_contact = contact_point_world_velocity(
+            v_site, w_site, normals, self.foot_collision_radius
+        )
+        vslip = tangential_contact_velocity(
+            v_site,
+            w_site,
+            normals,
+            self.foot_collision_radius,
+            imu_true["quat"],
+        )
+        foot_mu = np.asarray(
+            self.model.geom_friction[self.contact_ids, 0], dtype=np.float32
+        )
 
         # ── terrain geometry ─────────────────────────────────────────────────
         foot_world = np.asarray(
@@ -419,6 +452,7 @@ class StepSampler:
                 base_force_pert.force, dtype=np.float32
             ).reshape(3),
             "base_lin_vel": base_linear_velocity(data).astype(np.float32),
+            "foot_vslip_yawbase": vslip.astype(np.float32),
             # ── context ──────────────────────────────────────────────────────
             "contact_raw": reduced["contact_raw"].astype(np.uint8),
             "contact_from_height": contact_from_height.astype(np.uint8),
@@ -466,6 +500,9 @@ class StepSampler:
             "imu_acc_bias": reading.imu_acc_bias,
             "imu_gyro_bias": reading.imu_gyro_bias,
             "foot_pos_world": foot_world.reshape(-1).astype(np.float32),
+            "foot_vel_world": v_contact.astype(np.float32),
+            "foot_mu": foot_mu,
+            "slip_event": np.zeros(self.n_feet, dtype=np.uint8),
             "terrain_height_under_foot": terrain_under_foot.astype(np.float32),
             "foot_height_terrain": foot_height.astype(np.float32),
             "foot_clearance": foot_clearance.astype(np.float32),
@@ -1586,6 +1623,8 @@ def setup_sim_collection(
     episode_duration_s: float | None = None,
     collect_out: str | None = None,
     name_prefix: str = "loco",
+    nav: str | None = None,
+    reset_randomization: dict | None = None,
     cfg: DatasetCollectionConfig | None = None,
     register_atexit: bool = True,
 ) -> SimCollectionHooks:
@@ -1684,6 +1723,12 @@ def setup_sim_collection(
             "robot": robot,
             "scene": scene,
             "gait": gait_type.value,
+            **({} if nav is None else {"nav": nav}),
+            **(
+                {}
+                if reset_randomization is None
+                else {"reset_randomization": reset_randomization}
+            ),
             "terrain": terrain.value,
             "sim_hz": sim_hz,
             "control_hz": recorder.config.control_hz,
@@ -1716,6 +1761,8 @@ def setup_multi_env_collection(
     episode_duration_s: float | None = None,
     collect_out: str | None = None,
     name_prefix: str = "loco",
+    nav: str | None = None,
+    reset_randomization: dict | None = None,
     cfg: DatasetCollectionConfig | None = None,
 ) -> "MultiEnvCollectionHooks":
     """N episode buffers, one run directory. Used by the multi-env collector."""
@@ -1737,6 +1784,8 @@ def setup_multi_env_collection(
         episode_duration_s=episode_duration_s,
         collect_out=collect_out,
         name_prefix=name_prefix,
+        nav=nav,
+        reset_randomization=reset_randomization,
         cfg=profile,
         register_atexit=False,
     )
@@ -1824,7 +1873,7 @@ def create_collection_session(
     """Build a recorder wired to a new :class:`DatasetBucketSystem`.
 
     The stored row rate is ``sim_hz`` (one parquet row per physics step).
-    ``episode.control_hz`` stays the command-sampler rate and is not used here.
+    ``episode.control_hz`` is the control rate and is not used here.
     Step-counted filters (contact dwell, regime dwell, mismatch radii) are
     scaled from their 50 Hz defaults so wall-clock duration is unchanged.
     """

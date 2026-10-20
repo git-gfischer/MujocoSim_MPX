@@ -131,6 +131,45 @@ def estimate_foot_grf(
 
     return grf
 
+
+def foot_contact_normals(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    contact_geom_ids: Sequence[int],
+    dist_threshold: float = 0.005,
+) -> np.ndarray:
+    """Unit normal toward each foot, world frame, shape ``(n_feet, 3)``.
+
+    MuJoCo's contact normal points from geom1 toward geom2. It is flipped
+    when the foot is geom1 so the result points from the ground into the
+    foot. Feet with no contact get world up. Foot-foot contacts are ignored.
+    """
+    ids = [int(g) for g in contact_geom_ids]
+    acc = np.zeros((len(ids), 3), dtype=np.float64)
+    geom_to_idx = {geom_id: idx for idx, geom_id in enumerate(ids)}
+    wrench = np.zeros(6, dtype=np.float64)
+    for k in range(data.ncon):
+        contact = data.contact[k]
+        if contact.dist > dist_threshold:
+            continue
+        g1, g2 = int(contact.geom1), int(contact.geom2)
+        i1, i2 = geom_to_idx.get(g1), geom_to_idx.get(g2)
+        if (i1 is None and i2 is None) or (i1 is not None and i2 is not None):
+            continue
+        idx = i1 if i1 is not None else i2
+        sign = -1.0 if i1 is not None else 1.0
+        mujoco.mj_contactForce(model, data, k, wrench)
+        acc[idx] += abs(float(wrench[0])) * sign * np.asarray(
+            contact.frame[:3], dtype=np.float64
+        )
+    normals = np.zeros_like(acc)
+    normals[:, 2] = 1.0
+    norms = np.linalg.norm(acc, axis=1)
+    hit = norms > 1e-8
+    normals[hit] = acc[hit] / norms[hit, None]
+    return normals
+
+
 #----------------------------------------------------------------------------
 def print_contact_friction(
     model: mujoco.MjModel,

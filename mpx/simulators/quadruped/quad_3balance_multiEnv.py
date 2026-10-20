@@ -55,6 +55,7 @@ from mpx.utils.simulation_utils.base_weight import BaseWeightForce
 from mpx.utils.simulation_utils.motor_model import MotorModel
 from mpx.config.sim_config.config_reset_randomization import balance_reset_randomization_config
 from mpx.utils.simulation_utils.reset_randomizer import ResetRandomizer, ResetTargets
+from mpx.utils.simulation_utils.pyramid_terrain import stamp_scene
 from mpx.config.sim_config.config_quad_spawn import spawn_config
 from mpx.utils.spawner.spawner import RobotMapSpawner
 
@@ -296,6 +297,7 @@ def _main_collect(
     for _ in range(n_env):
         model = mujoco.MjModel.from_xml_path(xml_path)
         model.opt.timestep = 1.0 / sim_frequency
+        stamp_scene(scene, model)
         data = mujoco.MjData(model)
         models.append(model)
         datas.append(data)
@@ -323,6 +325,7 @@ def _main_collect(
         episode_duration_s=episode_duration_s,
         collect_out=collect_out,
         name_prefix="balance",
+        reset_randomization=balance_reset_randomization_config.to_metadata(),
         cfg=dataset_collection_config,
     )
 
@@ -1155,7 +1158,7 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--scene", type=str,
-                        choices=["flat", "rough", "perlin", "stairs", "ramp", "slippery"],
+                        choices=["flat", "rough", "perlin", "stairs", "ramp", "staired_pyramid", "slippery"],
                         default="flat")
     parser.add_argument("--robot", type=str, choices=["go2", "go2_dls", "b2"], default="go2_dls")
     parser.add_argument("--n-env", type=int, default=8,

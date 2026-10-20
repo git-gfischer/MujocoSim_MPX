@@ -119,6 +119,9 @@ class PointNavigator:
         self._resample_key = self._keycode(resample_key)
         self._commit_pending = False
         self._resample_pending = False
+        # Optional ``qpos -> xy``. The ramp pyramid uses this to put the goal
+        # on the far side of the obstacle instead of a random nearby point.
+        self.goal_sampler = None
 
     # ------------------------------------------------------------------ goals
     @staticmethod
@@ -140,6 +143,10 @@ class PointNavigator:
             self._drive_forward = bool(self._rng.random() < 0.5)
         else:
             self._drive_forward = True
+        if self.goal_sampler is not None:
+            self.goal_xy = np.asarray(self.goal_sampler(qpos), dtype=np.float64).reshape(2)
+            self._has_goal = True
+            return self.goal_xy.copy()
         angle = self._rng.uniform(0.0, 2.0 * np.pi)
         radius = self._rng.uniform(*self.goal_distance)
         self.goal_xy = robot_xy + radius * np.array([np.cos(angle), np.sin(angle)])

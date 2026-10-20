@@ -243,6 +243,57 @@ def _yaw_rotation(quat_wxyz: np.ndarray) -> np.ndarray:
     )
 
 
+def contact_point_world_velocity(
+    v_world: np.ndarray,
+    omega_world: np.ndarray,
+    normal_world: np.ndarray,
+    radius: float,
+) -> np.ndarray:
+    """World velocity of each foot contact point, flat ``(n_feet * 3,)``.
+
+    The site velocity is the sphere centre. The material point in contact sits
+    about ``−r n`` from that centre: ``v = v_centre + ω × (−r n)``. ``n``
+    points from the contact toward the foot centre, in world.
+    """
+    normal = np.asarray(normal_world, dtype=np.float64).reshape(-1, 3)
+    linear = np.asarray(v_world, dtype=np.float64).reshape(-1, 3)
+    angular = np.asarray(omega_world, dtype=np.float64).reshape(-1, 3)
+    return (linear + np.cross(angular, -float(radius) * normal)).reshape(-1)
+
+
+def tangential_contact_velocity(
+    v_world: np.ndarray,
+    omega_world: np.ndarray,
+    normal_world: np.ndarray,
+    radius: float,
+    quat_wxyz: np.ndarray,
+) -> np.ndarray:
+    """Tangential velocity of each foot contact point, yaw-base frame.
+
+    The logged site velocity is the sphere centre. The material point in
+    contact sits about ``−r n`` from that centre, so
+
+        v_contact = v_centre + ω × (−r n)
+        v = (I − n nᵀ) R_WYᵀ v_contact
+
+    ``n`` points from the contact toward the foot centre, in world. On flat
+    ground that is world up and the vertical part drops out. Returns a flat
+    ``(n_feet * 3,)`` array. A stuck foot reads near 0; a value near the
+    commanded base speed means this was computed relative to the base.
+    """
+    v_contact = contact_point_world_velocity(
+        v_world, omega_world, normal_world, radius
+    ).reshape(-1, 3)
+    normal = np.asarray(normal_world, dtype=np.float64).reshape(-1, 3)
+    # Row form of R_WYᵀ @ v. _yaw_rotation is world ← yaw.
+    yaw = _yaw_rotation(quat_wxyz)
+    v_yaw = v_contact @ yaw
+    n_yaw = normal @ yaw
+    n_yaw = n_yaw / np.maximum(np.linalg.norm(n_yaw, axis=1, keepdims=True), 1e-12)
+    tangential = v_yaw - n_yaw * np.sum(n_yaw * v_yaw, axis=1, keepdims=True)
+    return tangential.reshape(-1)
+
+
 def gravity_align(
     foot_vectors: np.ndarray,
     quat_wxyz: np.ndarray,
@@ -356,3 +407,87 @@ class TerrainProbe:
         return np.asarray(
             [self.height_at(data, p[:2]) for p in pts], dtype=np.float64
         )
+
+
+def build_terrain_height_grid(
+    model: mujoco.MjModel, resolution: float = 0.05, extent: float | None = None
+):
+    """Raycast a height grid over every non-plane terrain geom.
+
+    Returns ``(grid, origin_xy, resolution)`` with ``grid`` shaped ``(nx, ny)``.
+    ``None`` when the model has no such geoms. Cells are the same elevation
+    :meth:`TerrainProbe.height_at` would return.
+
+    ``extent`` fixes the grid to ``[-extent, extent]`` on both axes instead of
+    the geoms' bounds, so a terrain redrawn at a new size keeps one shape.
+    """
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    xs: list[float] = []
+    ys: list[float] = []
+    for i in range(model.ngeom):
+        if int(model.geom_group[i]) != _TERRAIN_GEOM_GROUP:
+            continue
+        if int(model.geom_type[i]) == int(mujoco.mjtGeom.mjGEOM_PLANE):
+            continue
+        pos = data.geom_xpos[i]
+        radius = float(np.linalg.norm(model.geom_size[i, :3]))
+        xs.extend((float(pos[0]) - radius, float(pos[0]) + radius))
+        ys.extend((float(pos[1]) - radius, float(pos[1]) + radius))
+    if not xs:
+        return None
+    if extent is not None:
+        xs = ys = [-float(extent), float(extent)]
+    x0 = float(np.min(xs))
+    y0 = float(np.min(ys))
+    nx = int(np.floor((float(np.max(xs)) - x0) / resolution)) + 1
+    ny = int(np.floor((float(np.max(ys)) - y0) / resolution)) + 1
+    probe = TerrainProbe(model)
+    grid = np.empty((nx, ny), dtype=np.float32)
+    for ix in range(nx):
+        x = x0 + ix * resolution
+        for iy in range(ny):
+            grid[ix, iy] = probe.height_at(data, (x, y0 + iy * resolution))
+    origin = np.array([x0, y0], dtype=np.float32)
+    return grid, origin, float(resolution)
+
+
+_HEIGHT_GRID_SCENES = ("rough", "stairs", "ramp", "staired_pyramid")
+
+
+def apply_rough_terrain_mpc(config, model: mujoco.MjModel, *, scene: str, terrain_aware: bool) -> None:
+    """On uneven scenes, optionally land swings on a raycast height grid.
+
+    The same grid is what the viewer draws. ``staired_pyramid`` must already
+    have its layers placed; the placeholders in the XML are one solid block.
+    """
+    if scene not in _HEIGHT_GRID_SCENES:
+        return
+    if not terrain_aware:
+        print("[terrain] blind MPC", flush=True)
+        return
+    attach_terrain_height_grid(config, model)
+
+
+def attach_terrain_height_grid(config, model: mujoco.MjModel, resolution: float = 0.05) -> bool:
+    """Store a height grid on ``config`` for the rough-terrain swing spline."""
+    built = build_terrain_height_grid(model, resolution=resolution)
+    if built is None:
+        return False
+    grid, origin, res = built
+    config.terrain_height_grid = grid
+    config.terrain_height_origin = origin
+    config.terrain_height_resolution = res
+    print(
+        f"[terrain] height grid {grid.shape[0]}x{grid.shape[1]} at {res:.3f} m",
+        flush=True,
+    )
+    return True
+
+
+def terrain_overlay_grid(config):
+    """Height grid the viewer draws. The same grid the swing planner lands on."""
+    grid = getattr(config, "terrain_height_grid", None)
+    if grid is None:
+        return None
+    return grid, config.terrain_height_origin, float(config.terrain_height_resolution)

@@ -196,8 +196,8 @@ class SimRateConfig:
     # at 200 Hz the same time constant is only 2 substeps and the foot bounces.
     sim_hz: float = 500.0
 
-    # Control / command-sampler rate [Hz]. Logging is at sim_hz (one row per
-    # physics step). Labels keep wall-clock filters (60 ms dwell), not this rate.
+    # Control rate [Hz]. Logging is at sim_hz (one row per physics step).
+    # Labels keep wall-clock filters (60 ms dwell), not this rate.
     control_hz: float = 50.0
 
     @property
@@ -209,8 +209,7 @@ class SimRateConfig:
 class EpisodeCollectionConfig:
     """On-the-fly episode buffering before routing into buckets."""
 
-    # Control / command-sampler rate [Hz]. Logging is at sim_hz; this is only
-    # the MPC-side period used by VelocityCommandSampler.
+    # Control rate [Hz]. Logging is at sim_hz; this is the MPC-side period.
     control_hz: float = 50.0
 
     # How episode boundaries are decided:
@@ -259,13 +258,6 @@ class EpisodeCollectionConfig:
     # at a respawn. v3 reused one parameter set across up to 12 consecutive
     # episodes, which made near-duplicate episodes land in different splits.
     randomize_per_episode: bool = True
-
-    # Drive collection from a segmented velocity command instead of goal
-    # following. Goal following never commands a yaw rate and never reverses:
-    # the audited v4 run had commanded yaw identically zero for all 23,994 rows,
-    # so yaw-invariance could not be tested at all. See
-    # mpx/utils/simulation_utils/velocity_command.py.
-    segmented_commands: bool = True
 
 
 @dataclass

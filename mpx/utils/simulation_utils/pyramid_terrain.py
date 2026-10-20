@@ -109,69 +109,24 @@ def sample_pyramid(
     )
 
 
-def _staired_from_draws(
-    base_half: float,
-    height: float,
-    rise: float,
-    tread: float,
-    *,
-    min_top_half: float,
-    max_layers: int,
-) -> tuple[float, float, float, float, float, int]:
-    rise = max(float(rise), 1e-4)
-    tread = max(float(tread), 1e-4)
-    n_steps = int(np.clip(round(height / rise), 2, max_layers))
-
-    def top_for(n: int, base: float) -> float:
-        return base - (n - 1) * tread
-
-    while n_steps >= 1:
-        top_half = top_for(n_steps, base_half)
-        if top_half >= min_top_half and top_half < base_half:
-            return base_half, top_half, n_steps * rise, rise, tread, n_steps
-        n_steps -= 1
-        if n_steps < 2:
-            break
-    n_steps = 2
-    top_half = top_for(n_steps, base_half)
-    if top_half < min_top_half or top_half >= base_half:
-        base_half = min_top_half + n_steps * tread + 0.05
-        top_half = top_for(n_steps, base_half)
-    return base_half, top_half, n_steps * rise, rise, tread, n_steps
-
-
 def sample_staired_pyramid(
     cfg: PyramidTerrainConfig, rng: np.random.Generator
 ) -> PyramidSample:
-    last: tuple[float, float, float, float] | None = None
-    for _ in range(max(1, int(cfg.sample_retries))):
-        base_half = _draw(cfg.base_half, rng)
-        height = _draw(cfg.height, rng)
-        rise = _draw(cfg.rise, rng)
-        tread = _draw(cfg.tread, rng)
-        last = (base_half, height, rise, tread)
-        n_steps = int(np.clip(round(height / max(rise, 1e-4)), 2, cfg.max_layers))
-        top_half = base_half - (n_steps - 1) * tread
-        if top_half >= cfg.min_top_half and top_half < base_half:
-            return PyramidSample(
-                kind="staired_pyramid",
-                base_half=base_half,
-                top_half=top_half,
-                height=n_steps * rise,
-                rise=rise,
-                tread=tread,
-                n_steps=n_steps,
-            )
-    base_half, top_half, height, rise, tread, n_steps = _staired_from_draws(
-        last[0], last[1], last[2], last[3],
-        min_top_half=cfg.min_top_half,
-        max_layers=cfg.max_layers,
-    )
+    """Stair-sized steps. Only the base (XY) and the step count (Z) change."""
+    rise = float(cfg.stair_rise)
+    tread = float(cfg.stair_tread)
+    base_half = _draw(cfg.base_half, rng)
+    max_n = 1 + int((base_half - cfg.min_top_half) / max(tread, 1e-4))
+    max_n = int(np.clip(max_n, 2, cfg.max_layers))
+    n_lo = int(np.clip(round(cfg.staired_height.low / rise), 2, max_n))
+    n_hi = int(np.clip(round(cfg.staired_height.high / rise), n_lo, max_n))
+    n_steps = int(rng.integers(n_lo, n_hi + 1))
+    top_half = base_half - (n_steps - 1) * tread
     return PyramidSample(
         kind="staired_pyramid",
         base_half=base_half,
         top_half=top_half,
-        height=height,
+        height=n_steps * rise,
         rise=rise,
         tread=tread,
         n_steps=n_steps,
@@ -232,11 +187,11 @@ def apply_pyramid_boxes(
     compiled_contype: Any,
     compiled_conaffinity: Any,
 ) -> None:
-    """Solid ziggurat: each layer is a square column from the floor up.
+    """Same plates as ``scene_stairs.xml``: each tread is ``rise`` thick.
 
-    Thin stacked treads can look like a pyramid in the viewer while physics
-    tunnels through them. Building each layer from z=0 makes the visible
-    volume the same as the collision volume.
+    Stairs sit the box center at ``(i + 0.5) * rise`` with half-height
+    ``rise / 2``. A column from the floor makes the height map treat the
+    whole stack as one tall solid.
     """
     n_steps = int(sample.n_steps or 0)
     rise = float(sample.rise or 0.05)
@@ -245,21 +200,41 @@ def apply_pyramid_boxes(
     first = int(layer_ids[0])
     on_type = int(compiled_contype[first]) or 1
     on_aff = int(compiled_conaffinity[first]) or 1
+    half_z = rise / 2.0
     for i, geom_id in enumerate(layer_ids):
         if i < n_steps:
             half_xy = base_half - i * tread
-            height_i = (i + 1) * rise
-            half_z = height_i / 2.0
             _set_box(
                 model,
                 int(geom_id),
-                (0.0, 0.0, half_z),
+                (0.0, 0.0, (i + 0.5) * rise),
                 (half_xy, half_xy, half_z),
                 contype=on_type,
                 conaffinity=on_aff,
             )
         else:
             _hide_box(model, int(geom_id))
+
+
+def floor_ring_outer(
+    sample: PyramidSample, cfg: PyramidTerrainConfig = pyramid_terrain_config
+) -> float:
+    """Farthest ``max(|x|, |y|)`` a floor spawn can land at."""
+    return float(sample.base_half) + cfg.floor_margin + cfg.floor_ring
+
+
+def opposite_goal(
+    qpos, sample: PyramidSample, cfg: PyramidTerrainConfig = pyramid_terrain_config
+) -> np.ndarray:
+    """Goal straight across the pyramid, mid-way through the far floor ring.
+
+    Off the base, inside every floor spawn and so inside the reset region.
+    """
+    v = -np.asarray(qpos, dtype=np.float64)[:2]
+    if float(np.max(np.abs(v))) < 1e-6:
+        v = np.array([1.0, 0.0])
+    reach = float(sample.base_half) + cfg.floor_margin + 0.5 * cfg.floor_ring
+    return v * reach / float(np.max(np.abs(v)))
 
 
 def spawn_p0_and_xy_yaw(
@@ -276,7 +251,7 @@ def spawn_p0_and_xy_yaw(
         p0 = np.array([0.0, 0.0, float(sample.height) + float(robot_height)], dtype=np.float64)
     else:
         inner = float(sample.base_half) + cfg.floor_margin
-        outer = max(inner + cfg.floor_ring, 4.0)
+        outer = floor_ring_outer(sample, cfg)
         x = y = 0.0
         for _ in range(64):
             x = float(rng.uniform(-outer, outer))
@@ -366,6 +341,9 @@ class PyramidTerrain:
     ) -> tuple[np.ndarray, tuple[float, float, float]]:
         return spawn_p0_and_xy_yaw(sample, robot_height, self._rng, self.cfg)
 
+    def floor_ring_outer(self, sample: PyramidSample) -> float:
+        return floor_ring_outer(sample, self.cfg)
+
     def try_spawn(
         self,
         spawner: Any,
@@ -395,3 +373,25 @@ class PyramidTerrain:
             if last_exc is not None:
                 raise last_exc
             raise
+
+
+def stamp_scene(scene: str, model: Any, rng: np.random.Generator | None = None) -> None:
+    """Place ramp or staired-pyramid geoms. Other scenes keep the XML."""
+    from mpx.utils.simulation_utils.ramp_pyramid import RampPyramid
+
+    ramp = RampPyramid.from_scene(scene, model, rng=rng)
+    if ramp.active:
+        ramp.apply(model)
+    PyramidTerrain.from_scene(scene, model, rng=rng).apply(model)
+
+
+def copy_scene_stamp(src: Any, dst: Any) -> None:
+    """Copy a stamped terrain onto another model loaded from the same XML."""
+    dst.body_pos[:] = src.body_pos
+    dst.geom_pos[:] = src.geom_pos
+    dst.geom_size[:] = src.geom_size
+    dst.geom_rbound[:] = src.geom_rbound
+    dst.geom_contype[:] = src.geom_contype
+    dst.geom_conaffinity[:] = src.geom_conaffinity
+    dst.geom_rgba[:] = src.geom_rgba
+    dst.geom_aabb[:] = src.geom_aabb

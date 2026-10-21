@@ -81,6 +81,11 @@ from mpx.utils.dataset_collection.dataset_bucket_system import (
 from mpx.config.sim_config.config_dataset_bucket import dataset_collection_config
 
 from mpx.estimators.camurri_contact import camurri_from_sim, format_camurri
+from mpx.config.sim_config.config_foot_force_jacobian import foot_force_jacobian_config
+from mpx.estimators.foot_force_jacobian import (
+    estimate_foot_force_jacobian,
+    format_jacobian_grf,
+)
 from mpx.estimators.quad_contact_estimation import estimate_contacts, estimate_foot_grf
 
 # Set GPU device for JAX
@@ -596,6 +601,11 @@ def main(
             if not collecting and not headless:
                 print(f"Contact: {contact}")
                 print(format_camurri(camurri_prob, camurri_stance))
+                if foot_force_jacobian_config.enabled:
+                    print(format_jacobian_grf(
+                        estimate_foot_grf(model, data, contact_ids),
+                        estimate_foot_force_jacobian(model, data, contact_ids),
+                    ))
                 print(foot)
                 print(f"Command: {command}")
             

@@ -54,8 +54,17 @@ from mpx.utils.dataset_collection.dataset_bucket_system import GaitType
 from mpx.config.sim_config.config_dataset_bucket import dataset_collection_config
 
 from mpx.config.sim_config.config_camurri_contact import camurri_contact_config
+from mpx.config.sim_config.config_foot_force_jacobian import foot_force_jacobian_config
 from mpx.estimators.camurri_contact import camurri_from_sim, format_camurri
-from mpx.estimators.quad_contact_estimation import estimate_contacts, print_contact_friction
+from mpx.estimators.foot_force_jacobian import (
+    estimate_foot_force_jacobian,
+    format_jacobian_grf,
+)
+from mpx.estimators.quad_contact_estimation import (
+    estimate_contacts,
+    estimate_foot_grf,
+    print_contact_friction,
+)
 
 # Set GPU device for JAX
 # gpu_device = jax.devices('gpu')[0]
@@ -345,6 +354,11 @@ def main(
             camurri_prob, camurri_stance = camurri_from_sim(model, data, contact_ids)
             if camurri_contact_config.echo:
                 print(format_camurri(camurri_prob, camurri_stance))
+            if foot_force_jacobian_config.echo and foot_force_jacobian_config.enabled:
+                print(format_jacobian_grf(
+                    estimate_foot_grf(model, data, contact_ids),
+                    estimate_foot_force_jacobian(model, data, contact_ids),
+                ))
             # print(f"Contact: {contact}")
             # print(foot)
             # print(f"Command: {command}")

@@ -58,7 +58,12 @@ import mpx.utils.simulation_utils.sim_utils as sim_utils
 from mpx.utils.math_utils.quad_math import yaw_from_quat, _quat_to_axes, quat_normalize_wxyz, quat_mul_wxyz
 
 from mpx.config.sim_config.config_camurri_contact import camurri_contact_config
+from mpx.config.sim_config.config_foot_force_jacobian import foot_force_jacobian_config
 from mpx.estimators.camurri_contact import camurri_from_sim, format_camurri
+from mpx.estimators.foot_force_jacobian import (
+    estimate_foot_force_jacobian,
+    format_jacobian_grf,
+)
 from mpx.estimators.quad_contact_estimation import estimate_contacts, estimate_foot_grf
 
 from mpx.utils.simulation_utils.live_plotter import ProprioceptivePlotter
@@ -430,6 +435,11 @@ def main(
             camurri_prob, camurri_stance = camurri_from_sim(model, data, contact_ids)
             if camurri_contact_config.echo:
                 print(format_camurri(camurri_prob, camurri_stance))
+            if foot_force_jacobian_config.echo and foot_force_jacobian_config.enabled:
+                print(format_jacobian_grf(
+                    estimate_foot_grf(model, data, contact_ids),
+                    estimate_foot_force_jacobian(model, data, contact_ids),
+                ))
             mpc_data, tau = solve_mpc(
                 mpc_data, qpos, qvel, foot, command,
                 jnp.asarray(contact_mask, dtype=jnp.float32),

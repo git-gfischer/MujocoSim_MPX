@@ -37,3 +37,15 @@ def test_format_prints_solver_then_estimate_xyz():
     line = format_jacobian_grf(solver, estimated)
     assert line.startswith("Jacobian GRF FL=(1.0 2.0 -3.0)/(4.0 5.0 -6.0)")
     assert "FR=" in line and "RL=" in line and "RR=" in line
+
+
+from mpx.config.sim_config.config_foot_force_jacobian import FootForceJacobianConfig
+from mpx.estimators.foot_force_jacobian import estimate_foot_force_jacobian
+
+
+def test_disabled_returns_zeros_without_a_model():
+    cfg = FootForceJacobianConfig(enabled=False)
+    force = estimate_foot_force_jacobian(None, None, [0, 1, 2, 3], cfg)
+    assert force.shape == (4, 3)
+    assert force.dtype == np.float64
+    assert np.all(force == 0.0)

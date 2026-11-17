@@ -30,12 +30,14 @@ Fully differentiable solver easily integrates into learning pipelines and suppor
 
 ✅ **A multiple-shooting SQP** formulation solves the KKT system in parallel, maintaining exactness and fast convergence.
 
-✅ **MJX MODELS** Support [MJX](https://mujoco.readthedocs.io/en/stable/mjx.html) whole body dynamics (included examples with [**Talos**](https://github.com/iit-DLSLab/mpx/blob/main/examples/mjx_talos.py), [**H1**](https://github.com/iit-DLSLab/mpx/blob/main/examples/mjx_h1.py), [**Aliengo**](https://github.com/iit-DLSLab/mpx/blob/main/examples/mjx_quad.py) and **Go2**)
+✅ **MJX MODELS** Support [MJX](https://mujoco.readthedocs.io/en/stable/mjx.html) whole body dynamics (included examples with [**Talos**](https://github.com/iit-DLSLab/framework/blob/main/examples/mjx_talos.py), [**H1**](https://github.com/iit-DLSLab/framework/blob/main/examples/mjx_h1.py), [**Aliengo**](https://github.com/iit-DLSLab/framework/blob/main/examples/mjx_quad.py) and **Go2**)
 
 The solver is wrapped by the `MPCControllerWrapper` class, and all the settings (such as the dynamics model and cost function to be used) can be changed in the config files. Examples for various legged robots are provided in the `examples` folder.
 > **Note:**  
 > If you want to solve multiple MPC in parallel, look at the examples/multi_env.py
-> `MPCWrapper` is designed to use the whole body model. For centroidal SRBD on Go2, run `python mpx/simulators/quadruped/quad_locomotion.py --robot go2 --mpc-model srbd`.
+> `MPCWrapper` is designed to use the whole body model. For centroidal SRBD on Go2, run `python framework/simulators/quadruped/quad_locomotion.py --robot go2 --mpc-model srbd`.
+>
+> The quadruped simulators use the MPX MPC by default. To swap the controller, see [framework/controllers/README.md](framework/controllers/README.md).
 
 ## Task examples
 | Acrobot Swing-Up | Quadruped Trot | Humanoid Jump | Quadruped Barrel Roll | Obstacle Avoidance |
@@ -59,7 +61,7 @@ The solver is wrapped by the `MPCControllerWrapper` class, and all the settings 
 
 ### Clone the repo
 ```
-git clone git@github.com:iit-DLSLab/mpx.git
+git clone git@github.com:iit-DLSLab/framework.git
 cd mpx && git submodule update --init --recursive
 ```
 
@@ -90,11 +92,11 @@ pip install -e .
 ## RUN example
 ```bash
 # Using Pixi
-pixi run python mpx/examples/mjx_quad.py
+pixi run python framework/examples/mjx_quad.py
 
 # Or activate the environment first
 pixi shell
-python mpx/examples/mjx_quad.py
+python framework/examples/mjx_quad.py
 ```
 
 Use the keyboard's arrows to control the robot.

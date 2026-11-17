@@ -2,12 +2,12 @@
 
 This note is about the **physics plant**, not the MPC friction cone. MuJoCo decides how much a foot can push into the ground and how much it can resist sliding. The controller only *asks* for forces; the solver may or may not be able to realize them.
 
-Related: the MPC's *soft* friction barrier is in [quadruped_whole_body_mpc.md](quadruped_whole_body_mpc.md) §7.1. Reset-time sampling of foot μ and `solref` lives in `mpx/config/sim_config/config_reset_randomization.py`.
+Related: the MPC's *soft* friction barrier is in [quadruped_whole_body_mpc.md](quadruped_whole_body_mpc.md) §7.1. Reset-time sampling of foot μ and `solref` lives in `framework/config/sim_config/config_reset_randomization.py`.
 
 Go2 sources used below:
 
-- Feet: `mpx/data/go2/go2_mjx.xml` (`class="foot"`)
-- Flat floor: `mpx/data/go2/scene_flat.xml`
+- Feet: `framework/data/go2/go2_mjx.xml` (`class="foot"`)
+- Flat floor: `framework/data/go2/scene_flat.xml`
 - Solver options: `<option cone="pyramidal" impratio="100" …>` on the Go2 model
 
 
@@ -136,7 +136,7 @@ On each `_respawn()`, `ResetRandomizer` can write:
 
 It does **not** change floor friction, `solimp`, spin/roll, `impratio`, or the MPC cone `μ`. Those stay as compiled XML / cost code.
 
-Default sampling range for sliding μ: `0.20 … 1.00` (same-or-slipperier than XML 1.2). Config: `mpx/config/sim_config/config_reset_randomization.py`.
+Default sampling range for sliding μ: `0.20 … 1.00` (same-or-slipperier than XML 1.2). Config: `framework/config/sim_config/config_reset_randomization.py`.
 
 
 ## 8. Mental picture

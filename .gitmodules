@@ -4,3 +4,6 @@
 [submodule "mpx/addons/ProprioceptiveImage"]
 	path = mpx/addons/ProprioceptiveImage
 	url = https://github.com/git-gfischer/ProprioceptiveImage.git
+[submodule "framework/controllers/mpx"]
+	path = framework/controllers/mpx
+	url = https://github.com/git-gfischer/mpx_controller.git

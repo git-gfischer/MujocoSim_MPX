@@ -5,9 +5,9 @@ This note walks through the **online locomotion MPC** as implemented in this rep
 
 | Layer                     | Code                                                                | Role                                                  |
 | ------------------------- | ------------------------------------------------------------------- | ----------------------------------------------------- |
-| Receding-horizon wrapper  | `mpx/utils/quad_utils_locomotion/mpc_wrapper_locomotion.py`         | Timer, reference, one SQP step, warm-start shift      |
-| Gait / tracking reference | `mpx/utils/quad_utils_locomotion/reference_generator_locomotion.py` | Contact sequence, footholds, swing splines, GRF guess |
-| OCP solver                | `mpx/jax_ocp_solvers/`                                              | Multiple-shooting SQP with parallel TVLQR KKT solve   |
+| Receding-horizon wrapper  | `framework/utils/quad_utils_locomotion/mpc_wrapper_locomotion.py`         | Timer, reference, one SQP step, warm-start shift      |
+| Gait / tracking reference | `framework/utils/quad_utils_locomotion/reference_generator_locomotion.py` | Contact sequence, footholds, swing splines, GRF guess |
+| OCP solver                | `framework/jax_ocp_solvers/`                                              | Multiple-shooting SQP with parallel TVLQR KKT solve   |
 
 
 Related: gait knobs (`timer_t`, `duty_factor`, `step_freq`, cost `W`) are documented in `[gait_duty_factor_mpc_gains.md](gait_duty_factor_mpc_gains.md)`. How MuJoCo realizes contact forces (geom μ, `solref`/`solimp`, `min(foot, floor)`) is in `[mujoco_contact_friction.md](mujoco_contact_friction.md)`. The solver paper is [arXiv:2506.07823](https://arxiv.org/abs/2506.07823). Go2 defaults used below: N=25, \Delta t=0.02\mathrm{s}, MPC rate 50\mathrm{Hz}, n_j=12 joints, n_c=4 feet.

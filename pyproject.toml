@@ -25,6 +25,9 @@ Homepage = "https://github.com/iit-DLSLab/mpx"
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.hatch.build.targets.wheel]
+packages = ["framework"]
+
 [tool.pixi.workspace]
 channels = ["conda-forge", "nvidia", "https://prefix.dev/robostack-humble"]
 platforms = ["linux-64"]
@@ -47,7 +50,7 @@ rosdep = "*"
 compilers = "*"
 jaxlib = { version = "*", build = "*cuda*" }
 "cuda-nvcc" = "*"
-# ProprioceptiveImage addon (mpx/addons/ProprioceptiveImage)
+# ProprioceptiveImage addon (framework/addons/ProprioceptiveImage)
 pyts = "*"
 easydict = "*"
 scikit-learn = "*"

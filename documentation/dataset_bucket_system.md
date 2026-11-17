@@ -1,14 +1,14 @@
 # The bucket system: balanced proprioceptive dataset collection
 
-This note is about **how collected timesteps are classified, counted and balanced**, not about how they are recorded. Recording (what columns exist, at what rate, in which parquet file) is in `mpx/utils/dataset_collection/dataset_schema.py` and `episode_recorder.py`. The bucket system is the layer on top: it decides *what kind* of sample each timestep is, keeps the statistics that say whether the dataset is any good, and produces the index a training sampler reads.
+This note is about **how collected timesteps are classified, counted and balanced**, not about how they are recorded. Recording (what columns exist, at what rate, in which parquet file) is in `framework/utils/dataset_collection/dataset_schema.py` and `episode_recorder.py`. The bucket system is the layer on top: it decides *what kind* of sample each timestep is, keeps the statistics that say whether the dataset is any good, and produces the index a training sampler reads.
 
 Sources:
 
-- `mpx/utils/dataset_collection/dataset_bucket_system.py` — `DatasetBucketSystem`, `BucketKey`, `SampleRef`
-- `mpx/utils/dataset_collection/contact_labeling.py` — the **only** definition of contact
-- `mpx/utils/dataset_collection/grf_diversity.py` — the post-hoc diversity diagnostics
-- `mpx/utils/dataset_collection/dataset_summary_plotter.py` — plot the cross-run JSON
-- `mpx/config/sim_config/config_dataset_bucket.py` — every threshold, defined once
+- `framework/utils/dataset_collection/dataset_bucket_system.py` — `DatasetBucketSystem`, `BucketKey`, `SampleRef`
+- `framework/utils/dataset_collection/contact_labeling.py` — the **only** definition of contact
+- `framework/utils/dataset_collection/grf_diversity.py` — the post-hoc diversity diagnostics
+- `framework/utils/dataset_collection/dataset_summary_plotter.py` — plot the cross-run JSON
+- `framework/config/sim_config/config_dataset_bucket.py` — every threshold, defined once
 - Related: [mujoco_contact_friction.md](mujoco_contact_friction.md) (what a contact is in the plant, and why there is no ground truth to read)
 
 
@@ -323,7 +323,7 @@ Reading the written index rather than the in-memory buckets is the point: **the 
 | `perturbation_ratio` | Per-bucket, per §6. |
 
 ```
-python -m mpx.utils.dataset_collection.grf_diversity datasets/<run>
+python -m framework.utils.dataset_collection.grf_diversity datasets/<run>
 ```
 
 `print_summary()` no longer prints a GRF number at all; it points at this tool.
@@ -426,7 +426,7 @@ Then the recorder, still for this run:
 Combined totals across previous folders live in `dataset_summary.json` (`summary` + per-run `datasets`). They are updated on disk at the same shutdown; they are not printed as a second “whole corpus” report. For that JSON:
 
 ```
-python -m mpx.utils.dataset_collection.dataset_summary_plotter datasets/dataset_summary.json --show
+python -m framework.utils.dataset_collection.dataset_summary_plotter datasets/dataset_summary.json --show
 ```
 
 
@@ -450,7 +450,7 @@ This function exists because the gait label was once hardcoded. The audited run 
 
 ## 11. Quick reference — tuning knobs
 
-All in `mpx/config/sim_config/config_dataset_bucket.py`. Nothing below is also hardcoded anywhere else; two of these used to be defined both here and as literals inside `print_summary`, and they agreed until someone tuned one.
+All in `framework/config/sim_config/config_dataset_bucket.py`. Nothing below is also hardcoded anywhere else; two of these used to be defined both here and as literals inside `print_summary`, and they agreed until someone tuned one.
 
 **`DatasetBucketConfig`**
 

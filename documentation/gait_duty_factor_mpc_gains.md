@@ -2,7 +2,7 @@
 
 Gait in this stack is not just `step_freq`. It is three coupled pieces, and MPC `W` is a fourth, separate tuning layer. You do not always need a new `W` for every tiny duty tweak, but you do need a consistent `(timer_t, duty_factor, step_freq)` set per gait, and you usually retune `W` when the support pattern or swing timing changes a lot.
 
-Primary Go2 locomotion knobs live in `mpx/config/robot_config/config_go2.py` (`Go2Locomotion`). The gait clock is `timer_run` in `mpx/utils/simulation_utils/sim_utils.py`. Foot references and contact sequence are built in `mpx/utils/quad_utils_locomotion/reference_generator_locomotion.py`.
+Primary Go2 locomotion knobs live in `framework/config/robot_config/config_go2.py` (`Go2Locomotion`). The gait clock is `timer_run` in `framework/utils/simulation_utils/sim_utils.py`. Foot references and contact sequence are built in `framework/utils/quad_utils_locomotion/reference_generator_locomotion.py`.
 
 ## What each knob actually does
 
@@ -13,7 +13,7 @@ Phase `leg_time` lives in `[0, 1)`, advances by `dt * step_freq`, and a foot is 
 This is the gait **pattern**. Order is FL, FR, RL, RR.
 
 ```python
-# mpx/config/robot_config/config_go2.py  (Go2Locomotion)
+# framework/config/robot_config/config_go2.py  (Go2Locomotion)
 timer_t = jnp.array([0.5, 0.0, 0.0, 0.5])  # trot
 # timer_t = jnp.array([0.5, 0.0, 0.5, 0.0])  # pace
 # timer_t = jnp.array([0.25, 0.75, 0.0, 0.5])  # crawl
